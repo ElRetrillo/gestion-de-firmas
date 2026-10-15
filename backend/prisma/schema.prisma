@@ -1,0 +1,218 @@
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+enum RolUsuario {
+  ADMIN
+  SUPERVISOR
+  FUNCIONARIO
+  MINISTRO_DE_FE
+}
+
+enum EstadoUsuario {
+  ACTIVO
+  EN_LICENCIA
+  SUSPENDIDO
+  DESVINCULADO
+}
+
+enum TipoCertificado {
+  FIRMAGOB
+  ESIGN
+}
+
+enum CustodiaCertificado {
+  CLOUD
+  TOKEN_FISICO
+}
+
+enum EstadoCertificado {
+  VIGENTE
+  POR_VENCER
+  REVOCADO
+  VENCIDO
+}
+
+enum EstadoPatrimonial {
+  OPERATIVO
+  EN_REVISION
+  DADO_DE_BAJA
+  ASIGNADO
+}
+
+enum EstadoHardware {
+  DESCONECTADO
+  CONECTADO
+  FIRMANDO
+}
+
+enum EventoTelemetria {
+  CONECTADO
+  DESCONECTADO
+  FIRMANDO
+}
+
+enum EstadoAprobacion {
+  PENDIENTE
+  EN_VISACION
+  APROBADA
+  RECHAZADA
+  FIRMADA
+}
+
+enum TipoActa {
+  ENTREGA
+  DEVOLUCION
+  TRASPASO
+  BAJA
+}
+
+enum TipoIntegracion {
+  FIRMAGOB
+  ESIGN_CHILE
+  CLAVE_UNICA
+}
+
+model Usuario {
+  id                String            @id @default(uuid())
+  rut               String            @unique
+  nombre            String
+  email             String            @unique
+  cargo             String
+  unidad            String
+  rol               RolUsuario        @default(FUNCIONARIO)
+  estado            EstadoUsuario     @default(ACTIVO)
+  certificados      Certificado[]
+  solicitudesFirma  SolicitudFirma[]
+  actasCustodia     ActaCustodia[]
+  historialCambios  HistorialCambio[]
+  createdAt         DateTime          @default(now()) @map("created_at")
+  updatedAt         DateTime          @updatedAt @map("updated_at")
+
+  @@map("usuarios")
+}
+
+model Certificado {
+  id               String              @id @default(uuid())
+  usuarioId        String              @map("usuario_id")
+  usuario          Usuario             @relation(fields: [usuarioId], references: [id], onDelete: Cascade)
+  tipo             TipoCertificado     @default(FIRMAGOB)
+  custodia         CustodiaCertificado @default(TOKEN_FISICO)
+  validoHasta      DateTime            @map("valido_hasta")
+  estado           EstadoCertificado   @default(VIGENTE)
+  tokenHardwareId  String?             @map("token_hardware_id")
+  tokenHardware    TokenHardware?      @relation(fields: [tokenHardwareId], references: [id])
+  createdAt        DateTime            @default(now()) @map("created_at")
+  updatedAt        DateTime            @updatedAt @map("updated_at")
+
+  @@index([usuarioId])
+  @@index([validoHasta])
+  @@map("certificados")
+}
+
+model TokenHardware {
+  id                String            @id @default(uuid())
+  serialNumber      String            @unique @map("serial_number")
+  vendorId          String            @map("vendor_id")
+  marca             String
+  modelo            String
+  estadoPatrimonial EstadoPatrimonial @default(OPERATIVO) @map("estado_patrimonial")
+  certificados      Certificado[]
+  telemetrias       TelemetriaEvento[]
+  actasCustodia     ActaCustodia[]
+  createdAt         DateTime          @default(now()) @map("created_at")
+  updatedAt         DateTime          @updatedAt @map("updated_at")
+
+  @@map("tokens_hardware")
+}
+
+model EstacionTrabajo {
+  id                String            @id @default(uuid())
+  codigoPc          String            @unique @map("codigo_pc")
+  ipAsignada        String            @map("ip_asignada")
+  dependenciaFisica String            @map("dependencia_fisica")
+  ultimoPing        DateTime          @default(now()) @map("ultimo_ping")
+  estadoHardware    EstadoHardware    @default(DESCONECTADO) @map("estado_hardware")
+  createdAt         DateTime          @default(now()) @map("created_at")
+  updatedAt         DateTime          @updatedAt @map("updated_at")
+
+  @@index([codigoPc])
+  @@map("estaciones_trabajo")
+}
+
+model TelemetriaEvento {
+  id              String            @id @default(uuid())
+  codigoPc        String            @map("codigo_pc")
+  tokenId         String?           @map("token_id")
+  token           TokenHardware?    @relation(fields: [tokenId], references: [id], onDelete: SetNull)
+  evento          EventoTelemetria
+  timestamp       DateTime          @default(now())
+  metadatosJsonb  Json              @default("{}") @map("metadatos_jsonb")
+
+  @@index([codigoPc, timestamp])
+  @@map("telemetria_eventos")
+}
+
+model SolicitudFirma {
+  id                    String            @id @default(uuid())
+  usuarioSolicitanteId  String            @map("usuario_solicitante_id")
+  usuarioSolicitante    Usuario           @relation(fields: [usuarioSolicitanteId], references: [id])
+  tipoTramite           String            @map("tipo_tramite")
+  estadoAprobacion      EstadoAprobacion  @default(PENDIENTE) @map("estado_aprobacion")
+  documentoUrl          String            @map("documento_url")
+  documentoFirmadoUrl   String?           @map("documento_firmado_url")
+  flujoVisacionJsonb    Json              @default("[]") @map("flujo_visacion_jsonb")
+  createdAt             DateTime          @default(now()) @map("created_at")
+  updatedAt             DateTime          @updatedAt @map("updated_at")
+
+  @@index([usuarioSolicitanteId])
+  @@index([estadoAprobacion])
+  @@map("solicitudes_firma")
+}
+
+model ActaCustodia {
+  id                  String        @id @default(uuid())
+  tokenId             String        @map("token_id")
+  token               TokenHardware @relation(fields: [tokenId], references: [id])
+  usuarioId           String        @map("usuario_id")
+  usuario             Usuario       @relation(fields: [usuarioId], references: [id])
+  tipoActa            TipoActa      @map("tipo_acta")
+  documentoFirmadoUrl String        @map("documento_firmado_url")
+  createdAt           DateTime      @default(now()) @map("created_at")
+
+  @@index([tokenId])
+  @@index([usuarioId])
+  @@map("actas_custodia")
+}
+
+model HistorialCambio {
+  id            String    @id @default(uuid())
+  tablaAfectada String    @map("tabla_afectada")
+  registroId    String    @map("registro_id")
+  accion        String
+  usuarioId     String?   @map("usuario_id")
+  usuario       Usuario?  @relation(fields: [usuarioId], references: [id], onDelete: SetNull)
+  diffJsonb     Json      @default("{}") @map("diff_jsonb")
+  createdAt     DateTime  @default(now()) @map("created_at")
+
+  @@index([tablaAfectada, registroId])
+  @@index([createdAt])
+  @@map("historial_cambios")
+}
+
+model IntegracionApi {
+  id                   String          @id @default(uuid())
+  servicio             TipoIntegracion @unique
+  credencialesCifradas String          @map("credenciales_cifradas")
+  webhookSecret        String          @map("webhook_secret")
+  activo               Boolean         @default(true)
+  createdAt            DateTime        @default(now()) @map("created_at")
+  updatedAt            DateTime        @updatedAt @map("updated_at")
+
+  @@map("integraciones_api")
+}
