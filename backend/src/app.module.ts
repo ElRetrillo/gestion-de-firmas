@@ -4,9 +4,13 @@ import { BullModule } from '@nestjs/bullmq';
 import { PrismaModule } from './prisma/prisma.module';
 import { RedisModule } from './redis/redis.module';
 import { WebsocketModule } from './websocket/websocket.module';
+import { AuthModule } from './auth/auth.module';
 import { TelemetriaModule } from './telemetria/telemetria.module';
 import { FirmasModule } from './firmas/firmas.module';
 import { UsuariosModule } from './usuarios/usuarios.module';
+import { EquipamientoModule } from './equipamiento/equipamiento.module';
+import { AuditoriaModule } from './auditoria/auditoria.module';
+import { IntegracionesModule } from './integraciones/integraciones.module';
 
 @Module({
   imports: [
@@ -31,9 +35,13 @@ import { UsuariosModule } from './usuarios/usuarios.module';
     PrismaModule,
     RedisModule,
     WebsocketModule,
+    AuthModule,
     TelemetriaModule,
     FirmasModule,
     UsuariosModule,
+    EquipamientoModule,
+    AuditoriaModule,
+    IntegracionesModule,
   ],
 })
 export class AppModule {}

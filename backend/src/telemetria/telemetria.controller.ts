@@ -35,4 +35,13 @@ export class TelemetriaController {
   async listarEventosRecientes() {
     return this.telemetriaService.obtenerUltimosEventos();
   }
+
+  @Post('limpiar')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({
+    summary: 'Limpia la malla de telemetría en vivo (Redis y registros de estaciones de prueba)',
+  })
+  async limpiarMalla() {
+    return this.telemetriaService.limpiarTelemetria();
+  }
 }

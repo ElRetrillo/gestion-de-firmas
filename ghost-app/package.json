@@ -1,0 +1,23 @@
+{
+  "name": "coquimbo-usb-ghost-agent",
+  "version": "2.0.0",
+  "description": "Agente Silencioso (Electron Ghost App) de Telemetría de Tokens Criptográficos USB - I. Municipalidad de Coquimbo",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "simulate": "node simulator.js"
+  },
+  "keywords": [
+    "electron",
+    "webhid",
+    "pkcs11",
+    "safenet",
+    "telemetria",
+    "coquimbo"
+  ],
+  "author": "Departamento de Ciberseguridad y Transformación Digital - Municipalidad de Coquimbo",
+  "license": "UNLICENSED",
+  "devDependencies": {
+    "electron": "^30.0.0"
+  }
+}

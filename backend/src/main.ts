@@ -7,11 +7,11 @@ async function bootstrap() {
   const logger = new Logger('Bootstrap');
   const app = await NestFactory.create(AppModule);
 
-  // Validación estricta de DTOs según lineamiento de ciberseguridad
+  // Validación de DTOs según lineamiento de ciberseguridad
   app.useGlobalPipes(
     new ValidationPipe({
       whitelist: true,
-      forbidNonWhitelisted: true,
+      forbidNonWhitelisted: false,
       transform: true,
     }),
   );
@@ -25,14 +25,18 @@ async function bootstrap() {
 
   // Documentación OpenAPI / Swagger
   const config = new DocumentBuilder()
-    .setTitle('Sistema de Gestión de Firmas y Telemetría de Tokens')
+    .setTitle('Sistema de Gestión de Firmas y Telemetría de Tokens - I. Municipalidad de Coquimbo')
     .setDescription(
-      'API Core para orquestación de firmas electrónicas (FirmaGob / ESIGN) y telemetría de hardware USB - Ilustre Municipalidad de Coquimbo',
+      'API Core Institucional conforme a Ley N° 19.799 (FEA), Ley N° 21.180 (Transformación Digital), Ley N° 21.663 (ANCI) e ISO/IEC 27001.',
     )
-    .setVersion('1.0.0')
+    .setVersion('2.0.0')
+    .addTag('Autenticación, OIDC y Seguridad eHSM')
     .addTag('Telemetría USB')
     .addTag('Orquestación de Firmas y Checksign')
     .addTag('Usuarios e Identidades Digitales')
+    .addTag('Equipamiento Criptográfico y Actas de Custodia')
+    .addTag('Auditoría Forense e Historial Inmutable (ANCI)')
+    .addTag('Integraciones Externas y Webhooks (HMAC-SHA256)')
     .addBearerAuth()
     .build();
 

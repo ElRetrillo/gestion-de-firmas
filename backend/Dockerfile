@@ -2,6 +2,8 @@
 # Etapa 1: Construcción y generación de Prisma Client
 FROM node:20-alpine AS builder
 
+RUN apk add --no-cache openssl
+
 WORKDIR /app
 
 # Copia de manifiestos de dependencias
@@ -20,6 +22,8 @@ RUN npm run build
 
 # Etapa 2: Imagen final de producción optimizada
 FROM node:20-alpine AS runner
+
+RUN apk add --no-cache openssl
 
 WORKDIR /app
 

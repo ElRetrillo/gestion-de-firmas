@@ -50,17 +50,36 @@ export class TelemetriaGateway implements OnGatewayConnection, OnGatewayDisconne
     codigoPc: string;
     estadoHardware: 'DESCONECTADO' | 'CONECTADO' | 'FIRMANDO';
     timestamp: string;
+    ipAsignada?: string;
+    dependenciaFisica?: string;
+    serialNumber?: string;
+    vendorId?: string;
+    marca?: string;
+    modelo?: string;
     tokenInfo?: {
       serialNumber?: string;
       vendorId?: string;
       marca?: string;
       modelo?: string;
-    };
+    } | null;
     metadatos?: Record<string, unknown>;
   }) {
     if (this.server) {
-      this.server.to('dashboard-supervisores').emit('estado_pc_actualizado', payload);
-      this.server.emit('estado_pc_actualizado', payload); // Emisión global de respaldo
+      // Emitir una sola vez globalmente (incluye a la sala dashboard-supervisores sin duplicar el evento)
+      this.server.emit('estado_pc_actualizado', payload);
+    }
+  }
+
+  broadcastLimpiarMalla() {
+    if (this.server) {
+      this.server.emit('telemetria_malla_limpiada', { timestamp: new Date().toISOString() });
+    }
+  }
+
+  emitirActualizacionPresencia(payload: Record<string, unknown>) {
+    if (this.server) {
+      this.server.emit('evento_sistema_firma', payload);
     }
   }
 }
+
