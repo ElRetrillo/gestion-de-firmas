@@ -98,15 +98,19 @@ export class SeedService implements OnModuleInit {
       const adminsActivos = await this.prisma.usuario.count({ where: { rol: 'ADMIN' } });
       if (adminsActivos > 0) return;
 
-      const rutAdmin = process.env.ADMIN_INICIAL_RUT;
+      const rutAdminRaw = process.env.ADMIN_INICIAL_RUT;
       const nombreAdmin = process.env.ADMIN_INICIAL_NOMBRE;
       const emailAdmin = process.env.ADMIN_INICIAL_EMAIL;
-      if (!rutAdmin || !nombreAdmin || !emailAdmin) {
+      if (!rutAdminRaw || !nombreAdmin || !emailAdmin) {
         this.logger.error(
           'No existe ningún ADMIN y faltan ADMIN_INICIAL_RUT / ADMIN_INICIAL_NOMBRE / ADMIN_INICIAL_EMAIL en el entorno. No se puede crear el administrador inicial.',
         );
         return;
       }
+
+      // Normaliza el RUT automáticamente (ej: 213748084 -> 21.374.808-4)
+      const { formatRut } = await import('../common/rut.util');
+      const rutAdmin = formatRut(rutAdminRaw.trim()) || rutAdminRaw.trim();
 
       const cargoAdmin = process.env.ADMIN_INICIAL_CARGO || 'Administrador de Sistemas';
       const unidadAdmin = process.env.ADMIN_INICIAL_UNIDAD || 'Dirección de TICs';
@@ -114,6 +118,8 @@ export class SeedService implements OnModuleInit {
       const passwordProvista = process.env.ADMIN_INICIAL_PASSWORD;
       const passwordTemporal = passwordProvista || generarPasswordTemporal();
       const pinTemporal = process.env.ADMIN_INICIAL_PIN || generarPin();
+      // Si se definió explícitamente en el .env, no forzar cambio obligatorio en el primer login
+      const debeCambiar = !passwordProvista;
 
       await this.prisma.usuario.upsert({
         where: { rut: rutAdmin },
@@ -122,7 +128,7 @@ export class SeedService implements OnModuleInit {
           estado: 'ACTIVO',
           passwordHash: hashSecret(passwordTemporal),
           pinHash: hashSecret(pinTemporal),
-          debeCambiarPassword: true,
+          debeCambiarPassword: debeCambiar,
         },
         create: {
           rut: rutAdmin,
@@ -134,7 +140,7 @@ export class SeedService implements OnModuleInit {
           rol: 'ADMIN',
           estado: 'ACTIVO',
           pinHash: hashSecret(pinTemporal),
-          debeCambiarPassword: true,
+          debeCambiarPassword: debeCambiar,
         },
       });
 
