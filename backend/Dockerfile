@@ -38,11 +38,12 @@ COPY --from=builder /app/node_modules/.prisma ./node_modules/.prisma
 COPY --from=builder /app/node_modules/@prisma ./node_modules/@prisma
 COPY --from=builder /app/prisma ./prisma
 COPY --from=builder /app/dist ./dist
+COPY docker-entrypoint.sh ./docker-entrypoint.sh
 
 # Asignar permisos al usuario no privilegiado y cambiar de usuario
-RUN chown -R node:node /app
+RUN chmod +x docker-entrypoint.sh && chown -R node:node /app
 USER node
 
 EXPOSE 3001
 
-CMD ["node", "dist/main.js"]
+ENTRYPOINT ["./docker-entrypoint.sh"]
