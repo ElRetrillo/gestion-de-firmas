@@ -37,7 +37,9 @@ El simulador oficial se encuentra en [`ghost-app/simulator.js`](file:///C:/Users
 1. Abre el Frontend en el navegador en la sección **Telemetría de Tokens** (`http://localhost:5173` o `http://localhost:3000`).
 2. Abre una terminal de PowerShell y corre el simulador:
    ```powershell
-   node "C:\Users\Daniel UCN\gestion-de-firmas\ghost-app\simulator.js"
+   node ghost-app/simulator.js
+   # O alternativamente desde la carpeta ghost-app:
+   # cd ghost-app && npm run simulate
    ```
 3. Verifica que en pantalla las estaciones `PC-SECMUN-01`, `PC-DOM-05` y la estación local (`os.hostname()`) actualicen su estado inmediatamente a través de WebSockets sin recargar la página.
 
@@ -47,19 +49,19 @@ El simulador oficial se encuentra en [`ghost-app/simulator.js`](file:///C:/Users
 
 #### A. Inyectar Token Conectado en Reposo (`CONECTADO`):
 ```powershell
+# Ejemplo con el nombre tal como lo registra el Sistema Operativo (FriendlyName / DeviceName):
 Invoke-RestMethod -Uri "http://localhost:3001/api/v1/telemetria/usb" -Method POST -Headers @{ "Content-Type" = "application/json" } -Body '{
   "codigoPc": "PC-DOM-05",
   "estadoHardware": "CONECTADO",
-  "serialNumber": "SN-SAF-98214",
+  "serialNumber": "SN-0529-D453B70C2CF7",
   "vendorId": "0x0529",
-  "marca": "Thales / SafeNet",
-  "modelo": "eToken 5110 CC (FIPS 140-2 L3)",
+  "marca": "SafeNet Inc.",
+  "modelo": "SafeNet eToken 5110",
   "ipAsignada": "10.20.2.45",
   "dependenciaFisica": "Dirección de Obras Municipales",
   "metadatos": {
-    "slot": 1,
-    "fipsCertified": true,
-    "driver": "SafeNet Authentication Client 10.8"
+    "osDeviceName": "SafeNet eToken 5110",
+    "driver": "SafeNet Authentication Client"
   }
 }'
 ```
@@ -84,22 +86,27 @@ Invoke-RestMethod -Uri "http://localhost:3001/api/v1/telemetria/usb" -Method POS
 
 ---
 
-### Método 3: Verificación de Persistencia en Base de Datos y Redis
+### Método 3: Verificación de Persistencia, Deduplicación y Alerta de Inactividad
 
-#### 1. Consultar estado consolidado en vivo (Redis + PostgreSQL):
+> [!IMPORTANT]
+> **Política de Deduplicación y Monitoreo de Seguridad:**
+> 1. **Registro Único por Transición**: Al desconectarse o conectarse un token, el evento se registra **una sola vez** en la base de datos forense (`telemetria_eventos`). Mientras la ranura permanezca vacía esperando conexión, los sondeos periódicos no se apilan ni saturan la bitácora.
+> 2. **Alerta de Inactividad (> 5 minutos)**: El sistema lleva la marca de tiempo de conexión en Redis. Si un token permanece conectado por más de 5 minutos sin realizar firmas, el sistema emite automáticamente una alerta de seguridad (`alertaInactividad: true`).
+
+#### 1. Consultar estado consolidado en vivo con alertas de inactividad:
 ```powershell
-Invoke-RestMethod -Uri "http://localhost:3001/api/v1/telemetria/estaciones" | ConvertTo-Json -Depth 3
+Invoke-RestMethod -Uri "http://localhost:3001/api/v1/telemetria/estaciones" | Select-Object codigoPc, estadoEnVivo, minutosConectado, alertaInactividad, alertaMensaje | Format-Table -AutoSize
 ```
 
-#### 2. Consultar bitácora forense de auditoría ANCI:
+#### 2. Consultar bitácora forense de auditoría ANCI (solo eventos únicos):
 ```powershell
-Invoke-RestMethod -Uri "http://localhost:3001/api/v1/telemetria/eventos-recientes" | ConvertTo-Json -Depth 3
+Invoke-RestMethod -Uri "http://localhost:3001/api/v1/telemetria/eventos-recientes" | Select-Object codigoPc, evento, timestamp | Format-Table -AutoSize
 ```
 
-#### 3. Verificar clave efímera y TTL en Redis (3600 segundos):
+#### 3. Verificar estado en Redis y clave de tiempo de conexión:
 ```powershell
-docker exec -it gestion-firmas-redis redis-cli GET "pc:PC-DOM-05"
-docker exec -it gestion-firmas-redis redis-cli TTL "pc:PC-DOM-05"
+docker exec -it gestion-firmas-redis redis-cli GET "pc:status:PC-DOM-05"
+docker exec -it gestion-firmas-redis redis-cli GET "token:connected_at:PC-DOM-05"
 ```
 
 ---
@@ -108,7 +115,9 @@ docker exec -it gestion-firmas-redis redis-cli TTL "pc:PC-DOM-05"
 
 Para estaciones de trabajo con tokens físicos USB conectados:
 ```powershell
-node "C:\Users\Daniel UCN\gestion-de-firmas\ghost-app\main.js"
+node ghost-app/main.js
+# O usando el script directo:
+# .\iniciar-agente.bat
 ```
 - Lee automáticamente el `os.hostname()` de la máquina.
 - Escanea el bus PnP/WebHID buscando Vendor IDs autorizados (`0x0529` SafeNet, `0x0DC3` Athena, `0x096E` Feitian).

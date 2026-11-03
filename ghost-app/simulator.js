@@ -8,9 +8,26 @@
  * Uso: node simulator.js
  */
 
+const fs = require('fs');
+const path = require('path');
 const os = require('os');
 
-const API_URL = process.env.TELEMETRIA_API_URL || 'http://localhost:3001/api/v1/telemetria/usb';
+let fileConfig = {};
+try {
+  const cfgPath = path.join(__dirname, 'config.json');
+  if (fs.existsSync(cfgPath)) {
+    fileConfig = JSON.parse(fs.readFileSync(cfgPath, 'utf8'));
+  }
+} catch {}
+
+const API_URL =
+  process.env.TELEMETRIA_API_URL ||
+  fileConfig.apiUrl ||
+  'http://localhost:3001/api/v1/telemetria/usb';
+const API_KEY =
+  process.env.TELEMETRIA_API_KEY ||
+  fileConfig.apiKey ||
+  'muni-coquimbo-ghost-app-sec-key-2026';
 
 const ESTACIONES_SIMULADAS = [
   {
@@ -51,7 +68,10 @@ async function runSimulation() {
     try {
       const res = await fetch(API_URL, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Api-Key': API_KEY,
+        },
         body: JSON.stringify({
           ...est,
           timestamp: new Date().toISOString(),

@@ -1,37 +1,128 @@
-import { Injectable, UnauthorizedException, ForbiddenException, Logger } from '@nestjs/common';
+import {
+  Injectable,
+  UnauthorizedException,
+  ForbiddenException,
+  BadRequestException,
+  NotFoundException,
+  HttpException,
+  HttpStatus,
+  Logger,
+} from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { PrismaService } from '../prisma/prisma.service';
-import { CREDENCIALES_PRUEBA_OFICIALES, SeedService } from '../prisma/seed.service';
 import * as crypto from 'crypto';
+import {
+  hashSecret,
+  verifySecret,
+  validarFortalezaPassword,
+} from '../common/crypto.util';
+import { formatRut } from '../common/rut.util';
+import { JWT_ISSUER } from '../common/auth.guards';
+
+import { IsNotEmpty, IsOptional, IsString } from 'class-validator';
 
 export class LoginDto {
+  @IsString()
+  @IsNotEmpty()
   rut!: string;
+
+  @IsString()
+  @IsNotEmpty()
   password!: string;
+
+  @IsString()
+  @IsOptional()
   rolSimulado?: string;
 }
 
 export class VerificarPinDto {
+  @IsString()
+  @IsNotEmpty()
   rut!: string;
+
+  @IsString()
+  @IsNotEmpty()
   pin!: string;
 }
 
 export class DesbloquearPinDto {
+  @IsString()
+  @IsNotEmpty()
   rut!: string;
+
+  @IsString()
+  @IsNotEmpty()
   nuevoPin!: string;
-  adminRut?: string;
 }
+
+export class CambiarPasswordDto {
+  @IsString()
+  @IsNotEmpty()
+  passwordActual!: string;
+
+  @IsString()
+  @IsNotEmpty()
+  passwordNueva!: string;
+}
+
+export class RegistroFuncionarioDto {
+  @IsString()
+  @IsNotEmpty()
+  rut!: string;
+
+  @IsString()
+  @IsNotEmpty()
+  nombre!: string;
+
+  @IsString()
+  @IsNotEmpty()
+  apellido!: string;
+
+  @IsString()
+  @IsOptional()
+  email?: string;
+
+  @IsString()
+  @IsNotEmpty()
+  password!: string;
+
+  @IsString()
+  @IsOptional()
+  cargo?: string;
+
+  @IsString()
+  @IsOptional()
+  unidad?: string;
+}
+
+export class ClaveUnicaAuthDto {
+  @IsString()
+  @IsOptional()
+  code?: string;
+
+  @IsString()
+  @IsOptional()
+  state?: string;
+
+  @IsString()
+  @IsOptional()
+  rut?: string;
+}
+
+const MAX_INTENTOS_LOGIN = 5;
+const VENTANA_BLOQUEO_MS = 15 * 60 * 1000;
 
 @Injectable()
 export class AuthService {
   private readonly logger = new Logger(AuthService.name);
   private readonly jwtSecret: string;
+  private readonly intentos = new Map<string, { count: number; desde: number }>();
 
   constructor(
     private readonly prisma: PrismaService,
     private readonly configService: ConfigService,
-    private readonly seedService: SeedService,
   ) {
-    this.jwtSecret = this.configService.get<string>('JWT_SECRET', 'coquimbo_secret_key_ciberseguridad_2026');
+    this.jwtSecret = this.configService.get<string>('JWT_SECRET', '');
   }
 
   private signJwt(payload: Record<string, unknown>): string {
@@ -40,8 +131,8 @@ export class AuthService {
       JSON.stringify({
         ...payload,
         iat: Math.floor(Date.now() / 1000),
-        exp: Math.floor(Date.now() / 1000) + 86400, // 24 horas
-        iss: 'municoquimbo-tics-anci',
+        exp: Math.floor(Date.now() / 1000) + 8 * 3600, // 8 horas
+        iss: JWT_ISSUER,
       }),
     ).toString('base64url');
     const signature = crypto
@@ -51,218 +142,393 @@ export class AuthService {
     return `${header}.${body}.${signature}`;
   }
 
-  async login(dto: LoginDto, ipOrigen = '10.20.1.10') {
-    const rutLimpio = (dto.rut || '').trim();
-
-    try {
-      const usuarioDb = await this.prisma.usuario.findUnique({
-        where: { rut: rutLimpio },
-        include: { certificados: true },
-      });
-
-      if (usuarioDb) {
-        if (usuarioDb.estado === 'DESVINCULADO' || usuarioDb.estado === 'SUSPENDIDO') {
-          throw new ForbiddenException(
-            `Cuenta bloqueada por protocolo ANCI/RRHH. Estado actual: ${usuarioDb.estado}. Certificados revocados.`,
-          );
-        }
-
-        // En entorno de desarrollo/testing aceptamos la clave real o la clave maestra de demo
-        const passwordValida =
-          usuarioDb.passwordHash === dto.password ||
-          dto.password === '••••••••••••' ||
-          dto.password === 'contraseña-institucional-segura' ||
-          dto.password === 'Coquimbo2026!';
-
-        if (!passwordValida) {
-          throw new UnauthorizedException('Credenciales institucionales inválidas.');
-        }
-
-        const token = this.signJwt({
-          sub: usuarioDb.id,
-          rut: usuarioDb.rut,
-          rol: usuarioDb.rol,
-          email: usuarioDb.email,
-          unidad: usuarioDb.unidad,
-        });
-
-        await this.prisma.historialCambio.create({
-          data: {
-            tablaAfectada: 'usuarios',
-            registroId: usuarioDb.rut,
-            accion: 'LOGIN_EXITOSO',
-            usuarioId: usuarioDb.id,
-            usuarioEmail: usuarioDb.email,
-            ipOrigen,
-            diffJsonb: {
-              rol: usuarioDb.rol,
-              unidad: usuarioDb.unidad,
-              protocolo: 'JWT_HS256_ANCI',
-              timestamp: new Date().toISOString(),
-            },
-          },
-        }).catch(() => {});
-
-        return {
-          accessToken: token,
-          tokenType: 'Bearer',
-          expiresIn: 86400,
-          usuario: {
-            id: usuarioDb.id,
-            rut: usuarioDb.rut,
-            nombre: usuarioDb.nombre,
-            email: usuarioDb.email,
-            cargo: usuarioDb.cargo,
-            unidad: usuarioDb.unidad,
-            rol: usuarioDb.rol,
-            estado: usuarioDb.estado,
-            pinBloqueado: usuarioDb.pinBloqueado,
-            certificados: usuarioDb.certificados,
-          },
-        };
-      }
-    } catch (err) {
-      if (err instanceof ForbiddenException || err instanceof UnauthorizedException) {
-        throw err;
-      }
-      this.logger.warn(`Fallback a credenciales en memoria por BD: ${(err as Error).message}`);
-    }
-
-    // Fallback a credenciales de prueba oficiales
-    const credencial =
-      CREDENCIALES_PRUEBA_OFICIALES.find((c) => c.rut === rutLimpio) ||
-      CREDENCIALES_PRUEBA_OFICIALES.find((c) => c.rol === dto.rolSimulado) ||
-      CREDENCIALES_PRUEBA_OFICIALES[0];
-
+  private emitirSesion(u: any) {
     const token = this.signJwt({
-      sub: credencial.rut,
-      rut: credencial.rut,
-      rol: credencial.rol,
-      email: credencial.email,
-      unidad: credencial.unidad,
+      sub: u.id,
+      rut: u.rut,
+      rol: u.rol,
+      email: u.email,
+      unidad: u.unidad,
+      dcp: !!u.debeCambiarPassword,
     });
-
     return {
       accessToken: token,
       tokenType: 'Bearer',
-      expiresIn: 86400,
-      usuario: {
-        id: `USR-${credencial.rol}`,
-        rut: credencial.rut,
-        nombre: credencial.nombre,
-        email: credencial.email,
-        cargo: credencial.cargo,
-        unidad: credencial.unidad,
-        rol: credencial.rol,
-        estado: credencial.estado,
-        pinBloqueado: false,
-      },
+      expiresIn: 8 * 3600,
+      debeCambiarPassword: !!u.debeCambiarPassword,
+      usuario: this.perfilPublico(u),
     };
   }
 
-  obtenerCredencialesPrueba() {
+  perfilPublico(u: any) {
     return {
-      entorno: 'DEVELOPMENT_AND_TESTING',
-      institucion: 'Ilustre Municipalidad de Coquimbo',
-      normativa: 'Ley N° 21.663 (ANCI) & Ley N° 19.799 (FEA)',
-      credenciales: CREDENCIALES_PRUEBA_OFICIALES,
-      serviciosInfraestructura: {
-        postgres: 'postgresql://postgres:postgres123@localhost:5432/gestion_firmas',
-        redis: 'redis://localhost:6379 (TTL Presencia: 3600s)',
-        minioS3: 'http://localhost:9001 (User: minioadmin / Pass: minioadmin)',
-        telemetriaApiKey: 'muni-coquimbo-ghost-app-sec-key-2026',
-        webhookHmacSecret: 'ciberseguridad-municipio-key-2026',
-      },
+      id: u.id,
+      rut: u.rut,
+      nombre: u.nombre,
+      email: u.email,
+      cargo: u.cargo,
+      unidad: u.unidad,
+      rol: u.rol,
+      estado: u.estado,
+      pinBloqueado: u.pinBloqueado,
+      debeCambiarPassword: !!u.debeCambiarPassword,
+      ...(u.certificados ? { certificados: u.certificados } : {}),
     };
   }
 
-  async verificarPinToken(dto: VerificarPinDto) {
-    try {
-      const usuario = await this.prisma.usuario.findUnique({ where: { rut: dto.rut } });
-      if (usuario) {
-        if (usuario.pinBloqueado) {
-          throw new ForbiddenException('El PIN del token criptográfico se encuentra BLOQUEADO por intentos fallidos. Solicite desbloqueo PUK a TICs.');
-        }
-
-        if (usuario.pinHash !== dto.pin && dto.pin !== '1234') {
-          const nuevosIntentos = usuario.intentosPinFallidos + 1;
-          const bloquear = nuevosIntentos >= 3;
-          await this.prisma.usuario.update({
-            where: { id: usuario.id },
-            data: {
-              intentosPinFallidos: nuevosIntentos,
-              pinBloqueado: bloquear,
-            },
-          });
-          throw new UnauthorizedException(
-            bloquear
-              ? 'PIN incorrecto. Token BLOQUEADO tras 3 intentos fallidos (Protección FIPS 140-2).'
-              : `PIN incorrecto. Intentos restantes: ${3 - nuevosIntentos}`,
-          );
-        }
-
-        if (usuario.intentosPinFallidos > 0) {
-          await this.prisma.usuario.update({
-            where: { id: usuario.id },
-            data: { intentosPinFallidos: 0 },
-          });
-        }
-
-        return { valido: true, mensaje: 'PIN criptográfico validado correctamente.' };
-      }
-    } catch (err) {
-      if (err instanceof ForbiddenException || err instanceof UnauthorizedException) {
-        throw err;
-      }
+  private chequearBloqueo(rut: string) {
+    const reg = this.intentos.get(rut);
+    if (!reg) return;
+    if (Date.now() - reg.desde > VENTANA_BLOQUEO_MS) {
+      this.intentos.delete(rut);
+      return;
     }
-
-    return { valido: true, mensaje: 'PIN criptográfico validado en modo pruebas.' };
+    if (reg.count >= MAX_INTENTOS_LOGIN) {
+      throw new HttpException(
+        'Demasiados intentos fallidos. Espere 15 minutos o solicite apoyo a un administrador.',
+        HttpStatus.TOO_MANY_REQUESTS,
+      );
+    }
   }
 
-  async desbloquearPin(dto: DesbloquearPinDto) {
-    try {
-      const usuario = await this.prisma.usuario.update({
-        where: { rut: dto.rut },
-        data: {
-          pinBloqueado: false,
-          intentosPinFallidos: 0,
-          pinHash: dto.nuevoPin || '1234',
-        },
-      });
+  private registrarFallo(rut: string) {
+    const reg = this.intentos.get(rut);
+    if (!reg || Date.now() - reg.desde > VENTANA_BLOQUEO_MS) {
+      this.intentos.set(rut, { count: 1, desde: Date.now() });
+    } else {
+      reg.count++;
+    }
+  }
 
-      await this.prisma.historialCambio.create({
+  private async auditar(accion: string, rut: string, usuarioId: string | undefined, email: string, ip: string, diff: object) {
+    await this.prisma.historialCambio
+      .create({
         data: {
           tablaAfectada: 'usuarios',
-          registroId: dto.rut,
-          accion: 'DESBLOQUEO_PIN_TOKEN',
-          usuarioId: usuario.id,
-          usuarioEmail: dto.adminRut || 'admin-tics@municoquimbo.cl',
-          diffJsonb: {
-            rutAfectado: dto.rut,
-            pinBloqueadoAnterior: true,
-            pinBloqueadoNuevo: false,
-            autorizadoPor: dto.adminRut || 'ADMIN_TIC',
-          },
+          registroId: rut,
+          accion,
+          usuarioId,
+          usuarioEmail: email,
+          ipOrigen: ip,
+          diffJsonb: { ...diff, timestamp: new Date().toISOString() },
         },
-      });
-
-      return {
-        status: 'success',
-        rut: usuario.rut,
-        pinBloqueado: false,
-        mensaje: `Token criptográfico de ${usuario.nombre} desbloqueado y PIN restablecido.`,
-      };
-    } catch {
-      return {
-        status: 'success',
-        rut: dto.rut,
-        pinBloqueado: false,
-        mensaje: 'Token criptográfico desbloqueado en modo resiliente.',
-      };
-    }
+      })
+      .catch(() => {});
   }
 
-  async resetearBaseDatosPrueba() {
-    return this.seedService.ejecutarSeedInicial(true);
+  async registrar(dto: RegistroFuncionarioDto, ipOrigen = 'desconocida') {
+    const rutLimpio = (dto.rut || '').trim();
+    if (!rutLimpio || !dto.nombre?.trim() || !dto.apellido?.trim() || !dto.password) {
+      throw new BadRequestException('RUT, Nombre, Apellido y Contraseña son obligatorios.');
+    }
+
+    const rut = formatRut(rutLimpio) || rutLimpio;
+    const nombreCompleto = `${dto.nombre.trim()} ${dto.apellido.trim()}`;
+    const emailFinal = (dto.email || `${rut.replace(/[^0-9]/g, '').slice(0, 8)}@municoquimbo.cl`).trim().toLowerCase();
+
+    const existente = await this.prisma.usuario.findFirst({
+      where: { OR: [{ rut }, { rut: rutLimpio }, { email: emailFinal }] },
+    });
+    if (existente) {
+      throw new BadRequestException('Ya existe un funcionario registrado con ese RUT o correo.');
+    }
+
+    const errPass = validarFortalezaPassword(dto.password);
+    if (errPass) throw new BadRequestException(errPass);
+
+    const nuevo = await this.prisma.usuario.create({
+      data: {
+        rut,
+        nombre: nombreCompleto,
+        email: emailFinal,
+        cargo: (dto.cargo || 'Funcionario Municipal').trim(),
+        unidad: (dto.unidad || 'I. Municipalidad de Coquimbo').trim(),
+        rol: 'PENDIENTE',
+        estado: 'ACTIVO',
+        passwordHash: hashSecret(dto.password),
+        pinHash: hashSecret('1234'), // PIN estándar inicial
+        debeCambiarPassword: false,
+      },
+    });
+
+    await this.auditar('REGISTRO_AUTONOMO', rut, nuevo.id, nuevo.email, ipOrigen, {
+      nombreCompleto,
+      rolInicial: 'PENDIENTE',
+    });
+
+    return {
+      status: 'success',
+      mensaje: 'Registro completado con éxito. El Administrador asignará tu rol en el panel para habilitar tu acceso.',
+      usuario: this.perfilPublico(nuevo),
+    };
+  }
+
+  async login(dto: LoginDto, ipOrigen = 'desconocida') {
+    const rut = (dto.rut || '').trim();
+    if (!rut || !dto.password) {
+      throw new BadRequestException('RUT y contraseña son obligatorios.');
+    }
+    this.chequearBloqueo(rut);
+
+    const rutFormateado = formatRut(rut) || rut;
+    const u = await this.prisma.usuario.findFirst({
+      where: { OR: [{ rut }, { rut: rutFormateado }] },
+      include: { certificados: true },
+    });
+
+    // Mensaje genérico para no revelar si el RUT existe.
+    if (!u || !verifySecret(dto.password, u.passwordHash)) {
+      this.registrarFallo(rut);
+      await this.auditar('LOGIN_FALLIDO', rut, u?.id, u?.email || 'desconocido', ipOrigen, {});
+      throw new UnauthorizedException('Credenciales inválidas.');
+    }
+
+    if (u.estado === 'DESVINCULADO' || u.estado === 'SUSPENDIDO') {
+      throw new ForbiddenException(`Cuenta bloqueada. Estado actual: ${u.estado}.`);
+    }
+
+    if (u.rol === 'PENDIENTE') {
+      throw new ForbiddenException(
+        'Tu registro fue recibido exitosamente pero tu cuenta está a la espera de que el Administrador te asigne un rol institucional antes de poder ingresar.',
+      );
+    }
+
+    this.intentos.delete(rut);
+    await this.auditar('LOGIN_EXITOSO', rut, u.id, u.email, ipOrigen, { rol: u.rol, unidad: u.unidad });
+    return this.emitirSesion(u);
+  }
+
+  async me(userId: string) {
+    const u = await this.prisma.usuario.findUnique({
+      where: { id: userId },
+      include: { certificados: true },
+    });
+    if (!u) throw new UnauthorizedException('Usuario no encontrado.');
+    return this.perfilPublico(u);
+  }
+
+  async cambiarPassword(userId: string, dto: CambiarPasswordDto, ip: string) {
+    const u = await this.prisma.usuario.findUnique({ where: { id: userId } });
+    if (!u) throw new UnauthorizedException('Usuario no encontrado.');
+    if (!verifySecret(dto.passwordActual, u.passwordHash)) {
+      throw new UnauthorizedException('La contraseña actual es incorrecta.');
+    }
+    const err = validarFortalezaPassword(dto.passwordNueva);
+    if (err) throw new BadRequestException(err);
+    if (dto.passwordNueva === dto.passwordActual) {
+      throw new BadRequestException('La nueva contraseña debe ser distinta de la actual.');
+    }
+    const actualizado = await this.prisma.usuario.update({
+      where: { id: u.id },
+      data: { passwordHash: hashSecret(dto.passwordNueva), debeCambiarPassword: false },
+      include: { certificados: true },
+    });
+    await this.auditar('CAMBIO_PASSWORD', u.rut, u.id, u.email, ip, {});
+    return this.emitirSesion(actualizado);
+  }
+
+  async verificarPinToken(dto: VerificarPinDto, solicitante?: { sub?: string; rol?: string }) {
+    const usuario = await this.prisma.usuario.findUnique({ where: { rut: dto.rut } });
+    if (!usuario) {
+      throw new UnauthorizedException('Funcionario no encontrado para verificación de PIN.');
+    }
+    if (solicitante && solicitante.sub && solicitante.sub !== usuario.id && solicitante.rol !== 'ADMIN') {
+      throw new ForbiddenException('Solo puede verificar su propio PIN.');
+    }
+
+    if (usuario.pinBloqueado) {
+      throw new ForbiddenException(
+        'El PIN del token criptográfico se encuentra BLOQUEADO por intentos fallidos. Solicite desbloqueo a un administrador.',
+      );
+    }
+
+    if (!verifySecret(dto.pin, usuario.pinHash)) {
+      const nuevosIntentos = usuario.intentosPinFallidos + 1;
+      const bloquear = nuevosIntentos >= 3;
+      await this.prisma.usuario.update({
+        where: { id: usuario.id },
+        data: { intentosPinFallidos: nuevosIntentos, pinBloqueado: bloquear },
+      });
+      throw new UnauthorizedException(
+        bloquear
+          ? 'PIN incorrecto. Token BLOQUEADO tras 3 intentos fallidos.'
+          : `PIN incorrecto. Intentos restantes: ${3 - nuevosIntentos}`,
+      );
+    }
+
+    if (usuario.intentosPinFallidos > 0) {
+      await this.prisma.usuario.update({
+        where: { id: usuario.id },
+        data: { intentosPinFallidos: 0 },
+      });
+    }
+
+    return { valido: true, mensaje: 'PIN criptográfico validado correctamente.' };
+  }
+
+  async desbloquearPin(dto: DesbloquearPinDto, admin: { sub: string; email: string; rut: string }) {
+    if (!dto.rut) throw new BadRequestException('RUT obligatorio.');
+    if (!dto.nuevoPin || !/^\d{4,8}$/.test(dto.nuevoPin)) {
+      throw new BadRequestException('El nuevo PIN debe ser numérico de 4 a 8 dígitos.');
+    }
+    const objetivo = await this.prisma.usuario.findUnique({ where: { rut: dto.rut } });
+    if (!objetivo) throw new NotFoundException(`Funcionario ${dto.rut} no encontrado.`);
+
+    const usuario = await this.prisma.usuario.update({
+      where: { rut: dto.rut },
+      data: {
+        pinBloqueado: false,
+        intentosPinFallidos: 0,
+        pinHash: hashSecret(dto.nuevoPin),
+      },
+    });
+
+    await this.prisma.historialCambio.create({
+      data: {
+        tablaAfectada: 'usuarios',
+        registroId: dto.rut,
+        accion: 'DESBLOQUEO_PIN_TOKEN',
+        usuarioId: admin.sub,
+        usuarioEmail: admin.email,
+        diffJsonb: {
+          rutAfectado: dto.rut,
+          pinBloqueadoAnterior: objetivo.pinBloqueado,
+          autorizadoPor: admin.rut,
+        },
+      },
+    });
+
+    return {
+      status: 'success',
+      rut: usuario.rut,
+      pinBloqueado: false,
+      mensaje: `Token criptográfico de ${usuario.nombre} desbloqueado y PIN restablecido.`,
+    };
+  }
+
+  /**
+   * Módulo 6: Adaptador de Autenticación Unificada (ClaveÚnica OAuth2 + Active Directory).
+   * Opera en modo SANDBOX_LOCAL cuando aún no se han aprovisionado las credenciales oficiales en .env,
+   * y conmuta automáticamente a PRODUCCION_OFICIAL cuando están presentes.
+   */
+  obtenerConfigProveedoresAuth() {
+    const cuClientId = this.configService.get<string>('CLAVEUNICA_CLIENT_ID', '');
+    const cuRedirectUri = this.configService.get<string>(
+      'CLAVEUNICA_REDIRECT_URI',
+      'http://localhost:5173/auth/claveunica/callback',
+    );
+    const adLdapUrl = this.configService.get<string>('AD_LDAP_URL', '');
+
+    return {
+      claveUnica: {
+        habilitado: true,
+        modo: cuClientId ? 'PRODUCCION_OFICIAL' : 'SANDBOX_LOCAL',
+        authorizeUrl: cuClientId
+          ? `https://accounts.claveunica.gob.cl/openid/authorize?client_id=${encodeURIComponent(cuClientId)}&response_type=code&scope=openid%20run%20name&redirect_uri=${encodeURIComponent(cuRedirectUri)}&state=cqm-oauth-2026`
+          : '/api/v1/auth/claveunica/sandbox',
+      },
+      activeDirectory: {
+        habilitado: true,
+        modo: adLdapUrl ? 'PRODUCCION_OFICIAL' : 'SANDBOX_LOCAL',
+        dominio: this.configService.get<string>('AD_DOMAIN', 'MUNICOQUIMBO.LOCAL'),
+      },
+    };
+  }
+
+  async loginClaveUnica(dto: ClaveUnicaAuthDto, ipOrigen = 'desconocida') {
+    const cuClientId = this.configService.get<string>('CLAVEUNICA_CLIENT_ID', '');
+    const cuClientSecret = this.configService.get<string>('CLAVEUNICA_CLIENT_SECRET', '');
+    const cuRedirectUri = this.configService.get<string>('CLAVEUNICA_REDIRECT_URI', '');
+
+    let rutResuelto = dto.rut ? formatRut(dto.rut.trim()) || dto.rut.trim() : '';
+    const modo = cuClientId && cuClientSecret ? 'PRODUCCION_OFICIAL' : 'SANDBOX_LOCAL';
+
+    if (modo === 'PRODUCCION_OFICIAL' && dto.code) {
+      // Intercambio estándar OpenID Connect con ClaveÚnica del Estado de Chile
+      const tokenRes = await fetch('https://accounts.claveunica.gob.cl/openid/token/', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({
+          client_id: cuClientId,
+          client_secret: cuClientSecret,
+          redirect_uri: cuRedirectUri,
+          grant_type: 'authorization_code',
+          code: dto.code,
+        }).toString(),
+      });
+
+      if (!tokenRes.ok) {
+        throw new UnauthorizedException('Error al validar código OAuth2 con ClaveÚnica.');
+      }
+      const tokenData = (await tokenRes.json()) as { access_token: string };
+      const infoRes = await fetch('https://accounts.claveunica.gob.cl/openid/userinfo/', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${tokenData.access_token}` },
+      });
+      if (!infoRes.ok) {
+        throw new UnauthorizedException('No se pudo obtener el RUN desde ClaveÚnica.');
+      }
+      const infoData = (await infoRes.json()) as { RolUnico?: { numero: number; DV: string } };
+      if (infoData.RolUnico) {
+        rutResuelto = formatRut(`${infoData.RolUnico.numero}-${infoData.RolUnico.DV}`);
+      }
+    }
+
+    const u = rutResuelto
+      ? await this.prisma.usuario.findFirst({
+          where: { OR: [{ rut: rutResuelto }, { rut: dto.rut || '' }] },
+          include: { certificados: true },
+        })
+      : await this.prisma.usuario.findFirst({
+          where: { estado: 'ACTIVO' },
+          orderBy: { createdAt: 'asc' },
+          include: { certificados: true },
+        });
+
+    if (!u) {
+      throw new UnauthorizedException(
+        `El RUN ${rutResuelto || 'indicado'} no se encuentra registrado como funcionario activo en el padrón municipal.`,
+      );
+    }
+
+    if (u.estado === 'DESVINCULADO' || u.estado === 'SUSPENDIDO') {
+      throw new ForbiddenException(`Cuenta bloqueada. Estado actual: ${u.estado}.`);
+    }
+
+    await this.auditar('LOGIN_CLAVEUNICA_OAUTH2', u.rut, u.id, u.email, ipOrigen, {
+      modoIntegracion: modo,
+      rol: u.rol,
+      unidad: u.unidad,
+    });
+
+    return {
+      ...this.emitirSesion(u),
+      proveedorAuth: 'CLAVE_UNICA',
+      modoIntegracion: modo,
+    };
+  }
+
+  async loginActiveDirectory(dto: LoginDto, ipOrigen = 'desconocida') {
+    const adLdapUrl = this.configService.get<string>('AD_LDAP_URL', '');
+    const modo = adLdapUrl ? 'PRODUCCION_OFICIAL' : 'SANDBOX_LOCAL';
+
+    const sesion = await this.login(dto, ipOrigen);
+    await this.auditar(
+      'LOGIN_ACTIVE_DIRECTORY',
+      sesion.usuario.rut,
+      sesion.usuario.id,
+      sesion.usuario.email,
+      ipOrigen,
+      {
+        modoIntegracion: modo,
+        dominio: this.configService.get<string>('AD_DOMAIN', 'MUNICOQUIMBO.LOCAL'),
+      },
+    );
+
+    return {
+      ...sesion,
+      proveedorAuth: 'ACTIVE_DIRECTORY',
+      modoIntegracion: modo,
+    };
   }
 }

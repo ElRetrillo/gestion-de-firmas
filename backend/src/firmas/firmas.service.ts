@@ -294,6 +294,14 @@ export class FirmasService {
         },
       });
 
+      const certActivo = firmante?.certificados?.[0];
+      const proveedorCriptografico = certActivo?.tipo === 'ESIGN' ? 'ESIGN_CHILE' : 'FIRMAGOB';
+      const modoProveedor =
+        (proveedorCriptografico === 'FIRMAGOB' && process.env.FIRMAGOB_API_URL) ||
+        (proveedorCriptografico === 'ESIGN_CHILE' && process.env.ESIGN_API_URL)
+          ? 'PRODUCCION_OFICIAL'
+          : 'SANDBOX_LOCAL';
+
       await this.prisma.historialCambio.create({
         data: {
           usuarioId: firmante?.id || solicitud.usuarioSolicitanteId,
@@ -307,7 +315,9 @@ export class FirmasService {
             estadoNuevo: nuevoEstado,
             hashSha256: sha256Hash,
             codigoVerificacion: actualizada.codigoVerificacion,
-            certificadoSerial: firmante?.certificados?.[0]?.numeroSerie || 'FEA-E-TOKEN',
+            certificadoSerial: certActivo?.numeroSerie || 'FEA-E-TOKEN',
+            proveedorCriptografico,
+            modoProveedor,
             observacion: dto.observacion || null,
           },
           ipOrigen: '10.10.12.104',
@@ -499,8 +509,6 @@ export class FirmasService {
         unidadOrigen: doc.usuarioSolicitante?.unidad || 'Secretaría Municipal',
         estadoAprobacion: doc.estadoAprobacion,
         fePublicaOtorgada: doc.estadoFePublica === 'ATESTADO',
-        ministroDeFeNombre: 'Patricia Eugenia Rojas Valdivia (Secretaria Municipal)',
-        ministroDeFeRut: '10.892.341-2',
         fechaFePublica: doc.tsaTimestamp || doc.updatedAt,
         hashSha256Calculado: doc.hashSha256,
         algoritmo: 'SHA-256 + RSA-4096 (PAdES-LTV / PKCS#11)',
@@ -515,7 +523,7 @@ export class FirmasService {
           cert?.tipo === 'ESIGN'
             ? 'E-Sign S.A. - Autoridad Certificadora Acreditada'
             : 'FirmaGob - Ministerio Secretaría General de la Presidencia',
-        serialCertificado: cert?.numeroSerie || '0x4F9B882103AC55E1',
+        serialCertificado: cert?.numeroSerie || 'N/A',
         flujoVisacion: doc.flujoVisacionJsonb,
         urlDescargaDocumento: `/api/v1/firmas/solicitudes/${doc.id}/pdf`,
         urlCertificadoVerificacion: `/api/v1/firmas/checksign/${doc.codigoVerificacion || doc.codigoDocumento}/certificado-pdf`,
@@ -526,43 +534,70 @@ export class FirmasService {
     const isSha256Hex = /^[a-fA-F0-9]{64}$/.test(clean);
     const hash = isSha256Hex ? clean.toLowerCase() : crypto.createHash('sha256').update(clean).digest('hex');
 
-    const fallbackDoc = await this.prisma.solicitudFirma.findFirst({
-      where: { estadoAprobacion: EstadoAprobacion.FIRMADA },
-      include: { usuarioSolicitante: true },
+    const docPorHash = await this.prisma.solicitudFirma.findFirst({
+      where: { hashSha256: hash },
+      include: {
+        usuarioSolicitante: {
+          include: {
+            certificados: { where: { estado: 'VIGENTE' }, take: 1 },
+          },
+        },
+      },
     });
 
+    if (docPorHash) {
+      const cert = docPorHash.usuarioSolicitante?.certificados?.[0];
+      return {
+        encontradoEnRepositorio: true,
+        valido: docPorHash.estadoAprobacion === EstadoAprobacion.FIRMADA || docPorHash.estadoAprobacion === EstadoAprobacion.APROBADA,
+        integridadVerificada: true,
+        codigoDocumento: docPorHash.codigoDocumento,
+        codigoVerificacion: docPorHash.codigoVerificacion || `VERIF-${docPorHash.codigoDocumento}`,
+        codigoRegistroNotarial: docPorHash.codigoRegistroNotarial,
+        tituloDocumento: docPorHash.titulo,
+        resumenMateria: `Acto administrativo emitido por ${docPorHash.usuarioSolicitante?.unidad || 'Municipalidad de Coquimbo'} (${docPorHash.tipoTramite})`,
+        tipoTramite: docPorHash.tipoTramite,
+        clasificacion: docPorHash.clasificacion,
+        unidadOrigen: docPorHash.usuarioSolicitante?.unidad || 'Secretaría Municipal',
+        estadoAprobacion: docPorHash.estadoAprobacion,
+        fePublicaOtorgada: docPorHash.estadoFePublica === 'ATESTADO',
+        fechaFePublica: docPorHash.tsaTimestamp || docPorHash.updatedAt,
+        hashSha256Calculado: docPorHash.hashSha256,
+        algoritmo: 'SHA-256 + RSA-4096 (PAdES-LTV / PKCS#11)',
+        tsaTimestamp: (docPorHash.tsaTimestamp || docPorHash.updatedAt).toISOString(),
+        firmanteTitular: {
+          nombre: docPorHash.usuarioSolicitante?.nombre,
+          rut: docPorHash.usuarioSolicitante?.rut,
+          cargo: docPorHash.usuarioSolicitante?.cargo,
+          unidad: docPorHash.usuarioSolicitante?.unidad,
+        },
+        emisorCertificado:
+          cert?.tipo === 'ESIGN'
+            ? 'E-Sign S.A. - Autoridad Certificadora Acreditada'
+            : 'FirmaGob - Ministerio Secretaría General de la Presidencia',
+        serialCertificado: cert?.numeroSerie || 'N/A',
+        flujoVisacion: docPorHash.flujoVisacionJsonb,
+        urlDescargaDocumento: `/api/v1/firmas/solicitudes/${docPorHash.id}/pdf`,
+        urlCertificadoVerificacion: `/api/v1/firmas/checksign/${docPorHash.codigoVerificacion || docPorHash.codigoDocumento}/certificado-pdf`,
+        normativa: 'Conforme a Ley N° 19.799 (FEA), Ley N° 21.180 y Ley Marco de Ciberseguridad N° 21.663',
+      };
+    }
+
     return {
-      encontradoEnRepositorio: Boolean(fallbackDoc && !isSha256Hex),
-      valido: true,
-      integridadVerificada: true,
-      codigoDocumento: fallbackDoc?.codigoDocumento || 'DOC-2026-CQM-1420',
-      codigoVerificacion: clean.startsWith('VERIF-')
-        ? clean
-        : fallbackDoc?.codigoVerificacion || 'VERIF-2026-CQM-8841-A9F2',
-      tituloDocumento:
-        fallbackDoc?.titulo || 'Documento Electrónico Verificado Criptográficamente (Hash SHA-256)',
-      resumenMateria:
-        'Verificación criptográfica de huella digital SHA-256 y sellado de tiempo RFC 3161 conforme a Ley N° 19.799.',
-      tipoTramite: fallbackDoc?.tipoTramite || 'DECRETO_ALCALDICIO',
-      unidadOrigen:
-        fallbackDoc?.usuarioSolicitante?.unidad || 'Secretaría Municipal - I. Municipalidad de Coquimbo',
-      estadoAprobacion: fallbackDoc?.estadoAprobacion || 'FIRMADA',
-      fePublicaOtorgada: fallbackDoc ? fallbackDoc.estadoFePublica === 'ATESTADO' : true,
-      ministroDeFeNombre: 'Patricia Eugenia Rojas Valdivia',
+      encontradoEnRepositorio: false,
+      valido: false,
+      integridadVerificada: false,
+      codigoDocumento: clean,
+      codigoVerificacion: clean,
+      tituloDocumento: 'Documento No Encontrado',
+      resumenMateria: 'El identificador o hash SHA-256 no corresponde a ningun acto administrativo registrado en la plataforma.',
+      tipoTramite: 'DESCONOCIDO',
+      unidadOrigen: 'No identificada',
+      estadoAprobacion: 'NO_REGISTRADO',
+      fePublicaOtorgada: false,
       hashSha256Calculado: hash,
-      algoritmo: 'SHA-256 + RSA-4096 (FEA PAdES-B-LTV)',
+      algoritmo: 'SHA-256',
       tsaTimestamp: new Date().toISOString(),
-      firmanteTitular: {
-        nombre: fallbackDoc?.usuarioSolicitante?.nombre || 'Patricia Eugenia Rojas Valdivia',
-        rut: fallbackDoc?.usuarioSolicitante?.rut || '10.892.341-2',
-        cargo: fallbackDoc?.usuarioSolicitante?.cargo || 'Secretaria Municipal (Ministro de Fe)',
-        unidad: fallbackDoc?.usuarioSolicitante?.unidad || 'Secretaría Municipal',
-      },
-      emisorCertificado: 'E-Sign S.A. - Autoridad Certificadora Acreditada',
-      serialCertificado: '0x4F9B882103AC55E1',
-      flujoVisacion: fallbackDoc?.flujoVisacionJsonb || [],
-      urlDescargaDocumento: fallbackDoc ? `/api/v1/firmas/solicitudes/${fallbackDoc.id}/pdf` : undefined,
-      urlCertificadoVerificacion: `/api/v1/firmas/checksign/${encodeURIComponent(clean || 'VERIF-2026-CQM-8841-A9F2')}/certificado-pdf`,
       normativa: 'Conforme a Ley N° 19.799 (FEA), Ley N° 21.180 y Ley N° 21.663 (ANCI)',
     };
   }
@@ -864,7 +899,7 @@ export class FirmasService {
       ['Serial Certificado X.509:', info.serialCertificado],
       ['Algoritmo Criptográfico:', info.algoritmo],
       ['Estampa de Tiempo TSA:', info.tsaTimestamp],
-      ['Fe Pública Municipal:', info.fePublicaOtorgada ? `OTORGADA POR ${info.ministroDeFeNombre}` : 'NO REQUERIDA'],
+      ['Fe Pública Municipal:', info.fePublicaOtorgada ? `OTORGADA POR ${(info as any).ministroDeFeNombre || 'Ministro de Fe Municipal'}` : 'NO REQUERIDA'],
     ];
 
     for (const [k, v] of detalles) {

@@ -1,33 +1,172 @@
-import { Injectable, Logger, NotFoundException } from '@nestjs/common';
+import { Injectable, Logger, NotFoundException, BadRequestException, ConflictException, OnModuleInit, OnModuleDestroy } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
+import { hashSecret, generarPasswordTemporal, generarPin, validarFortalezaPassword } from '../common/crypto.util';
+import { formatRut, getRutVariants } from '../common/rut.util';
+
+const ROLES_VALIDOS = ['ADMIN', 'SUPERVISOR', 'FUNCIONARIO', 'MINISTRO_DE_FE', 'PENDIENTE'];
+
+function sanitizar<T extends Record<string, any>>(u: T): Omit<T, 'passwordHash' | 'pinHash'> {
+  const { passwordHash, pinHash, ...resto } = u as any;
+  return resto;
+}
+
+import { IsEmail, IsNotEmpty, IsOptional, IsString } from 'class-validator';
 
 export class CrearUsuarioDto {
+  @IsString()
+  @IsNotEmpty()
   rut!: string;
+
+  @IsString()
+  @IsNotEmpty()
   nombre!: string;
+
+  @IsEmail()
   email!: string;
-  cargo!: string;
-  unidad!: string;
+
+  @IsString()
+  @IsOptional()
+  cargo?: string;
+
+  @IsString()
+  @IsOptional()
+  unidad?: string;
+
+  @IsString()
+  @IsOptional()
   rol?: 'ADMIN' | 'SUPERVISOR' | 'FUNCIONARIO' | 'MINISTRO_DE_FE';
+
+  @IsString()
+  @IsOptional()
   condicionContractual?: string;
+
+  @IsString()
+  @IsOptional()
   password?: string;
+
+  @IsString()
+  @IsOptional()
   pin?: string;
 }
 
 export class CambiarEstadoUsuarioDto {
+  @IsString()
+  @IsNotEmpty()
   estado!: 'ACTIVO' | 'EN_LICENCIA' | 'SUSPENDIDO' | 'DESVINCULADO';
+
+  @IsString()
+  @IsOptional()
   motivo?: string;
+
+  @IsString()
+  @IsOptional()
   ejecutadoPor?: string;
 }
 
+export class SolicitarModificacionDatosDto {
+  @IsString()
+  @IsOptional()
+  rut?: string;
+
+  @IsString()
+  @IsOptional()
+  nuevoCargo?: string;
+
+  @IsString()
+  @IsOptional()
+  nuevaUnidad?: string;
+
+  @IsString()
+  @IsOptional()
+  nuevaCondicionContractual?: string;
+
+  @IsEmail()
+  @IsOptional()
+  nuevoEmail?: string;
+
+  @IsString()
+  @IsNotEmpty()
+  justificacion!: string;
+}
+
+export class ResolverModificacionDatosDto {
+  @IsString()
+  @IsNotEmpty()
+  decision!: 'APROBADA' | 'RECHAZADA';
+
+  @IsString()
+  @IsOptional()
+  observacion?: string;
+}
+
 @Injectable()
-export class UsuariosService {
+export class UsuariosService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(UsuariosService.name);
+  private cronVencimientosTimer: NodeJS.Timeout | null = null;
 
   constructor(private readonly prisma: PrismaService) {}
 
-  async listarUsuarios() {
+  async onModuleInit() {
+    // Ejecución inicial diferida (10s tras arranque) y programación automática cada 24 horas (Módulo 2: Alertas 60, 30 y 15 días)
+    setTimeout(() => {
+      this.ejecutarBarridoAutomaticoVencimientos().catch(() => {});
+    }, 10000);
+
+    this.cronVencimientosTimer = setInterval(() => {
+      this.ejecutarBarridoAutomaticoVencimientos().catch(() => {});
+    }, 24 * 60 * 60 * 1000);
+  }
+
+  onModuleDestroy() {
+    if (this.cronVencimientosTimer) {
+      clearInterval(this.cronVencimientosTimer);
+      this.cronVencimientosTimer = null;
+    }
+  }
+
+  async listarUsuarios(filtros?: {
+    q?: string;
+    rut?: string;
+    nombre?: string;
+    cargo?: string;
+    unidad?: string;
+    limit?: number;
+  }) {
     try {
+      const where: any = {};
+
+      if (filtros?.q && filtros.q.trim()) {
+        const queryTerm = filtros.q.trim();
+        const rutVariants = getRutVariants(queryTerm);
+        where.OR = [
+          ...rutVariants.map((v) => ({ rut: { contains: v, mode: 'insensitive' } })),
+          { nombre: { contains: queryTerm, mode: 'insensitive' } },
+          { cargo: { contains: queryTerm, mode: 'insensitive' } },
+          { email: { contains: queryTerm, mode: 'insensitive' } },
+          { unidad: { contains: queryTerm, mode: 'insensitive' } },
+        ];
+      } else {
+        if (filtros?.rut && filtros.rut.trim()) {
+          const rutVariants = getRutVariants(filtros.rut.trim());
+          if (rutVariants.length > 1) {
+            where.OR = rutVariants.map((v) => ({ rut: { contains: v, mode: 'insensitive' } }));
+          } else {
+            where.rut = { contains: filtros.rut.trim(), mode: 'insensitive' };
+          }
+        }
+        if (filtros?.nombre && filtros.nombre.trim()) {
+          where.nombre = { contains: filtros.nombre.trim(), mode: 'insensitive' };
+        }
+        if (filtros?.cargo && filtros.cargo.trim()) {
+          where.cargo = { contains: filtros.cargo.trim(), mode: 'insensitive' };
+        }
+        if (filtros?.unidad && filtros.unidad.trim()) {
+          where.unidad = { contains: filtros.unidad.trim(), mode: 'insensitive' };
+        }
+      }
+
       const usuarios = await this.prisma.usuario.findMany({
+        where,
         include: {
           certificados: {
             include: {
@@ -36,167 +175,143 @@ export class UsuariosService {
           },
           actasCustodia: true,
         },
-        orderBy: { createdAt: 'asc' },
+        orderBy: { nombre: 'asc' },
+        ...(filtros?.limit ? { take: Number(filtros.limit) } : {}),
       });
-      if (usuarios.length > 0) return usuarios;
+      return usuarios.map((u) => sanitizar(u));
     } catch (err) {
-      this.logger.warn(`Fallback en listarUsuarios: ${(err as Error).message}`);
+      this.logger.error(`Error al listar usuarios en base de datos: ${(err as Error).message}`);
+      return [];
     }
-
-    return [
-      {
-        id: 'USR-01',
-        rut: '12.894.120-3',
-        nombre: 'Patricio Reyes Morales',
-        email: 'preyes@municoquimbo.cl',
-        cargo: 'Secretario Municipal y Administrador TIC',
-        unidad: 'Dirección de TICs y Secretaría Municipal',
-        rol: 'ADMIN',
-        estado: 'ACTIVO',
-        condicionContractual: 'PLANTA',
-        pinBloqueado: false,
-        certificados: [
-          {
-            id: 'CERT-01',
-            numeroSerie: '0x4F9B882103AC55E1',
-            tipo: 'FIRMAGOB',
-            custodia: 'TOKEN_FISICO',
-            validoHasta: new Date(Date.now() + 86400000 * 25),
-            estado: 'POR_VENCER',
-          },
-        ],
-      },
-      {
-        id: 'USR-02',
-        rut: '14.120.932-5',
-        nombre: 'Marcela Vega Contreras',
-        email: 'mvega@municoquimbo.cl',
-        cargo: 'Jefa de Oficina de Partes y Archivo',
-        unidad: 'Dirección de Administración y Finanzas (DAF)',
-        rol: 'SUPERVISOR',
-        estado: 'ACTIVO',
-        condicionContractual: 'PLANTA',
-        pinBloqueado: false,
-        certificados: [
-          {
-            id: 'CERT-07',
-            numeroSerie: '0x33F98A2210BB7741',
-            tipo: 'ESIGN',
-            custodia: 'CLOUD',
-            validoHasta: new Date(Date.now() + 86400000 * 180),
-            estado: 'VIGENTE',
-          },
-        ],
-      },
-      {
-        id: 'USR-03',
-        rut: '11.554.218-1',
-        nombre: 'Eugenio Gómez Díaz',
-        email: 'egomez@municoquimbo.cl',
-        cargo: 'Ministro de Fe Suplente',
-        unidad: 'Asesoría Jurídica y Secretaría Municipal',
-        rol: 'MINISTRO_DE_FE',
-        estado: 'ACTIVO',
-        condicionContractual: 'PLANTA',
-        pinBloqueado: false,
-        certificados: [
-          {
-            id: 'CERT-05',
-            numeroSerie: '0x99B23D8812FA3304',
-            tipo: 'ESIGN',
-            custodia: 'TOKEN_FISICO',
-            validoHasta: new Date(Date.now() + 86400000 * 240),
-            estado: 'VIGENTE',
-          },
-        ],
-      },
-      {
-        id: 'USR-04',
-        rut: '14.112.980-5',
-        nombre: 'Marcelo Gómez',
-        email: 'mgomez@municoquimbo.cl',
-        cargo: 'Director de Obras',
-        unidad: 'Dirección de Obras Municipales',
-        rol: 'FUNCIONARIO',
-        estado: 'ACTIVO',
-        condicionContractual: 'PLANTA',
-        pinBloqueado: false,
-        certificados: [
-          {
-            id: 'CERT-03',
-            numeroSerie: '0x11C94E7723DF9001',
-            tipo: 'FIRMAGOB',
-            custodia: 'TOKEN_FISICO',
-            validoHasta: new Date(Date.now() + 86400000 * 12),
-            estado: 'POR_VENCER',
-          },
-        ],
-      },
-    ];
   }
 
-  async crearUsuario(dto: CrearUsuarioDto) {
-    try {
-      const nuevo = await this.prisma.usuario.create({
-        data: {
-          rut: dto.rut.trim(),
-          nombre: dto.nombre.trim(),
-          email: dto.email.trim().toLowerCase(),
-          cargo: dto.cargo.trim(),
-          unidad: dto.unidad.trim(),
-          rol: dto.rol || 'FUNCIONARIO',
-          condicionContractual: dto.condicionContractual || 'CONTRATA',
-          passwordHash: dto.password || 'FuncCoquimbo2026!',
-          pinHash: dto.pin || '1234',
-          estado: 'ACTIVO',
-        },
-      });
-
-      // Emitir certificado inicial por defecto
-      await this.prisma.certificado.create({
-        data: {
-          numeroSerie: `0x${Math.floor(Math.random() * 0xffffffffffff).toString(16).toUpperCase()}`,
-          usuarioId: nuevo.id,
-          tipo: 'FIRMAGOB',
-          custodia: 'TOKEN_FISICO',
-          validoHasta: new Date(Date.now() + 365 * 86400000),
-          estado: 'VIGENTE',
-        },
-      });
-
-      await this.prisma.historialCambio.create({
-        data: {
-          tablaAfectada: 'usuarios',
-          registroId: nuevo.rut,
-          accion: 'ALTA_FUNCIONARIO',
-          usuarioId: nuevo.id,
-          usuarioEmail: nuevo.email,
-          diffJsonb: {
-            nombre: nuevo.nombre,
-            rol: nuevo.rol,
-            unidad: nuevo.unidad,
-            condicionContractual: nuevo.condicionContractual,
-          },
-        },
-      });
-
-      return nuevo;
-    } catch (err) {
-      this.logger.warn(`Error al crear usuario: ${(err as Error).message}`);
-      return {
-        id: `USR-${Date.now()}`,
-        ...dto,
-        estado: 'ACTIVO',
-        createdAt: new Date().toISOString(),
-      };
+  async crearUsuario(dto: CrearUsuarioDto, ejecutor?: { sub?: string; email?: string }) {
+    if (!dto.rut || !dto.nombre || !dto.email) {
+      throw new BadRequestException('RUT, Nombre y Correo Electrónico son obligatorios.');
     }
+    const rol = dto.rol || 'FUNCIONARIO';
+    if (!ROLES_VALIDOS.includes(rol)) {
+      throw new BadRequestException(`Rol inválido. Valores: ${ROLES_VALIDOS.join(', ')}`);
+    }
+    const rut = formatRut(dto.rut.trim()) || dto.rut.trim();
+    const existente = await this.prisma.usuario.findFirst({
+      where: { OR: [{ rut }, { rut: dto.rut.trim() }, { email: dto.email.trim().toLowerCase() }] },
+    });
+    if (existente) throw new ConflictException('Ya existe un usuario con ese RUT o correo.');
+
+    let passwordTemporal: string | undefined;
+    if (dto.password) {
+      const err = validarFortalezaPassword(dto.password);
+      if (err) throw new BadRequestException(err);
+    } else {
+      passwordTemporal = generarPasswordTemporal();
+    }
+    const passwordFinal = dto.password || passwordTemporal!;
+
+    let pinTemporal: string | undefined;
+    if (dto.pin && !/^\d{4,8}$/.test(dto.pin)) {
+      throw new BadRequestException('El PIN debe ser numérico de 4 a 8 dígitos.');
+    }
+    if (!dto.pin) pinTemporal = generarPin();
+    const pinFinal = dto.pin || pinTemporal!;
+
+    const nuevo = await this.prisma.usuario.create({
+      data: {
+        rut,
+        nombre: dto.nombre.trim(),
+        email: dto.email.trim().toLowerCase(),
+        cargo: (dto.cargo || 'Funcionario').trim(),
+        unidad: (dto.unidad || 'Municipalidad de Coquimbo').trim(),
+        rol,
+        condicionContractual: dto.condicionContractual || 'CONTRATA',
+        passwordHash: hashSecret(passwordFinal),
+        pinHash: hashSecret(pinFinal),
+        debeCambiarPassword: true,
+        estado: 'ACTIVO',
+      },
+    });
+
+    await this.prisma.historialCambio.create({
+      data: {
+        tablaAfectada: 'usuarios',
+        registroId: nuevo.rut,
+        accion: rol === 'ADMIN' ? 'ALTA_ADMINISTRADOR' : 'ALTA_FUNCIONARIO',
+        usuarioId: ejecutor?.sub || nuevo.id,
+        usuarioEmail: ejecutor?.email || nuevo.email,
+        diffJsonb: {
+          nombre: nuevo.nombre,
+          rol: nuevo.rol,
+          unidad: nuevo.unidad,
+          condicionContractual: nuevo.condicionContractual,
+        },
+      },
+    }).catch(() => {});
+
+    return {
+      ...sanitizar(nuevo),
+      // Credenciales temporales: se muestran UNA sola vez.
+      ...(passwordTemporal ? { passwordTemporal } : {}),
+      ...(pinTemporal ? { pinTemporal } : {}),
+    };
+  }
+
+  async cambiarRol(idOrRut: string, rolNuevo: string, ejecutor: { sub: string; email: string }) {
+    if (!ROLES_VALIDOS.includes(rolNuevo)) {
+      throw new BadRequestException(`Rol inválido. Valores: ${ROLES_VALIDOS.join(', ')}`);
+    }
+    const u = await this.prisma.usuario.findFirst({ where: { OR: [{ id: idOrRut }, { rut: idOrRut }] } });
+    if (!u) throw new NotFoundException(`Funcionario ${idOrRut} no encontrado`);
+
+    if (u.rol === 'ADMIN' && rolNuevo !== 'ADMIN') {
+      if (u.id === ejecutor.sub) {
+        throw new BadRequestException('No puede quitarse a sí mismo el rol de administrador.');
+      }
+      const admins = await this.prisma.usuario.count({ where: { rol: 'ADMIN', estado: 'ACTIVO' } });
+      if (admins <= 1) {
+        throw new BadRequestException('Debe existir al menos un administrador activo.');
+      }
+    }
+
+    const actualizado = await this.prisma.usuario.update({ where: { id: u.id }, data: { rol: rolNuevo as any } });
+    await this.prisma.historialCambio.create({
+      data: {
+        tablaAfectada: 'usuarios',
+        registroId: u.rut,
+        accion: 'CAMBIO_ROL',
+        usuarioId: ejecutor.sub,
+        usuarioEmail: ejecutor.email,
+        diffJsonb: { rolAnterior: u.rol, rolNuevo },
+      },
+    }).catch(() => {});
+    return sanitizar(actualizado);
+  }
+
+  async resetPassword(idOrRut: string, ejecutor: { sub: string; email: string }) {
+    const u = await this.prisma.usuario.findFirst({ where: { OR: [{ id: idOrRut }, { rut: idOrRut }] } });
+    if (!u) throw new NotFoundException(`Funcionario ${idOrRut} no encontrado`);
+    const passwordTemporal = generarPasswordTemporal();
+    await this.prisma.usuario.update({
+      where: { id: u.id },
+      data: { passwordHash: hashSecret(passwordTemporal), debeCambiarPassword: true },
+    });
+    await this.prisma.historialCambio.create({
+      data: {
+        tablaAfectada: 'usuarios',
+        registroId: u.rut,
+        accion: 'RESET_PASSWORD_ADMIN',
+        usuarioId: ejecutor.sub,
+        usuarioEmail: ejecutor.email,
+        diffJsonb: { rut: u.rut },
+      },
+    }).catch(() => {});
+    return { rut: u.rut, passwordTemporal, mensaje: 'Entregue esta contraseña al funcionario; deberá cambiarla al ingresar. Se muestra una sola vez.' };
   }
 
   /**
    * Módulo 1 (Sección 3.1): Ciclo de vida del funcionario y protocolo de bloqueo <48h RRHH
    */
-  async cambiarEstadoUsuario(idOrRut: string, dto: CambiarEstadoUsuarioDto) {
-    try {
+  async cambiarEstadoUsuario(idOrRut: string, dto: CambiarEstadoUsuarioDto, ejecutor?: { sub: string; email: string }) {
+    {
       const usuario = await this.prisma.usuario.findFirst({
         where: {
           OR: [{ id: idOrRut }, { rut: idOrRut }],
@@ -206,6 +321,16 @@ export class UsuariosService {
 
       if (!usuario) {
         throw new NotFoundException(`Funcionario ${idOrRut} no encontrado`);
+      }
+
+      if (usuario.rol === 'ADMIN' && dto.estado !== 'ACTIVO') {
+        if (ejecutor && usuario.id === ejecutor.sub) {
+          throw new BadRequestException('No puede cambiar su propio estado de administrador.');
+        }
+        const admins = await this.prisma.usuario.count({ where: { rol: 'ADMIN', estado: 'ACTIVO' } });
+        if (admins <= 1) {
+          throw new BadRequestException('Debe existir al menos un administrador activo.');
+        }
       }
 
       const estadoAnterior = usuario.estado;
@@ -245,8 +370,8 @@ export class UsuariosService {
           tablaAfectada: 'usuarios',
           registroId: usuario.rut,
           accion: dto.estado === 'DESVINCULADO' ? 'DESVINCULACION_RRHH' : 'CAMBIO_ESTADO_USUARIO',
-          usuarioId: usuario.id,
-          usuarioEmail: dto.ejecutadoPor || 'rrhh-tics@municoquimbo.cl',
+          usuarioId: ejecutor?.sub || usuario.id,
+          usuarioEmail: ejecutor?.email || dto.ejecutadoPor || 'sistema',
           diffJsonb: {
             funcionario: usuario.nombre,
             rut: usuario.rut,
@@ -261,18 +386,11 @@ export class UsuariosService {
 
       return {
         status: 'success',
-        usuario: actualizado,
+        usuario: sanitizar(actualizado),
         certificadosRevocados,
         mensaje: esDesvinculacion
           ? `Protocolo ANCI/RRHH (<48h) ejecutado: Cuenta ${dto.estado} y ${certificadosRevocados.length} certificado(s) revocado(s).`
           : `Estado de ${usuario.nombre} actualizado a ${dto.estado}.`,
-      };
-    } catch (err) {
-      return {
-        status: 'success',
-        idOrRut,
-        nuevoEstado: dto.estado,
-        mensaje: `Estado actualizado en modo resiliente: ${(err as Error).message}`,
       };
     }
   }
@@ -299,99 +417,35 @@ export class UsuariosService {
         orderBy: { validoHasta: 'asc' },
       });
 
-      if (certs.length > 0) {
-        return certs.map((c) => {
-          const diasRestantes = Math.max(
-            1,
-            Math.ceil((c.validoHasta.getTime() - ahora.getTime()) / (1000 * 60 * 60 * 24)),
-          );
-          const severidad = diasRestantes <= 15 ? 'ALTA' : diasRestantes <= 30 ? 'MEDIA' : 'BAJA';
-          return {
-            id: c.id,
-            numeroSerie: c.numeroSerie,
-            tipo: c.tipo === 'FIRMAGOB' ? 'FIRMAGOB (Token Criptográfico)' : 'FEA ESIGN (Cloudsigner HSM)',
-            custodia: c.custodia,
-            hardwareModelo: c.tokenHardware
-              ? `${c.tokenHardware.marca} ${c.tokenHardware.modelo}`
-              : 'Thales Luna HSM Cloud',
-            diasRestantes,
-            severidad,
-            fechaExpiracion: c.validoHasta.toISOString().split('T')[0],
-            usuario: {
-              nombre: c.usuario.nombre,
-              unidad: c.usuario.unidad,
-              email: c.usuario.email,
-              rut: c.usuario.rut,
-            },
-          };
-        });
-      }
-    } catch {
-      // Fallback
+      return certs.map((c) => {
+        const diasRestantes = Math.max(
+          1,
+          Math.ceil((c.validoHasta.getTime() - ahora.getTime()) / (1000 * 60 * 60 * 24)),
+        );
+        const severidad = diasRestantes <= 15 ? 'ALTA' : diasRestantes <= 30 ? 'MEDIA' : 'BAJA';
+        return {
+          id: c.id,
+          numeroSerie: c.numeroSerie,
+          tipo: c.tipo === 'FIRMAGOB' ? 'FIRMAGOB (Token Criptográfico)' : 'FEA ESIGN (Cloudsigner HSM)',
+          custodia: c.custodia,
+          hardwareModelo: c.tokenHardware
+            ? `${c.tokenHardware.marca} ${c.tokenHardware.modelo}`
+            : 'Thales Luna HSM Cloud',
+          diasRestantes,
+          severidad,
+          fechaExpiracion: c.validoHasta.toISOString().split('T')[0],
+          usuario: {
+            nombre: c.usuario.nombre,
+            unidad: c.usuario.unidad,
+            email: c.usuario.email,
+            rut: c.usuario.rut,
+          },
+        };
+      });
+    } catch (err) {
+      this.logger.error(`Error al obtener alertas de vencimiento: ${(err as Error).message}`);
+      return [];
     }
-
-    return [
-      {
-        id: 'CERT-03',
-        tipo: 'FIRMAGOB (Token Criptográfico)',
-        custodia: 'TOKEN_FISICO',
-        hardwareModelo: 'Feitian ePass2003 Auto',
-        diasRestantes: 12,
-        severidad: 'ALTA',
-        fechaExpiracion: '2026-10-31',
-        usuario: {
-          nombre: 'Marcelo Gómez',
-          unidad: 'Dirección de Obras Municipales',
-          email: 'mgomez@municoquimbo.cl',
-          rut: '14.112.980-5',
-        },
-      },
-      {
-        id: 'CERT-01',
-        tipo: 'FIRMAGOB (Token SafeNet)',
-        custodia: 'TOKEN_FISICO',
-        hardwareModelo: 'SafeNet eToken 5110 FIPS',
-        diasRestantes: 25,
-        severidad: 'MEDIA',
-        fechaExpiracion: '2026-11-13',
-        usuario: {
-          nombre: 'Patricio Reyes Morales',
-          unidad: 'Secretaría Municipal',
-          email: 'preyes@municoquimbo.cl',
-          rut: '12.894.120-3',
-        },
-      },
-      {
-        id: 'CERT-04',
-        tipo: 'FEA ESIGN (Cloudsigner HSM)',
-        custodia: 'CLOUD',
-        hardwareModelo: 'Thales Luna HSM Cloud',
-        diasRestantes: 52,
-        severidad: 'BAJA',
-        fechaExpiracion: '2026-12-10',
-        usuario: {
-          nombre: 'Camila Sepúlveda',
-          unidad: 'Dirección Jurídica',
-          email: 'csepulveda@municoquimbo.cl',
-          rut: '17.842.301-1',
-        },
-      },
-      {
-        id: 'CERT-02',
-        tipo: 'FIRMAGOB (Token SafeNet)',
-        custodia: 'TOKEN_FISICO',
-        hardwareModelo: 'SafeNet eToken 5110',
-        diasRestantes: 58,
-        severidad: 'BAJA',
-        fechaExpiracion: '2026-12-16',
-        usuario: {
-          nombre: 'Andrea Morales C.',
-          unidad: 'Dirección de Adm. y Finanzas',
-          email: 'amorales@municoquimbo.cl',
-          rut: '16.541.228-9',
-        },
-      },
-    ];
   }
 
   async despacharNotificacionVencimiento(certificadoId?: string, emailDestino?: string) {
@@ -419,6 +473,229 @@ export class UsuariosService {
       certificadoId: certificadoId || 'ALL',
       emailDestino: emailDestino || 'multiple',
       timestamp: new Date().toISOString(),
+    };
+  }
+
+  /**
+   * Módulo 2: Barrido automático programado de vencimientos a 60, 30 y 15 días.
+   * Actualiza certificados próximos a vencer y registra alertas preventivas en el Audit Trail.
+   */
+  async ejecutarBarridoAutomaticoVencimientos() {
+    try {
+      const ahora = new Date();
+      const alertas = await this.obtenerAlertasVencimiento();
+
+      // Marcar como VENCIDO aquellos cuya fecha ya expiró
+      await this.prisma.certificado.updateMany({
+        where: {
+          validoHasta: { lt: ahora },
+          estado: { in: ['VIGENTE', 'POR_VENCER'] },
+        },
+        data: { estado: 'VENCIDO' },
+      });
+
+      if (alertas.length === 0) return { procesados: 0 };
+
+      let criticos15 = 0;
+      let medios30 = 0;
+      let preventivos60 = 0;
+
+      for (const a of alertas) {
+        if (a.diasRestantes <= 15) criticos15++;
+        else if (a.diasRestantes <= 30) medios30++;
+        else preventivos60++;
+
+        if (a.diasRestantes <= 30) {
+          await this.prisma.certificado
+            .update({
+              where: { id: a.id },
+              data: { estado: 'POR_VENCER' },
+            })
+            .catch(() => {});
+        }
+      }
+
+      await this.prisma.historialCambio.create({
+        data: {
+          tablaAfectada: 'certificados',
+          registroId: 'CRON_AUTOMATICO_60_30_15',
+          accion: 'BARRIDO_AUTOMATICO_VENCIMIENTOS',
+          usuarioEmail: 'scheduler-automatico@municoquimbo.cl',
+          diffJsonb: {
+            totalAlertasDetectadas: alertas.length,
+            umbral15DiasCritico: criticos15,
+            umbral30DiasMedio: medios30,
+            umbral60DiasPreventivo: preventivos60,
+            timestamp: ahora.toISOString(),
+          },
+        },
+      });
+
+      this.logger.log(
+        `[Scheduler Vencimientos] Barrido automático completado: ${alertas.length} certificado(s) en ventana de 60/30/15 días.`,
+      );
+      return {
+        procesados: alertas.length,
+        criticos15,
+        medios30,
+        preventivos60,
+      };
+    } catch (err) {
+      this.logger.warn(`Aviso en barrido automático de vencimientos: ${(err as Error).message}`);
+      return { procesados: 0 };
+    }
+  }
+
+  /**
+   * Módulo 5: Flujo formal de solicitudes de actualización de perfiles, cargos y traslados internos.
+   */
+  async solicitarModificacionDatos(
+    dto: SolicitarModificacionDatosDto,
+    solicitanteContext?: { sub?: string; rut?: string; email?: string },
+  ) {
+    const targetRut = dto.rut ? formatRut(dto.rut) : solicitanteContext?.rut;
+    const usuario = await this.prisma.usuario.findFirst({
+      where: targetRut
+        ? { OR: [{ rut: targetRut }, { id: solicitanteContext?.sub || '' }] }
+        : { id: solicitanteContext?.sub || '' },
+    });
+
+    if (!usuario) {
+      throw new NotFoundException('No se encontró el funcionario para registrar la solicitud de modificación.');
+    }
+
+    const folio = `MOD-DATOS-2026-${Math.floor(1000 + Math.random() * 9000)}`;
+    const registro = await this.prisma.historialCambio.create({
+      data: {
+        tablaAfectada: 'usuarios',
+        registroId: folio,
+        accion: 'SOLICITUD_MODIFICACION_DATOS',
+        usuarioId: usuario.id,
+        usuarioEmail: usuario.email,
+        diffJsonb: {
+          folio,
+          estadoSolicitud: 'PENDIENTE',
+          usuarioId: usuario.id,
+          rut: usuario.rut,
+          nombre: usuario.nombre,
+          datosActuales: {
+            cargo: usuario.cargo,
+            unidad: usuario.unidad,
+            condicionContractual: usuario.condicionContractual,
+            email: usuario.email,
+          },
+          cambiosSolicitados: {
+            nuevoCargo: dto.nuevoCargo || usuario.cargo,
+            nuevaUnidad: dto.nuevaUnidad || usuario.unidad,
+            nuevaCondicionContractual: dto.nuevaCondicionContractual || usuario.condicionContractual,
+            nuevoEmail: dto.nuevoEmail || usuario.email,
+          },
+          justificacion: dto.justificacion,
+          fechaSolicitud: new Date().toISOString(),
+        },
+      },
+    });
+
+    return {
+      status: 'registered',
+      folio,
+      id: registro.id,
+      estado: 'PENDIENTE',
+      mensaje: `Solicitud formal de modificación ${folio} registrada y enviada a visación de TICs/RRHH.`,
+    };
+  }
+
+  async listarSolicitudesModificacion() {
+    const registros = await this.prisma.historialCambio.findMany({
+      where: {
+        accion: {
+          in: [
+            'SOLICITUD_MODIFICACION_DATOS',
+            'SOLICITUD_MODIFICACION_APROBADA',
+            'SOLICITUD_MODIFICACION_RECHAZADA',
+          ],
+        },
+      },
+      orderBy: { createdAt: 'desc' },
+      take: 50,
+    });
+
+    return registros.map((r) => {
+      const meta = (r.diffJsonb as Record<string, any>) || {};
+      return {
+        id: r.id,
+        folio: meta.folio || r.registroId,
+        estadoSolicitud: meta.estadoSolicitud || 'PENDIENTE',
+        rut: meta.rut || '',
+        nombre: meta.nombre || r.usuarioEmail,
+        datosActuales: meta.datosActuales || {},
+        cambiosSolicitados: meta.cambiosSolicitados || {},
+        justificacion: meta.justificacion || '',
+        observacionResolucion: meta.observacionResolucion || null,
+        resueltoPor: meta.resueltoPor || null,
+        createdAt: r.createdAt,
+      };
+    });
+  }
+
+  async resolverSolicitudModificacion(
+    solicitudIdOrFolio: string,
+    dto: ResolverModificacionDatosDto,
+    ejecutor: { sub: string; email: string },
+  ) {
+    const registro = await this.prisma.historialCambio.findFirst({
+      where: {
+        OR: [{ id: solicitudIdOrFolio }, { registroId: solicitudIdOrFolio }],
+      },
+    });
+
+    if (!registro) {
+      throw new NotFoundException(`Solicitud de modificación ${solicitudIdOrFolio} no encontrada.`);
+    }
+
+    const meta = (registro.diffJsonb as Record<string, any>) || {};
+    const cambios = meta.cambiosSolicitados || {};
+    const usuarioId = meta.usuarioId || registro.usuarioId;
+
+    if (dto.decision === 'APROBADA' && usuarioId) {
+      await this.prisma.usuario.update({
+        where: { id: usuarioId },
+        data: {
+          ...(cambios.nuevoCargo ? { cargo: cambios.nuevoCargo } : {}),
+          ...(cambios.nuevaUnidad ? { unidad: cambios.nuevaUnidad } : {}),
+          ...(cambios.nuevaCondicionContractual
+            ? { condicionContractual: cambios.nuevaCondicionContractual }
+            : {}),
+          ...(cambios.nuevoEmail ? { email: cambios.nuevoEmail.toLowerCase() } : {}),
+        },
+      });
+    }
+
+    const nuevaAccion =
+      dto.decision === 'APROBADA'
+        ? 'SOLICITUD_MODIFICACION_APROBADA'
+        : 'SOLICITUD_MODIFICACION_RECHAZADA';
+
+    const actualizado = await this.prisma.historialCambio.update({
+      where: { id: registro.id },
+      data: {
+        accion: nuevaAccion,
+        diffJsonb: {
+          ...meta,
+          estadoSolicitud: dto.decision,
+          observacionResolucion: dto.observacion || null,
+          resueltoPor: ejecutor.email,
+          fechaResolucion: new Date().toISOString(),
+        },
+      },
+    });
+
+    return {
+      status: 'resolved',
+      id: actualizado.id,
+      folio: meta.folio || actualizado.registroId,
+      decision: dto.decision,
+      resueltoPor: ejecutor.email,
     };
   }
 }

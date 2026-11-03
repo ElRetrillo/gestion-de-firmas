@@ -18,20 +18,93 @@ const { exec } = require('child_process');
 
 let electronApp = null;
 let BrowserWindow = null;
+let ipcMain = null;
 try {
   const electron = require('electron');
   electronApp = electron.app;
   BrowserWindow = electron.BrowserWindow;
+  ipcMain = electron.ipcMain;
 } catch {
   // Permite ejecución en modo servicio Node.js puro si Electron no está presente en el host
 }
 
-const API_BASE_URL = process.env.TELEMETRIA_API_URL || 'http://localhost:3001/api/v1/telemetria/usb';
-const HOSTNAME = process.env.CODIGO_PC_OVERRIDE || os.hostname().toUpperCase();
-const DEPENDENCIA_FISICA = process.env.DEPENDENCIA_FISICA || 'Red Interna Municipal - Coquimbo';
-const POLL_INTERVAL_MS = Number(process.env.USB_POLL_INTERVAL_MS || 2000);
-const HEARTBEAT_INTERVAL_MS = Number(process.env.USB_HEARTBEAT_INTERVAL_MS || 45000);
-const OFFLINE_QUEUE_FILE = path.join(os.tmpdir(), 'coquimbo-ghost-telemetry-queue.json');
+// Carga de configuración portable (archivo local config.json o variables de entorno)
+function loadConfig() {
+  const configPath = path.join(__dirname, 'config.json');
+  let fileConfig = {};
+  try {
+    if (fs.existsSync(configPath)) {
+      fileConfig = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+    }
+  } catch (err) {
+    console.warn('[GhostAgent] Advertencia al leer config.json local:', err.message);
+  }
+
+  const apiUrl =
+    process.env.TELEMETRIA_API_URL ||
+    fileConfig.apiUrl ||
+    'http://localhost:3001/api/v1/telemetria/usb';
+
+  const apiKey =
+    process.env.TELEMETRIA_API_KEY ||
+    fileConfig.apiKey ||
+    'muni-coquimbo-ghost-app-sec-key-2026';
+
+  const hostname =
+    process.env.CODIGO_PC_OVERRIDE ||
+    fileConfig.codigoPcOverride ||
+    os.hostname().toUpperCase();
+
+  const dependencia =
+    process.env.DEPENDENCIA_FISICA ||
+    fileConfig.dependenciaFisica ||
+    'Red Interna Municipal - Coquimbo';
+
+  const pollInterval = Number(
+    process.env.USB_POLL_INTERVAL_MS ||
+    fileConfig.pollIntervalMs ||
+    2000,
+  );
+
+  const heartbeatInterval = Number(
+    process.env.USB_HEARTBEAT_INTERVAL_MS ||
+    fileConfig.heartbeatIntervalMs ||
+    45000,
+  );
+
+  // Directorio portable y resiliente para la cola offline en cualquier usuario de Windows
+  const appDataRoot = process.env.LOCALAPPDATA || process.env.APPDATA || os.tmpdir();
+  const queueDir = path.join(appDataRoot, 'CoquimboGhostApp');
+  try {
+    if (!fs.existsSync(queueDir)) {
+      fs.mkdirSync(queueDir, { recursive: true });
+    }
+  } catch {
+    // Si falla crear en AppData, utilizar directorio temporal del sistema
+  }
+  const queueFile = fs.existsSync(queueDir)
+    ? path.join(queueDir, 'telemetry-queue.json')
+    : path.join(os.tmpdir(), 'coquimbo-ghost-telemetry-queue.json');
+
+  return {
+    apiUrl,
+    apiKey,
+    hostname,
+    dependencia,
+    pollInterval,
+    heartbeatInterval,
+    queueFile,
+  };
+}
+
+const CONFIG = loadConfig();
+const API_BASE_URL = CONFIG.apiUrl;
+const API_KEY = CONFIG.apiKey;
+const HOSTNAME = CONFIG.hostname;
+const DEPENDENCIA_FISICA = CONFIG.dependencia;
+const POLL_INTERVAL_MS = CONFIG.pollInterval;
+const HEARTBEAT_INTERVAL_MS = CONFIG.heartbeatInterval;
+const OFFLINE_QUEUE_FILE = CONFIG.queueFile;
 
 // Catálogo de Vendor IDs oficiales de Tokens Criptográficos Acreditados (Ley N° 19.799)
 const KNOWN_CRYPTO_VENDORS = {
@@ -116,6 +189,7 @@ async function flushQueue() {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
+          'X-Api-Key': API_KEY,
           'X-Ghost-Agent-Version': '2.1.0-headless',
           'X-Workstation-Hostname': HOSTNAME,
         },
@@ -210,7 +284,7 @@ function scanWindowsUsbTokens() {
         const chosen = validDevices[0];
         const instanceIdStr = String(chosen.InstanceId || '');
         const vidMatch = instanceIdStr.match(/VID_([0-9A-F]{4})/i);
-        const vid = vidMatch ? vidMatch[1].toUpperCase() : '08E6';
+        const vid = vidMatch ? vidMatch[1].toUpperCase() : 'UNKNOWN';
 
         // Extraer número de serie real de la instancia USB si está disponible (ej: USB\VID_08E6&PID_34CF\D453B70C2CF7)
         const parts = instanceIdStr.split('\\');
@@ -220,21 +294,23 @@ function scanWindowsUsbTokens() {
             ? `SN-${vid}-${rawInstanceSerial.replace(/[^A-Z0-9-]/gi, '').toUpperCase()}`
             : `SN-WIN-${HOSTNAME}-${vid}`;
 
-        const vendorMeta = KNOWN_CRYPTO_VENDORS[vid] || {
-          marca: 'Thales / SafeNet',
-          modelo: chosen.FriendlyName || 'USB Cryptographic Token',
-        };
+        // Obtener el nombre registrado en el OS exactamente como lo reporta el sistema operativo
+        const osDeviceName = String(chosen.FriendlyName || chosen.Caption || chosen.Description || '').trim();
+        const osManufacturer = String(chosen.Manufacturer || '').trim();
 
-        const friendly = String(chosen.FriendlyName || '').trim();
-        const modeloFinal =
-          friendly && !friendly.toLowerCase().includes('filtro') && !friendly.toLowerCase().includes('filter')
-            ? `${vendorMeta.modelo.split(' (')[0]} (${friendly})`
-            : vendorMeta.modelo;
+        const vendorMeta = KNOWN_CRYPTO_VENDORS[vid];
+        const marcaFinal =
+          osManufacturer && !osManufacturer.startsWith('(') && osManufacturer.toLowerCase() !== 'microsoft'
+            ? osManufacturer
+            : vendorMeta?.marca || 'Dispositivo Criptográfico PKCS#11';
+
+        // El modelo/nombre visual debe ser el nombre del token que tiene registrado en el OS
+        const modeloFinal = osDeviceName || vendorMeta?.modelo || 'Token Criptográfico USB';
 
         resolve({
-          vendorId: `0x${vid}`,
+          vendorId: vid !== 'UNKNOWN' ? `0x${vid}` : '0x0000',
           serialNumber: cleanSerial,
-          marca: vendorMeta.marca,
+          marca: marcaFinal,
           modelo: modeloFinal,
           instanceId: instanceIdStr,
         });
@@ -255,27 +331,37 @@ async function monitorUsbLoop() {
     const currentSerial = detectedToken ? detectedToken.serialNumber : null;
 
     const stateChanged =
-      currentState !== lastKnownState ||
-      (currentState === 'CONECTADO' && currentSerial !== lastKnownSerial);
+      lastKnownState !== null &&
+      (currentState !== lastKnownState ||
+        (currentState === 'CONECTADO' && currentSerial !== lastKnownSerial));
 
+    // Si es el primer escaneo al encender el agente:
+    const isFirstScan = lastKnownState === null;
     const now = Date.now();
-    const heartbeatDue = now - lastHeartbeatAt >= HEARTBEAT_INTERVAL_MS;
+    const heartbeatDue = !isFirstScan && now - lastHeartbeatAt >= HEARTBEAT_INTERVAL_MS;
 
-    // Solo emitir cuando cambia el estado físico (inserción/extracción) o cuando toca heartbeat de presencia
-    if (!stateChanged && !heartbeatDue) {
+    // Solo emitir si:
+    // 1. Hay un cambio real de estado (se conectó, o se desconectó habiendo estado conectado)
+    // 2. O en el primer escaneo si hay un token conectado de inmediato
+    // 3. O por heartbeat periódico de presencia (sin stackear eventos)
+    const shouldSend =
+      stateChanged ||
+      (isFirstScan && currentState === 'CONECTADO') ||
+      (isFirstScan && currentState === 'DESCONECTADO') ||
+      heartbeatDue;
+
+    if (!shouldSend) {
       return;
     }
 
-    if (stateChanged) {
+    if (stateChanged || (isFirstScan && currentState === 'CONECTADO')) {
       if (currentState === 'CONECTADO' && detectedToken) {
         console.log(
-          `[GhostAgent] [USB INSERTADO] Token detectado: ${detectedToken.marca} - ${detectedToken.modelo} (S/N: ${detectedToken.serialNumber}, VID: ${detectedToken.vendorId})`,
+          `[GhostAgent] [USB CONECTADO] Token detectado: ${detectedToken.marca} - ${detectedToken.modelo} (S/N: ${detectedToken.serialNumber})`,
         );
-      } else {
+      } else if (currentState === 'DESCONECTADO' && lastKnownToken) {
         console.log(
-          `[GhostAgent] [USB EXTRAÍDO] Ranura libre en estación ${HOSTNAME}${
-            lastKnownToken ? ` (Token removido: ${lastKnownToken.serialNumber})` : ''
-          }`,
+          `[GhostAgent] [USB DESCONECTADO] Token removido de la estación ${HOSTNAME} (S/N: ${lastKnownToken.serialNumber}). Esperando conexión...`,
         );
       }
     }
@@ -294,8 +380,8 @@ async function monitorUsbLoop() {
         osPlatform: `${os.type()} ${os.release()}`,
         hostname: os.hostname(),
         agentVersion: '2.1.0-headless',
-        stateChanged,
-        isHeartbeat: !stateChanged,
+        stateChanged: stateChanged || (isFirstScan && currentState === 'CONECTADO'),
+        isHeartbeat: !stateChanged && !isFirstScan,
         previousSerialNumber: !detectedToken && lastKnownToken ? lastKnownToken.serialNumber : undefined,
       },
     };
@@ -320,6 +406,7 @@ async function handleGracefulShutdown() {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
+        'X-Api-Key': API_KEY,
         'X-Ghost-Agent-Version': '2.1.0-headless',
         'X-Workstation-Hostname': HOSTNAME,
       },
@@ -364,6 +451,27 @@ if (electronApp) {
     electronApp.dock.hide();
   }
 
+  // Configurar inicio automático en el arranque del sistema operativo (Arquitectura Capa 1)
+  try {
+    electronApp.setLoginItemSettings({
+      openAtLogin: true,
+      path: process.execPath,
+    });
+    electronApp.setAsDefaultProtocolClient('coquimbo-agent');
+  } catch {
+    // Ignorar si el entorno restringe el registro de inicio
+  }
+
+  if (ipcMain) {
+    ipcMain.handle('get-workstation-hostname', () => HOSTNAME);
+    ipcMain.on('webhid-usb-event', (_event, hidPayload) => {
+      console.log(
+        `[GhostAgent] [WebHID IPC] Interrupción física detectada en ${hidPayload?.codigoPc || HOSTNAME}: ${hidPayload?.tipo} (vendorId=${hidPayload?.vendorId})`,
+      );
+      monitorUsbLoop();
+    });
+  }
+
   electronApp.whenReady().then(() => {
     const hiddenWin = new BrowserWindow({
       show: false,
@@ -378,6 +486,56 @@ if (electronApp) {
 
     // Habilitar permisos automáticos para WebHID en el contexto oculto
     hiddenWin.webContents.session.setDevicePermissionHandler(() => true);
+    hiddenWin.webContents.session.on('select-hid-device', (event, details, callback) => {
+      event.preventDefault();
+      if (details.deviceList && details.deviceList.length > 0) {
+        callback(details.deviceList[0].deviceId);
+      } else {
+        callback();
+      }
+    });
+
+    // Cargar proceso de renderizado oculto con escuchas nativas WebHID (navigator.hid) y canal IPC (ipcRenderer)
+    const rendererHtml = `
+      <!DOCTYPE html>
+      <html>
+        <head><meta charset="utf-8"><title>GhostAgent WebHID Renderer</title></head>
+        <body>
+          <script>
+            const { ipcRenderer } = require('electron');
+            const ALLOWED_VENDORS = [0x0529, 0x0DC3, 0x096E, 0x08E6, 0x04B9, 0x076B, 0x04E6, 0x0A89, 0x1050, 0x20A0];
+            (async () => {
+              const codigoPc = await ipcRenderer.invoke('get-workstation-hostname');
+              if (navigator.hid) {
+                navigator.hid.addEventListener('connect', ({ device }) => {
+                  if (!device || ALLOWED_VENDORS.includes(device.vendorId)) {
+                    ipcRenderer.send('webhid-usb-event', {
+                      codigoPc,
+                      tipo: 'connect',
+                      vendorId: device ? '0x' + device.vendorId.toString(16).toUpperCase().padStart(4, '0') : 'UNKNOWN',
+                      productName: device ? device.productName : 'Token USB',
+                      timestamp: new Date().toISOString()
+                    });
+                  }
+                });
+                navigator.hid.addEventListener('disconnect', ({ device }) => {
+                  if (!device || ALLOWED_VENDORS.includes(device.vendorId)) {
+                    ipcRenderer.send('webhid-usb-event', {
+                      codigoPc,
+                      tipo: 'disconnect',
+                      vendorId: device ? '0x' + device.vendorId.toString(16).toUpperCase().padStart(4, '0') : 'UNKNOWN',
+                      productName: device ? device.productName : 'Token USB',
+                      timestamp: new Date().toISOString()
+                    });
+                  }
+                });
+              }
+            })();
+          </script>
+        </body>
+      </html>
+    `;
+    hiddenWin.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(rendererHtml)}`);
 
     startHeadlessAgent();
   });

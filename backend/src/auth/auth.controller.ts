@@ -1,58 +1,108 @@
 import { Controller, Post, Get, Body, Req, HttpCode, HttpStatus } from '@nestjs/common';
-import { ApiTags, ApiOperation, ApiResponse } from '@nestjs/swagger';
-import { AuthService, LoginDto, VerificarPinDto, DesbloquearPinDto } from './auth.service';
+import { ApiTags, ApiOperation, ApiResponse, ApiBearerAuth } from '@nestjs/swagger';
+import {
+  AuthService,
+  LoginDto,
+  RegistroFuncionarioDto,
+  VerificarPinDto,
+  DesbloquearPinDto,
+  CambiarPasswordDto,
+  ClaveUnicaAuthDto,
+} from './auth.service';
 import { Request } from 'express';
+import { Public, Roles, AllowPasswordChange } from '../common/auth.guards';
 
-@ApiTags('Autenticación, RBAC y Credenciales de Prueba')
+function ipDe(req: Request): string {
+  return ((req.headers['x-forwarded-for'] as string) || req.socket.remoteAddress || 'desconocida')
+    .split(',')[0]
+    .trim();
+}
+
+@ApiTags('Autenticación y RBAC')
+@ApiBearerAuth()
 @Controller('api/v1/auth')
 export class AuthController {
   constructor(private readonly authService: AuthService) {}
 
+  @Public()
+  @Post('registro')
+  @HttpCode(HttpStatus.CREATED)
+  @ApiOperation({
+    summary: 'Registro autónomo de funcionarios (RUT, Nombre, Apellido y Contraseña)',
+    description: 'Crea la cuenta en estado PENDIENTE de asignación de rol por el Administrador.',
+  })
+  async registro(@Body() dto: RegistroFuncionarioDto, @Req() req: Request) {
+    return this.authService.registrar(dto, ipDe(req));
+  }
+
+  @Public()
   @Post('login')
   @HttpCode(HttpStatus.OK)
   @ApiOperation({
-    summary: 'Autenticación institucional por RUT y contraseña (RBAC)',
-    description: 'Valida credenciales contra PostgreSQL, verifica que el funcionario no esté desvinculado y emite un token JWT firmado (HS256).',
+    summary: 'Autenticación institucional por RUT y contraseña',
+    description: 'Valida credenciales y emite un JWT (HS256, 8h). Si debeCambiarPassword=true solo se permite /auth/cambiar-password.',
   })
-  @ApiResponse({ status: 200, description: 'Autenticación exitosa con perfil y rol RBAC.' })
+  @ApiResponse({ status: 200, description: 'Autenticación exitosa.' })
   async login(@Body() dto: LoginDto, @Req() req: Request) {
-    const ip = (req.headers['x-forwarded-for'] as string) || req.socket.remoteAddress || '10.20.1.10';
-    return this.authService.login(dto, ip);
+    return this.authService.login(dto, ipDe(req));
   }
 
-  @Get('credenciales-prueba')
-  @ApiOperation({
-    summary: 'Obtener matriz de credenciales de prueba para entorno de Desarrollo/Testing',
-    description: 'Retorna las cuentas de prueba preconfiguradas por rol (ADMIN, SUPERVISOR, MINISTRO_DE_FE, FUNCIONARIO) y sus PINs de token.',
-  })
-  obtenerCredencialesPrueba() {
-    return this.authService.obtenerCredencialesPrueba();
+  @AllowPasswordChange()
+  @Get('me')
+  @ApiOperation({ summary: 'Perfil del usuario autenticado' })
+  async me(@Req() req: any) {
+    return this.authService.me(req.user.sub);
+  }
+
+  @AllowPasswordChange()
+  @Post('cambiar-password')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Cambiar contraseña propia (obligatorio en primer ingreso). Retorna nueva sesión.' })
+  async cambiarPassword(@Body() dto: CambiarPasswordDto, @Req() req: any) {
+    return this.authService.cambiarPassword(req.user.sub, dto, ipDe(req));
   }
 
   @Post('verificar-pin')
   @HttpCode(HttpStatus.OK)
-  @ApiOperation({
-    summary: 'Validar PIN de Token Criptográfico USB (con bloqueo tras 3 intentos fallidos)',
-  })
-  async verificarPin(@Body() dto: VerificarPinDto) {
-    return this.authService.verificarPinToken(dto);
+  @ApiOperation({ summary: 'Validar PIN de Token USB (bloqueo tras 3 intentos fallidos)' })
+  async verificarPin(@Body() dto: VerificarPinDto, @Req() req: any) {
+    return this.authService.verificarPinToken(dto, req.user);
   }
 
+  @Roles('ADMIN')
   @Post('desbloquear-pin')
   @HttpCode(HttpStatus.OK)
-  @ApiOperation({
-    summary: 'Desbloquear PIN de Token USB mediante autorización administrativa TIC (Módulo 5)',
-  })
-  async desbloquearPin(@Body() dto: DesbloquearPinDto) {
-    return this.authService.desbloquearPin(dto);
+  @ApiOperation({ summary: 'Desbloquear PIN de Token USB (solo ADMIN)' })
+  async desbloquearPin(@Body() dto: DesbloquearPinDto, @Req() req: any) {
+    return this.authService.desbloquearPin(dto, req.user);
   }
 
-  @Post('seed-reset')
+  @Public()
+  @Get('oauth/config')
+  @ApiOperation({
+    summary: 'Módulo 6: Configuración de proveedores externos (ClaveÚnica OAuth2 y Active Directory) en modo Sandbox o Producción',
+  })
+  obtenerConfigOAuth() {
+    return this.authService.obtenerConfigProveedoresAuth();
+  }
+
+  @Public()
+  @Post('claveunica/callback')
   @HttpCode(HttpStatus.OK)
   @ApiOperation({
-    summary: 'Restaurar y poblar Base de Datos de Prueba (Seed completo)',
+    summary: 'Módulo 6: Autenticación mediante ClaveÚnica del Estado (OAuth2 / OpenID Connect con fallback Sandbox Local)',
   })
-  async resetearSeed() {
-    return this.authService.resetearBaseDatosPrueba();
+  async loginClaveUnica(@Body() dto: ClaveUnicaAuthDto, @Req() req: Request) {
+    return this.authService.loginClaveUnica(dto, ipDe(req));
+  }
+
+  @Public()
+  @Post('ad/login')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({
+    summary: 'Módulo 6: Autenticación federada con Active Directory Municipal (LDAP / Kerberos con fallback Sandbox Local)',
+  })
+  async loginActiveDirectory(@Body() dto: LoginDto, @Req() req: Request) {
+    return this.authService.loginActiveDirectory(dto, ipDe(req));
   }
 }

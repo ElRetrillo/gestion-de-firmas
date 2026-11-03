@@ -66,6 +66,42 @@ export class RedisService implements OnModuleInit, OnModuleDestroy {
     return null;
   }
 
+  async setKey(key: string, value: string, ttlSeconds = 86400): Promise<void> {
+    this.memoryFallback.set(key, { value, expiresAt: Date.now() + ttlSeconds * 1000 });
+    if (!this.client) return;
+    try {
+      await this.client.set(key, value, 'EX', ttlSeconds);
+    } catch {
+      // Ignorar fallback
+    }
+  }
+
+  async getKey(key: string): Promise<string | null> {
+    if (this.client) {
+      try {
+        const val = await this.client.get(key);
+        if (val) return val;
+      } catch {
+        // Fallback a memoria
+      }
+    }
+    const mem = this.memoryFallback.get(key);
+    if (mem && mem.expiresAt > Date.now()) {
+      return mem.value;
+    }
+    return null;
+  }
+
+  async delKey(key: string): Promise<void> {
+    this.memoryFallback.delete(key);
+    if (!this.client) return;
+    try {
+      await this.client.del(key);
+    } catch {
+      // Ignorar
+    }
+  }
+
   async getAllPresences(): Promise<Record<string, string>> {
     const result: Record<string, string> = {};
 

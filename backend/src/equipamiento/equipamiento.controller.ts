@@ -1,9 +1,11 @@
-import { Controller, Get, Post, Body, Param, Res } from '@nestjs/common';
-import { ApiTags, ApiOperation } from '@nestjs/swagger';
+import { Controller, Get, Post, Body, Param, Res, Req } from '@nestjs/common';
+import { ApiTags, ApiOperation, ApiBearerAuth } from '@nestjs/swagger';
 import { EquipamientoService, CrearTokenDto, CrearActaCustodiaDto } from './equipamiento.service';
-import { Response } from 'express';
+import { Response, Request } from 'express';
+import { Roles } from '../common/auth.guards';
 
 @ApiTags('Equipamiento USB y Actas de Custodia')
+@ApiBearerAuth()
 @Controller('api/v1/equipamiento')
 export class EquipamientoController {
   constructor(private readonly equipamientoService: EquipamientoService) {}
@@ -14,6 +16,7 @@ export class EquipamientoController {
     return this.equipamientoService.listarTokens();
   }
 
+  @Roles('ADMIN', 'SUPERVISOR')
   @Post('tokens')
   @ApiOperation({ summary: 'Registrar nuevo token criptográfico USB en inventario' })
   async crearToken(@Body() dto: CrearTokenDto) {
@@ -26,14 +29,41 @@ export class EquipamientoController {
     return this.equipamientoService.listarActasCustodia();
   }
 
+  @Roles('ADMIN', 'SUPERVISOR')
   @Post('actas')
   @ApiOperation({ summary: 'Generar y firmar digitalmente una nueva acta de custodia de token USB' })
-  async crearActa(@Body() dto: CrearActaCustodiaDto) {
-    return this.equipamientoService.crearActaCustodia(dto);
+  async crearActa(@Body() dto: CrearActaCustodiaDto, @Req() req: Request) {
+    let emisorContext: { id?: string; rut?: string; nombre?: string; cargo?: string; email?: string } | undefined;
+
+    // 1. Extraer si req.user fue inyectado por JwtAuthGuard
+    const userReq = (req as any).user;
+    if (userReq) {
+      emisorContext = {
+        id: userReq.sub,
+        rut: userReq.rut,
+        email: userReq.email,
+      };
+    }
+
+    // 2. Extraer si viene en cabeceras directas (ej: X-Usuario-Rut, X-Usuario-Id)
+    const headerRut = (req.headers['x-usuario-rut'] as string) || (req.headers['x-user-rut'] as string);
+    const headerId = (req.headers['x-usuario-id'] as string) || (req.headers['x-user-id'] as string);
+    const headerNombre = (req.headers['x-usuario-nombre'] as string) || (req.headers['x-user-name'] as string);
+
+    if (headerRut || headerId || headerNombre) {
+      emisorContext = {
+        id: headerId || emisorContext?.id,
+        rut: headerRut || emisorContext?.rut,
+        nombre: headerNombre,
+        email: emisorContext?.email,
+      };
+    }
+
+    return this.equipamientoService.crearActaCustodia(dto, emisorContext);
   }
 
   @Get('actas/:id/pdf')
-  @ApiOperation({ summary: 'Descargar PDF oficial firmado del acta de custodia (generado con pdf-lib)' })
+  @ApiOperation({ summary: 'Descargar PDF oficial firmado del acta de custodia (soporta token Bearer o ?access_token=)' })
   async descargarPdfActa(@Param('id') id: string, @Res() res: Response) {
     const buffer = await this.equipamientoService.generarPdfActaCustodia(id);
     res.set({

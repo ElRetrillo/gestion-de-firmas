@@ -1,11 +1,13 @@
 {
   "name": "coquimbo-usb-ghost-agent",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "description": "Agente Silencioso (Electron Ghost App) de Telemetría de Tokens Criptográficos USB - I. Municipalidad de Coquimbo",
   "main": "main.js",
   "scripts": {
     "start": "electron .",
-    "simulate": "node simulator.js"
+    "simulate": "node simulator.js",
+    "pack": "electron-builder --dir",
+    "build:exe": "electron-builder --win --x64"
   },
   "keywords": [
     "electron",
@@ -15,9 +17,46 @@
     "telemetria",
     "coquimbo"
   ],
-  "author": "Departamento de Ciberseguridad y Transformación Digital - Municipalidad de Coquimbo",
+  "author": "Departamento de Gestión de Sistemas y TICs - I. Municipalidad de Coquimbo",
   "license": "UNLICENSED",
+  "build": {
+    "appId": "cl.municoquimbo.tic.ghostagent",
+    "productName": "CoquimboUsbGhostAgent",
+    "directories": {
+      "output": "dist-installer"
+    },
+    "files": [
+      "main.js",
+      "config.json",
+      "package.json"
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        },
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
+    },
+    "nsis": {
+      "oneClick": true,
+      "perMachine": false,
+      "runAfterFinish": true,
+      "createDesktopShortcut": false,
+      "createStartMenuShortcut": true,
+      "shortcutName": "Agente Telemetría USB Coquimbo"
+    }
+  },
   "devDependencies": {
-    "electron": "^30.0.0"
+    "electron": "^30.0.0",
+    "electron-builder": "^24.13.3"
   }
 }

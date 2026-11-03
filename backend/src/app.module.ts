@@ -1,6 +1,7 @@
 import { Module } from '@nestjs/common';
 import { ConfigModule, ConfigService } from '@nestjs/config';
 import { BullModule } from '@nestjs/bullmq';
+import { APP_GUARD } from '@nestjs/core';
 import { PrismaModule } from './prisma/prisma.module';
 import { RedisModule } from './redis/redis.module';
 import { WebsocketModule } from './websocket/websocket.module';
@@ -11,6 +12,7 @@ import { UsuariosModule } from './usuarios/usuarios.module';
 import { EquipamientoModule } from './equipamiento/equipamiento.module';
 import { AuditoriaModule } from './auditoria/auditoria.module';
 import { IntegracionesModule } from './integraciones/integraciones.module';
+import { JwtAuthGuard, RolesGuard } from './common/auth.guards';
 
 @Module({
   imports: [
@@ -42,6 +44,16 @@ import { IntegracionesModule } from './integraciones/integraciones.module';
     EquipamientoModule,
     AuditoriaModule,
     IntegracionesModule,
+  ],
+  providers: [
+    {
+      provide: APP_GUARD,
+      useClass: JwtAuthGuard,
+    },
+    {
+      provide: APP_GUARD,
+      useClass: RolesGuard,
+    },
   ],
 })
 export class AppModule {}

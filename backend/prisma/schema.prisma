@@ -13,6 +13,7 @@ enum RolUsuario {
   SUPERVISOR
   FUNCIONARIO
   MINISTRO_DE_FE
+  PENDIENTE
 }
 
 enum EstadoUsuario {
@@ -95,11 +96,12 @@ model Usuario {
   unidad              String
   rol                 RolUsuario        @default(FUNCIONARIO)
   estado              EstadoUsuario     @default(ACTIVO)
-  passwordHash        String            @default("Coquimbo2026!") @map("password_hash")
-  pinHash             String            @default("1234") @map("pin_hash")
+  passwordHash        String            @map("password_hash")
+  pinHash             String            @map("pin_hash")
   intentosPinFallidos Int               @default(0) @map("intentos_pin_fallidos")
   pinBloqueado        Boolean           @default(false) @map("pin_bloqueado")
-  condicionContractual String           @default("PLANTA") @map("condicion_contractual")
+  debeCambiarPassword Boolean           @default(false) @map("debe_cambiar_password")
+  condicionContractual String           @default("CONTRATA") @map("condicion_contractual")
   certificados        Certificado[]
   solicitudesFirma    SolicitudFirma[]
   actasCustodia       ActaCustodia[]
@@ -112,7 +114,7 @@ model Usuario {
 
 model Certificado {
   id               String              @id @default(uuid())
-  numeroSerie      String              @default("0x4F9B882103AC55E1") @map("numero_serie")
+  numeroSerie      String              @map("numero_serie")
   usuarioId        String              @map("usuario_id")
   usuario          Usuario             @relation(fields: [usuarioId], references: [id], onDelete: Cascade)
   tipo             TipoCertificado     @default(FIRMAGOB)
@@ -176,18 +178,18 @@ model TelemetriaEvento {
 model SolicitudFirma {
   id                    String                  @id @default(uuid())
   codigoDocumento       String                  @unique @default(cuid()) @map("codigo_documento")
-  titulo                String                  @default("Acto Administrativo Municipal")
+  titulo                String
   usuarioSolicitanteId  String                  @map("usuario_solicitante_id")
   usuarioSolicitante    Usuario                 @relation(fields: [usuarioSolicitanteId], references: [id])
   tipoTramite           String                  @map("tipo_tramite")
   clasificacion         ClasificacionDocumental @default(INTERNA)
   prioridad             String                  @default("NORMAL")
-  estacionAsignada      String                  @default("PC-SECMUN-01") @map("estacion_asignada")
-  tamanioKb             Int                     @default(350) @map("tamanio_kb")
+  estacionAsignada      String?                 @map("estacion_asignada")
+  tamanioKb             Int                     @default(0) @map("tamanio_kb")
   estadoAprobacion      EstadoAprobacion        @default(PENDIENTE) @map("estado_aprobacion")
   documentoUrl          String                  @map("documento_url")
   documentoFirmadoUrl   String?                 @map("documento_firmado_url")
-  hashSha256            String                  @default("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855") @map("hash_sha256")
+  hashSha256            String                  @map("hash_sha256")
   codigoVerificacion    String?                 @map("codigo_verificacion")
   codigoRegistroNotarial String?                @map("codigo_registro_notarial")
   estadoFePublica       String                  @default("NO_APLICA") @map("estado_fe_publica")
@@ -210,7 +212,7 @@ model ActaCustodia {
   usuarioId           String        @map("usuario_id")
   usuario             Usuario       @relation(fields: [usuarioId], references: [id])
   tipoActa            TipoActa      @map("tipo_acta")
-  observaciones       String        @default("Entrega conforme según protocolo ANCI Ley 21.663")
+  observaciones       String?
   hashSha256          String        @default("") @map("hash_sha256")
   documentoFirmadoUrl String        @map("documento_firmado_url")
   createdAt           DateTime      @default(now()) @map("created_at")
@@ -227,8 +229,8 @@ model HistorialCambio {
   accion        String
   usuarioId     String?   @map("usuario_id")
   usuario       Usuario?  @relation(fields: [usuarioId], references: [id], onDelete: SetNull)
-  usuarioEmail  String    @default("sistema@municoquimbo.cl") @map("usuario_email")
-  ipOrigen      String    @default("10.20.1.10") @map("ip_origen")
+  usuarioEmail  String    @map("usuario_email")
+  ipOrigen      String?   @map("ip_origen")
   diffJsonb     Json      @default("{}") @map("diff_jsonb")
   createdAt     DateTime  @default(now()) @map("created_at")
 
@@ -242,11 +244,25 @@ model IntegracionApi {
   servicio             TipoIntegracion @unique
   credencialesCifradas String          @map("credenciales_cifradas")
   webhookSecret        String          @map("webhook_secret")
-  endpointUrl          String          @default("https://api.firma.digital.gob.cl/v2") @map("endpoint_url")
+  endpointUrl          String          @map("endpoint_url")
   activo               Boolean         @default(true)
   ultimoCheck          DateTime        @default(now()) @map("ultimo_check")
   createdAt            DateTime        @default(now()) @map("created_at")
   updatedAt            DateTime        @updatedAt @map("updated_at")
 
   @@map("integraciones_api")
+}
+
+model ClasificacionInformacion {
+  id                  String                  @id @default(uuid())
+  nivel               ClasificacionDocumental @unique
+  nombre              String
+  descripcionPolitica String                  @map("descripcion_politica")
+  requiereFePublica   Boolean                 @default(false) @map("requiere_fe_publica")
+  retencionAnios      Int                     @default(5) @map("retencion_anios")
+  normativaBase       String                  @default("ISO/IEC 27001 - Ley 21.663 ANCI") @map("normativa_base")
+  createdAt           DateTime                @default(now()) @map("created_at")
+  updatedAt           DateTime                @updatedAt @map("updated_at")
+
+  @@map("clasificacion_informacion")
 }

@@ -1,0 +1,8 @@
+{
+  "apiEndpoint": "https://localhost",
+  "apiKey": "13c95102f4e51b87877c298216ea5fc09effa78b8ec1b882",
+  "pollingIntervalMs": 5000,
+  "inactivityTimeoutMinutes": 30,
+  "logLevel": "info",
+  "rejectUnauthorized": false
+}

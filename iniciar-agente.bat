@@ -1,14 +1,14 @@
 @echo off
+setlocal
 title Agente Ghost App - Telemetria USB Coquimbo
-echo ========================================================
-echo   Iniciando Agente de Telemetria de Token USB (Local)
-echo   Ilustre Municipalidad de Coquimbo
-echo ========================================================
-echo.
-cd /d "%~dp0ghost-app" 2>nul || cd /d "%~dp0"
-node main.js
-if %errorlevel% neq 0 (
-  echo.
-  echo [ERROR] Hubo un problema al iniciar el agente.
-  pause
+
+set "ROOT_DIR=%~dp0"
+set "GHOST_DIR=%ROOT_DIR%ghost-app"
+
+if exist "%GHOST_DIR%\iniciar-agente.bat" (
+  cd /d "%GHOST_DIR%"
+  call "%GHOST_DIR%\iniciar-agente.bat"
+) else (
+  cd /d "%ROOT_DIR%"
+  node main.js
 )

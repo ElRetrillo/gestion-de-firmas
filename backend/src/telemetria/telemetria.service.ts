@@ -4,6 +4,8 @@ import { RedisService } from '../redis/redis.service';
 import { TelemetriaGateway } from '../websocket/telemetria.gateway';
 import { TelemetriaUsbDto, EstadoHardwareEnum } from './dto/telemetria-usb.dto';
 import { Prisma } from '@prisma/client';
+import * as fs from 'fs';
+import * as path from 'path';
 
 @Injectable()
 export class TelemetriaService {
@@ -34,13 +36,32 @@ export class TelemetriaService {
     }
 
     const isHeartbeat = Boolean(dto.metadatos && dto.metadatos.isHeartbeat === true);
+
+    // Solo se considera cambio de estado real si:
+    // 1. Hay un cambio efectivo en el estado físico (ej: DESCONECTADO -> CONECTADO o CONECTADO -> DESCONECTADO)
+    // 2. O si estando conectado, cambia el número de serie del token físico insertado
+    // 3. O si es el primer registro de la estación en la base de datos
     const stateChanged =
+      previousState === null ||
       previousState !== dto.estadoHardware ||
-      (!isDesconectado && dto.serialNumber && previousStation?.serialTokenActivo !== dto.serialNumber) ||
-      !isHeartbeat;
+      (!isDesconectado && dto.serialNumber && previousStation?.serialTokenActivo !== dto.serialNumber);
 
     // 1. Persistencia en caché efímera de Redis (TTL 3600s)
     await this.redis.setPresence(dto.codigoPc, dto.estadoHardware);
+
+    // Control de tiempo para alertas de inactividad (>5 minutos conectado sin firmar)
+    const timeKeyConnected = `token:connected_at:${dto.codigoPc}`;
+    let connectedAtMs: number = Date.now();
+    if (!isDesconectado) {
+      const storedTime = await this.redis.getKey(timeKeyConnected);
+      if (storedTime) {
+        connectedAtMs = Number(storedTime);
+      } else {
+        await this.redis.setKey(timeKeyConnected, String(connectedAtMs), 86400);
+      }
+    } else {
+      await this.redis.delKey(timeKeyConnected);
+    }
 
     // 2. Registro o vinculación de hardware token si está presente
     let tokenId: string | null = null;
@@ -57,14 +78,14 @@ export class TelemetriaService {
           where: { serialNumber: dto.serialNumber },
           update: {
             vendorId: dto.vendorId || 'UNKNOWN',
-            marca: dto.marca || 'Thales / SafeNet',
-            modelo: dto.modelo || 'USB Cryptographic Token',
+            marca: dto.marca || 'Desconocido',
+            modelo: dto.modelo || 'Dispositivo Token USB',
           },
           create: {
             serialNumber: dto.serialNumber,
             vendorId: dto.vendorId || 'UNKNOWN',
-            marca: dto.marca || 'Thales / SafeNet',
-            modelo: dto.modelo || 'USB Cryptographic Token',
+            marca: dto.marca || 'Desconocido',
+            modelo: dto.modelo || 'Dispositivo Token USB',
           },
         });
         tokenId = token.id;
@@ -79,8 +100,8 @@ export class TelemetriaService {
         tokenInfo = {
           serialNumber: dto.serialNumber,
           vendorId: dto.vendorId || 'UNKNOWN',
-          marca: dto.marca || 'Thales / SafeNet',
-          modelo: dto.modelo || 'USB Cryptographic Token',
+          marca: dto.marca || 'Desconocido',
+          modelo: dto.modelo || 'Dispositivo Token USB',
         };
       }
     } else if (isDesconectado) {
@@ -129,7 +150,8 @@ export class TelemetriaService {
       this.logger.warn(`No se pudo actualizar estación de trabajo: ${(err as Error).message}`);
     }
 
-    // 4. Inserción en telemetria_eventos para auditoría forense solo ante cambios de estado o eventos explícitos
+    // 4. Inserción en telemetria_eventos para auditoría forense ÚNICAMENTE ante cambios reales de estado
+    // (Evita que eventos repetidos o heartbeats periódicos se stackeen en los logs de la base de datos)
     if (stateChanged) {
       try {
         await this.prisma.telemetriaEvento.create({
@@ -147,10 +169,19 @@ export class TelemetriaService {
             } as Prisma.InputJsonValue,
           },
         });
+        this.logger.log(
+          `[LOG FORENSE REGISTRADO] Transición de Hardware PC=${dto.codigoPc} -> ${dto.estadoHardware}${
+            dto.serialNumber ? ` (Token S/N=${dto.serialNumber})` : ''
+          }`,
+        );
       } catch (err) {
         this.logger.warn(`No se pudo guardar telemetría forense en BD: ${(err as Error).message}`);
       }
     }
+
+    // Cálculo de tiempo transcurrido y alerta (>5 minutos conectado sin firmar)
+    const minutosConectado = !isDesconectado ? Math.floor((Date.now() - connectedAtMs) / 60000) : 0;
+    const alertaInactividad = !isDesconectado && minutosConectado >= 5;
 
     // 5. Difusión en tiempo real vía WebSocket hacia Dashboard de Supervisores
     this.gateway.broadcastEstadoPc({
@@ -172,15 +203,16 @@ export class TelemetriaService {
         ...(dto.metadatos || {}),
         stateChanged,
         isHeartbeat: !stateChanged,
+        minutosConectado,
+        alertaInactividad,
+        alertaMensaje: alertaInactividad
+          ? `Alerta de Seguridad: Token conectado por ${minutosConectado} mins sin actividad de firma.`
+          : undefined,
         previousSerialNumber:
           (dto.metadatos?.previousSerialNumber as string | undefined) ||
           (isDesconectado ? previousStation?.serialTokenActivo : undefined),
       },
     });
-
-    this.logger.log(
-      `Evento USB procesado: PC=${dto.codigoPc} Estado=${dto.estadoHardware} (${stateChanged ? 'CAMBIO_ESTADO' : 'HEARTBEAT'})`,
-    );
 
     return {
       status: 'success',
@@ -188,6 +220,8 @@ export class TelemetriaService {
       estadoHardware: dto.estadoHardware,
       serialTokenActivo: isDesconectado ? null : tokenInfo?.serialNumber || null,
       stateChanged,
+      minutosConectado,
+      alertaInactividad,
       timestamp: timestamp.toISOString(),
     };
   }
@@ -234,26 +268,43 @@ export class TelemetriaService {
 
     const presencias = await this.redis.getAllPresences();
 
-    return estaciones.map((estacion) => {
-      const liveStatus = presencias[estacion.codigoPc] || estacion.estadoHardware;
-      const isDesconectado = liveStatus === 'DESCONECTADO';
+    return Promise.all(
+      estaciones.map(async (estacion) => {
+        const liveStatus = presencias[estacion.codigoPc] || estacion.estadoHardware;
+        const isDesconectado = liveStatus === 'DESCONECTADO';
 
-      let tokenInfo = null;
-      if (!isDesconectado) {
-        if (estacion.serialTokenActivo && tokensMap[estacion.serialTokenActivo]) {
-          tokenInfo = tokensMap[estacion.serialTokenActivo];
-        } else if (tokensMap[`__pc_${estacion.codigoPc}`]) {
-          tokenInfo = tokensMap[`__pc_${estacion.codigoPc}`];
+        let tokenInfo = null;
+        if (!isDesconectado) {
+          if (estacion.serialTokenActivo && tokensMap[estacion.serialTokenActivo]) {
+            tokenInfo = tokensMap[estacion.serialTokenActivo];
+          } else if (tokensMap[`__pc_${estacion.codigoPc}`]) {
+            tokenInfo = tokensMap[`__pc_${estacion.codigoPc}`];
+          }
         }
-      }
 
-      return {
-        ...estacion,
-        serialTokenActivo: isDesconectado ? null : (estacion.serialTokenActivo || tokenInfo?.serialNumber || null),
-        estadoEnVivo: liveStatus,
-        tokenInfo: isDesconectado ? null : tokenInfo,
-      };
-    });
+        let minutosConectado = 0;
+        let alertaInactividad = false;
+        if (!isDesconectado) {
+          const storedTime = await this.redis.getKey(`token:connected_at:${estacion.codigoPc}`);
+          if (storedTime) {
+            minutosConectado = Math.floor((Date.now() - Number(storedTime)) / 60000);
+            alertaInactividad = minutosConectado >= 5;
+          }
+        }
+
+        return {
+          ...estacion,
+          serialTokenActivo: isDesconectado ? null : (estacion.serialTokenActivo || tokenInfo?.serialNumber || null),
+          estadoEnVivo: liveStatus,
+          tokenInfo: isDesconectado ? null : tokenInfo,
+          minutosConectado,
+          alertaInactividad,
+          alertaMensaje: alertaInactividad
+            ? `Alerta: Token conectado por ${minutosConectado} mins sin actividad.`
+            : null,
+        };
+      }),
+    );
   }
 
   async obtenerUltimosEventos() {
@@ -278,5 +329,130 @@ export class TelemetriaService {
     }
     this.gateway.broadcastLimpiarMalla();
     return { status: 'cleared', timestamp: new Date().toISOString() };
+  }
+
+  private buscarBinarioExeCompilado(): { filePath: string; filename: string } | null {
+    try {
+      const distInstallerDir = path.resolve(process.cwd(), '../ghost-app/dist-installer');
+      if (!fs.existsSync(distInstallerDir)) return null;
+      const files = fs.readdirSync(distInstallerDir);
+      const exeFile = files.find((f) => f.toLowerCase().endsWith('.exe'));
+      if (!exeFile) return null;
+      return {
+        filePath: path.join(distInstallerDir, exeFile),
+        filename: exeFile,
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  obtenerInfoInstaladorAgente(baseUrl = 'http://localhost:3001') {
+    const exeInfo = this.buscarBinarioExeCompilado();
+    return {
+      nombre: 'Agente Silencioso de Telemetría USB (Ghost App)',
+      version: '2.1.0',
+      arquitectura: 'Windows x64 (Sin requerir Active Directory ni permisos de Administrador)',
+      protocoloUri: 'coquimbo-agent://ping',
+      endpointIngesta: `${baseUrl}/api/v1/telemetria/usb`,
+      exeCompiladoDisponible: Boolean(exeInfo),
+      nombreArchivoExe: exeInfo?.filename || null,
+      instrucciones: [
+        '1. Descargue el instalador en 1 clic desde este portal.',
+        '2. Ejecútelo una sola vez en su estación de trabajo Windows.',
+        '3. El agente quedará registrado automáticamente en el inicio de sesión de su usuario (openAtLogin) y operará de forma invisible en segundo plano.',
+      ],
+    };
+  }
+
+  generarPaqueteInstaladorAgente(
+    baseUrl = 'http://localhost:3001',
+    formato?: string,
+    dependenciaFisica = 'Red Interna Municipal - Coquimbo',
+  ): {
+    tipo: 'exe' | 'autoinstalador';
+    filename: string;
+    contentType: string;
+    buffer?: Buffer;
+    filePath?: string;
+  } {
+    const exeInfo = this.buscarBinarioExeCompilado();
+    if (exeInfo && formato !== 'autoinstalador') {
+      return {
+        tipo: 'exe',
+        filename: exeInfo.filename,
+        contentType: 'application/vnd.microsoft.portable-executable',
+        filePath: exeInfo.filePath,
+      };
+    }
+
+    // Leer el código fuente real de ghost-app/main.js para incrustarlo en Base64 dentro del autoinstalador 1-Clic
+    const mainJsPath = path.resolve(process.cwd(), '../ghost-app/main.js');
+    let mainJsContent = '';
+    try {
+      mainJsContent = fs.readFileSync(mainJsPath, 'utf8');
+    } catch {
+      mainJsContent = `console.log("Agente GhostApp Coquimbo");`;
+    }
+    const mainJsBase64 = Buffer.from(mainJsContent, 'utf8').toString('base64');
+
+    const apiKey = process.env.TELEMETRIA_API_KEY || 'muni-coquimbo-ghost-app-sec-key-2026';
+    const configJson = JSON.stringify(
+      {
+        apiUrl: `${baseUrl}/api/v1/telemetria/usb`,
+        apiKey,
+        dependenciaFisica,
+        pollIntervalMs: 2000,
+        heartbeatIntervalMs: 45000,
+      },
+      null,
+      2,
+    );
+    const configBase64 = Buffer.from(configJson, 'utf8').toString('base64');
+
+    const vbsScript = [
+      'Set WshShell = CreateObject("WScript.Shell")',
+      'Set fso = CreateObject("Scripting.FileSystemObject")',
+      'strDir = fso.GetParentFolderName(WScript.ScriptFullName)',
+      'WshShell.CurrentDirectory = strDir',
+      'WshShell.Run "cmd /c node ""main.js""", 0, False',
+    ].join('\r\n');
+    const vbsBase64 = Buffer.from(vbsScript, 'utf8').toString('base64');
+
+    const batContent = [
+      '@echo off',
+      'chcp 65001 >nul',
+      'title Instalador Automatico En 1 Clic - Agente Telemetria USB (I. Municipalidad de Coquimbo)',
+      'echo ============================================================================',
+      'echo   ILUSTRE MUNICIPALIDAD DE COQUIMBO - DEPTO. DE GESTION DE SISTEMAS Y TICS',
+      'echo   Instalador Asistido en 1 Clic - Agente Silencioso de Telemetria USB v2.1',
+      'echo   (No requiere Active Directory ni permisos de Administrador local)',
+      'echo ============================================================================',
+      'echo.',
+      'set "INSTALL_DIR=%LOCALAPPDATA%\\CoquimboGhostApp"',
+      'if not exist "%INSTALL_DIR%" mkdir "%INSTALL_DIR%"',
+      'echo [1/4] Desplegando binarios y configuracion en %INSTALL_DIR%...',
+      `powershell -NoProfile -ExecutionPolicy Bypass -Command "[IO.File]::WriteAllBytes('%INSTALL_DIR%\\main.js', [Convert]::FromBase64String('${mainJsBase64}'))"`,
+      `powershell -NoProfile -ExecutionPolicy Bypass -Command "[IO.File]::WriteAllBytes('%INSTALL_DIR%\\config.json', [Convert]::FromBase64String('${configBase64}'))"`,
+      `powershell -NoProfile -ExecutionPolicy Bypass -Command "[IO.File]::WriteAllBytes('%INSTALL_DIR%\\iniciar-silencioso.vbs', [Convert]::FromBase64String('${vbsBase64}'))"`,
+      'echo [2/4] Registrando inicio automatico en Windows (HKCU Run - openAtLogin)...',
+      'reg add "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run" /v "CoquimboUsbGhostAgent" /t REG_SZ /d "wscript.exe \\"%INSTALL_DIR%\\iniciar-silencioso.vbs\\"" /f >nul',
+      'echo [3/4] Reiniciando instancias previas del agente...',
+      'powershell -NoProfile -Command "Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -match \'main\\.js\' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }" >nul 2>&1',
+      'echo [4/4] Iniciando Agente Silencioso en segundo plano (Headless)...',
+      'start "" wscript.exe "%INSTALL_DIR%\\iniciar-silencioso.vbs"',
+      'echo.',
+      'echo [OK] Agente instalado y ejecutandose en segundo plano.',
+      'echo      Su estacion (%COMPUTERNAME%) ya esta reportando telemetria en vivo al Dashboard.',
+      'timeout /t 4 >nul',
+      'exit /b 0',
+    ].join('\r\n');
+
+    return {
+      tipo: 'autoinstalador',
+      filename: 'Instalar-Agente-USB-Coquimbo.bat',
+      contentType: 'application/x-bat; charset=utf-8',
+      buffer: Buffer.from(batContent, 'utf8'),
+    };
   }
 }

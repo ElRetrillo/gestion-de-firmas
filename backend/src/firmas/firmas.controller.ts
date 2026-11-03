@@ -9,7 +9,7 @@ import {
   HttpCode,
   HttpStatus,
 } from '@nestjs/common';
-import { ApiTags, ApiOperation, ApiResponse } from '@nestjs/swagger';
+import { ApiTags, ApiOperation, ApiResponse, ApiBearerAuth } from '@nestjs/swagger';
 import { Response } from 'express';
 import { FirmasService } from './firmas.service';
 import {
@@ -18,8 +18,10 @@ import {
   FirmarSolicitudIndividualDto,
   OtorgarFePublicaDto,
 } from './dto/crear-solicitud-firma.dto';
+import { Public, Roles } from '../common/auth.guards';
 
 @ApiTags('Orquestación de Firmas y Checksign')
+@ApiBearerAuth()
 @Controller('api/v1/firmas')
 export class FirmasController {
   constructor(private readonly firmasService: FirmasService) {}
@@ -57,6 +59,7 @@ export class FirmasController {
     return this.firmasService.firmarSolicitudIndividual(id, dto);
   }
 
+  @Roles('ADMIN', 'MINISTRO_DE_FE')
   @Post('solicitudes/:id/fe-publica')
   @ApiOperation({
     summary: 'Otorgar Atestación de Fe Pública (Ministro de Fe - Secretario Municipal) conforme a Ley N° 18.695',
@@ -70,7 +73,7 @@ export class FirmasController {
 
   @Get('solicitudes/:id/pdf')
   @ApiOperation({
-    summary: 'Descargar documento electrónico PDF con estampado criptográfico FEA y código Checksign',
+    summary: 'Descargar documento electrónico PDF con estampado criptográfico FEA y código Checksign (soporta ?access_token=)',
   })
   async descargarPdfDocumento(@Param('id') id: string, @Res() res: Response) {
     const { buffer, filename } = await this.firmasService.generarPdfDocumentoFirmado(id);
@@ -93,18 +96,20 @@ export class FirmasController {
     return this.firmasService.encolarLoteFirma(dto);
   }
 
+  @Public()
   @Post('checksign/verificar')
   @ApiOperation({
-    summary: 'Portal Checksign: Verificación de autenticidad e integridad documental',
+    summary: 'Portal Checksign: Verificación pública de autenticidad e integridad documental',
     description: 'Comprueba el hash criptográfico SHA-256, código de verificación y sellado de tiempo RFC 3161 conforme a la Ley N° 19.799.',
   })
   async verificarChecksign(@Body() body: { hashOTexto: string }) {
     return this.firmasService.verificarDocumentoChecksign(body.hashOTexto || 'DOC-2026-CQM-1420');
   }
 
+  @Public()
   @Get('checksign/:codigo/certificado-pdf')
   @ApiOperation({
-    summary: 'Descargar Certificado Oficial PDF de Validación Criptográfica Checksign',
+    summary: 'Descargar Certificado Oficial PDF de Validación Criptográfica Checksign (Portal Público)',
   })
   async descargarCertificadoChecksign(@Param('codigo') codigo: string, @Res() res: Response) {
     const { buffer, filename } = await this.firmasService.generarPdfCertificadoChecksign(codigo);

@@ -2,12 +2,33 @@ import { NestFactory } from '@nestjs/core';
 import { AppModule } from './app.module';
 import { ValidationPipe, Logger } from '@nestjs/common';
 import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
+import { Request, Response, NextFunction } from 'express';
 
 async function bootstrap() {
   const logger = new Logger('Bootstrap');
+
+  const jwtSecret = process.env.JWT_SECRET || '';
+  if (!jwtSecret || jwtSecret === 'coquimbo_secret_key_ciberseguridad_2026' || jwtSecret === 'coquimbo_secret_key_2026') {
+    if (process.env.NODE_ENV === 'production') {
+      logger.error('CRÍTICO: JWT_SECRET no configurado o usando clave por defecto en PRODUCCIÓN.');
+    } else {
+      logger.warn('ADVERTENCIA: Usando JWT_SECRET por defecto de desarrollo. Cambiar para producción.');
+    }
+  }
+
   const app = await NestFactory.create(AppModule);
 
-  // Validación de DTOs según lineamiento de ciberseguridad
+  // Cabeceras de seguridad HTTP estándar (Equivalente Helmet sin dependencias externas)
+  app.use((req: Request, res: Response, next: NextFunction) => {
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('X-Frame-Options', 'SAMEORIGIN');
+    res.setHeader('X-XSS-Protection', '1; mode=block');
+    res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+    res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
+    next();
+  });
+
+  // Validación estricta de DTOs según lineamiento de ciberseguridad
   app.useGlobalPipes(
     new ValidationPipe({
       whitelist: true,
@@ -17,8 +38,27 @@ async function bootstrap() {
   );
 
   // Configuración de CORS institucional
+  const corsOriginsEnv = process.env.CORS_ORIGINS;
+  let allowedOrigins: string | string[] | boolean = true;
+  if (corsOriginsEnv) {
+    if (corsOriginsEnv === '*') {
+      allowedOrigins = '*';
+    } else {
+      allowedOrigins = corsOriginsEnv.split(',').map((o) => o.trim());
+    }
+  } else {
+    // Orígenes predeterminados de desarrollo y pasarela
+    allowedOrigins = [
+      'http://localhost:3000',
+      'http://localhost:5173',
+      'http://localhost:80',
+      'http://127.0.0.1:3000',
+      'http://127.0.0.1:5173',
+    ];
+  }
+
   app.enableCors({
-    origin: '*',
+    origin: allowedOrigins,
     methods: 'GET,HEAD,PUT,PATCH,POST,DELETE',
     credentials: true,
   });
@@ -30,13 +70,13 @@ async function bootstrap() {
       'API Core Institucional conforme a Ley N° 19.799 (FEA), Ley N° 21.180 (Transformación Digital), Ley N° 21.663 (ANCI) e ISO/IEC 27001.',
     )
     .setVersion('2.0.0')
-    .addTag('Autenticación, OIDC y Seguridad eHSM')
+    .addTag('Autenticación y RBAC')
     .addTag('Telemetría USB')
     .addTag('Orquestación de Firmas y Checksign')
     .addTag('Usuarios e Identidades Digitales')
-    .addTag('Equipamiento Criptográfico y Actas de Custodia')
-    .addTag('Auditoría Forense e Historial Inmutable (ANCI)')
-    .addTag('Integraciones Externas y Webhooks (HMAC-SHA256)')
+    .addTag('Equipamiento USB y Actas de Custodia')
+    .addTag('Auditoría Forense ANCI y Trazabilidad JSONB')
+    .addTag('Integraciones Externas y Webhooks HMAC')
     .addBearerAuth()
     .build();
 
