@@ -6,7 +6,7 @@ import { TelemetriaUsbDto, EstadoHardwareEnum } from './dto/telemetria-usb.dto';
 import { Prisma } from '@prisma/client';
 import * as fs from 'fs';
 import * as path from 'path';
-import { GHOST_APP_MAIN_JS_BASE64 } from './ghost-app-payload';
+import { GHOST_APP_CHUNKS } from './ghost-app-payload';
 
 @Injectable()
 export class TelemetriaService {
@@ -387,8 +387,11 @@ export class TelemetriaService {
       };
     }
 
-    // Cargar el código fuente real del agente (embebido en Base64 para garantizar portabilidad)
-    const mainJsBase64 = GHOST_APP_MAIN_JS_BASE64;
+    // Generar comandos por fragmentos para evitar el límite de longitud de línea de CMD (8192 bytes)
+    const chunkCommands = GHOST_APP_CHUNKS.map((chunk, idx) => {
+      const mode = idx === 0 ? 'Create' : 'Append';
+      return `powershell -NoProfile -ExecutionPolicy Bypass -Command "$bytes = [Convert]::FromBase64String('${chunk}'); $stream = [IO.File]::Open('%INSTALL_DIR%\\main.js', [IO.FileMode]::${mode}); $stream.Write($bytes, 0, $bytes.Length); $stream.Close()"`;
+    });
 
     const apiKey = process.env.TELEMETRIA_API_KEY || 'muni-coquimbo-ghost-app-sec-key-2026';
     const configJson = JSON.stringify(
@@ -426,7 +429,8 @@ export class TelemetriaService {
       'set "INSTALL_DIR=%LOCALAPPDATA%\\CoquimboGhostApp"',
       'if not exist "%INSTALL_DIR%" mkdir "%INSTALL_DIR%"',
       'echo [1/4] Desplegando binarios y configuracion en %INSTALL_DIR%...',
-      `powershell -NoProfile -ExecutionPolicy Bypass -Command "[IO.File]::WriteAllBytes('%INSTALL_DIR%\\main.js', [Convert]::FromBase64String('${mainJsBase64}'))"`,
+      'if exist "%INSTALL_DIR%\\main.js" del /f /q "%INSTALL_DIR%\\main.js"',
+      ...chunkCommands,
       `powershell -NoProfile -ExecutionPolicy Bypass -Command "[IO.File]::WriteAllBytes('%INSTALL_DIR%\\config.json', [Convert]::FromBase64String('${configBase64}'))"`,
       `powershell -NoProfile -ExecutionPolicy Bypass -Command "[IO.File]::WriteAllBytes('%INSTALL_DIR%\\iniciar-silencioso.vbs', [Convert]::FromBase64String('${vbsBase64}'))"`,
       'echo [2/4] Registrando inicio automatico en Windows (HKCU Run - openAtLogin)...',

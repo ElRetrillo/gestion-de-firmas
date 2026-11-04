@@ -16,6 +16,9 @@ const fs = require('fs');
 const path = require('path');
 const { exec } = require('child_process');
 
+// En Node.js v18+ nativo (global fetch), permitir certificados autofirmados si NODE_TLS_REJECT_UNAUTHORIZED=0
+process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
+
 let electronApp = null;
 let BrowserWindow = null;
 let ipcMain = null;
