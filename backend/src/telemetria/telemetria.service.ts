@@ -6,6 +6,7 @@ import { TelemetriaUsbDto, EstadoHardwareEnum } from './dto/telemetria-usb.dto';
 import { Prisma } from '@prisma/client';
 import * as fs from 'fs';
 import * as path from 'path';
+import { GHOST_APP_MAIN_JS_BASE64 } from './ghost-app-payload';
 
 @Injectable()
 export class TelemetriaService {
@@ -386,27 +387,8 @@ export class TelemetriaService {
       };
     }
 
-    // Buscar el archivo main.js del agente Ghost App (en local o dentro del contenedor)
-    const posiblesRutas = [
-      path.resolve(process.cwd(), 'ghost-app/main.js'),
-      path.resolve(process.cwd(), '../ghost-app/main.js'),
-      path.resolve(__dirname, '../../ghost-app/main.js'),
-    ];
-
-    let mainJsContent = '';
-    for (const r of posiblesRutas) {
-      if (fs.existsSync(r)) {
-        try {
-          mainJsContent = fs.readFileSync(r, 'utf8');
-          break;
-        } catch {}
-      }
-    }
-
-    if (!mainJsContent) {
-      mainJsContent = `console.log("Agente GhostApp Coquimbo");`;
-    }
-    const mainJsBase64 = Buffer.from(mainJsContent, 'utf8').toString('base64');
+    // Cargar el código fuente real del agente (embebido en Base64 para garantizar portabilidad)
+    const mainJsBase64 = GHOST_APP_MAIN_JS_BASE64;
 
     const apiKey = process.env.TELEMETRIA_API_KEY || 'muni-coquimbo-ghost-app-sec-key-2026';
     const configJson = JSON.stringify(
