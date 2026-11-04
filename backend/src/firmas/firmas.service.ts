@@ -3,6 +3,8 @@ import {
   Logger,
   NotFoundException,
   ConflictException,
+  UnauthorizedException,
+  BadRequestException,
   HttpException,
   HttpStatus,
 } from '@nestjs/common';
@@ -277,16 +279,33 @@ export class FirmasService {
   async firmarSolicitudIndividual(idOrCodigo: string, dto: FirmarSolicitudIndividualDto) {
     const accion = dto.accion || 'FIRMAR';
     const modalidad = dto.modalidadFirma === 'DESATENDIDA' ? 'DESATENDIDA' : 'ATENDIDA';
-    const codigoOtpOPin = (dto.otp || dto.pin || '').trim();
+    const codigoOtp = (dto.otp || '').trim();
+    const codigoPin = (dto.pin || '').trim();
 
     // 1. Validar OTP / PIN según modalidad del Protocolo FirmaGob v2 (Atendida vs Desatendida)
     if (accion !== 'RECHAZAR' && modalidad === 'ATENDIDA') {
-      const otpactual = this.generarOtpActualTest().otp;
-      if (codigoOtpOPin !== otpactual) {
+      if (codigoPin) {
         await this.authService.verificarPinToken({
           rut: dto.rutFirmante,
-          pin: codigoOtpOPin || '000000',
+          pin: codigoPin,
         });
+      }
+
+      if (codigoOtp) {
+        const esTotpValido = await this.authService.verificarCodigoTotpUsuario(
+          dto.rutFirmante,
+          codigoOtp,
+        );
+        const esOtpSandbox = await this.verificarOtpEnSandbox(dto.rutFirmante, codigoOtp);
+        if (!esTotpValido && !esOtpSandbox) {
+          throw new UnauthorizedException(
+            'Código OTP dinámico incorrecto o expirado. Verifique el código de 6 dígitos en Google Authenticator o Microsoft Authenticator.',
+          );
+        }
+      } else if (!codigoPin) {
+        throw new BadRequestException(
+          'Para firma en modalidad ATENDIDA debe proporcionar su PIN de Token USB y/o el código OTP de su Authenticator.',
+        );
       }
     }
 
@@ -1754,7 +1773,9 @@ export class FirmasService {
       }
 
       const otpClean = otpHeader!.trim();
-      const otpValido = await this.verificarOtpEnSandbox(String(run), otpClean);
+      const otpValido =
+        (await this.authService.verificarCodigoTotpUsuario(String(run), otpClean)) ||
+        (await this.verificarOtpEnSandbox(String(run), otpClean));
       const intentosPrevios = Number((await this.redis.getKey(redisOtpKey)) || '0');
 
       // Si ya estaba bloqueado (>= 5 intentos) y vuelve a ingresar un OTP inválido -> 429

@@ -18,8 +18,22 @@ import {
 } from '../common/crypto.util';
 import { formatRut } from '../common/rut.util';
 import { JWT_ISSUER } from '../common/auth.guards';
+import { RedisService } from '../redis/redis.service';
+import {
+  derivarSecretoUsuario,
+  calcularTotp,
+  verificarTotp,
+  generarOtpauthUrl,
+  generarSecretoBase32,
+} from '../common/totp.util';
 
 import { IsNotEmpty, IsOptional, IsString } from 'class-validator';
+
+export class VerificarTotpDto {
+  @IsString()
+  @IsNotEmpty()
+  codigo!: string;
+}
 
 export class LoginDto {
   @IsString()
@@ -121,8 +135,9 @@ export class AuthService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly configService: ConfigService,
+    private readonly redis: RedisService,
   ) {
-    this.jwtSecret = this.configService.get<string>('JWT_SECRET', '');
+    this.jwtSecret = this.configService.get<string>('JWT_SECRET', 'secret_key_coquimbo_seguridad_fea_2026');
   }
 
   private signJwt(payload: Record<string, unknown>): string {
@@ -530,5 +545,99 @@ export class AuthService {
       proveedorAuth: 'ACTIVE_DIRECTORY',
       modoIntegracion: modo,
     };
+  }
+
+  /**
+   * Genera o recupera el secreto TOTP RFC 6238 del funcionario para configurar Google / Microsoft Authenticator
+   */
+  async obtenerSetupTotp(userIdOrRut: string) {
+    const usuario = await this.prisma.usuario.findFirst({
+      where: { OR: [{ id: userIdOrRut }, { rut: userIdOrRut }] },
+    });
+    if (!usuario) throw new UnauthorizedException('Usuario no encontrado.');
+
+    const redisKey = `user:totp-secret:${usuario.rut}`;
+    let secret = await this.redis.getKey(redisKey);
+    if (!secret) {
+      secret = derivarSecretoUsuario(usuario.rut, this.jwtSecret);
+    }
+
+    const otpauthUrl = generarOtpauthUrl({
+      cuenta: `${usuario.rut} (${usuario.email})`,
+      secretBase32: secret,
+      emisor: 'Ilustre Municipalidad de Coquimbo',
+    });
+
+    const codigoActual = calcularTotp(secret);
+
+    return {
+      rut: usuario.rut,
+      nombre: usuario.nombre,
+      email: usuario.email,
+      secretBase32: secret,
+      otpauthUrl,
+      codigoActual,
+      emisor: 'Ilustre Municipalidad de Coquimbo',
+      instrucciones: [
+        '1. Descargue Google Authenticator, Microsoft Authenticator o 2FAS en su teléfono.',
+        '2. En la app móvil, seleccione "Agregar cuenta" o "+" y luego "Ingresar clave de configuración".',
+        `3. En nombre de cuenta escriba "${usuario.email}" y en la clave ingrese: ${secret}`,
+        '4. Asegúrese de que el tipo de clave sea "Basada en tiempo" (TOTP 30s).',
+        '5. El código de 6 dígitos que aparezca en su aplicación será su OTP dinámico para autorizar firmas.',
+      ],
+      aplicacionesRecomendadas: [
+        {
+          nombre: 'Google Authenticator',
+          plataformas: 'Android e iOS',
+          playStoreUrl: 'https://play.google.com/store/apps/details?id=com.google.android.apps.authenticator2',
+          appStoreUrl: 'https://apps.apple.com/app/google-authenticator/id388497605',
+        },
+        {
+          nombre: 'Microsoft Authenticator',
+          plataformas: 'Android e iOS',
+          playStoreUrl: 'https://play.google.com/store/apps/details?id=com.azure.authenticator',
+          appStoreUrl: 'https://apps.apple.com/app/microsoft-authenticator/id983156458',
+        },
+        {
+          nombre: '2FAS Authenticator (Open Source)',
+          plataformas: 'Android e iOS',
+          playStoreUrl: 'https://play.google.com/store/apps/details?id=com.twofasapp',
+          appStoreUrl: 'https://apps.apple.com/app/2fas-auth/id1217793794',
+        },
+      ],
+    };
+  }
+
+  /**
+   * Valida si un código de 6 dígitos ingresado coincide con el OTP TOTP en tiempo real del usuario
+   */
+  async verificarCodigoTotpUsuario(rutOrUserId: string, codigo: string): Promise<boolean> {
+    const usuario = await this.prisma.usuario.findFirst({
+      where: { OR: [{ id: rutOrUserId }, { rut: rutOrUserId }] },
+    });
+    if (!usuario) return false;
+
+    let secret = await this.redis.getKey(`user:totp-secret:${usuario.rut}`);
+    if (!secret) {
+      secret = derivarSecretoUsuario(usuario.rut, this.jwtSecret);
+    }
+
+    return verificarTotp(secret, codigo, 1, 30);
+  }
+
+  /**
+   * Regenera un nuevo secreto aleatorio para el usuario y lo almacena en Redis
+   */
+  async regenerarSecretoTotp(userIdOrRut: string) {
+    const usuario = await this.prisma.usuario.findFirst({
+      where: { OR: [{ id: userIdOrRut }, { rut: userIdOrRut }] },
+    });
+    if (!usuario) throw new UnauthorizedException('Usuario no encontrado.');
+
+    const nuevoSecreto = generarSecretoBase32(20);
+    const redisKey = `user:totp-secret:${usuario.rut}`;
+    await this.redis.setKey(redisKey, nuevoSecreto, 365 * 86400);
+
+    return this.obtenerSetupTotp(usuario.id);
   }
 }

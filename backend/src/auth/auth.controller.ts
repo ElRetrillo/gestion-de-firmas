@@ -8,6 +8,7 @@ import {
   DesbloquearPinDto,
   CambiarPasswordDto,
   ClaveUnicaAuthDto,
+  VerificarTotpDto,
 } from './auth.service';
 import { Request } from 'express';
 import { Public, Roles, AllowPasswordChange } from '../common/auth.guards';
@@ -104,5 +105,35 @@ export class AuthController {
   })
   async loginActiveDirectory(@Body() dto: LoginDto, @Req() req: Request) {
     return this.authService.loginActiveDirectory(dto, ipDe(req));
+  }
+
+  @Get('totp/setup')
+  @ApiOperation({
+    summary: 'Configuración 2FA / TOTP oficial (Google Authenticator, Microsoft Authenticator, 2FAS)',
+    description: 'Retorna clave secreta Base32, URL otpauth:// y lista de aplicaciones móviles para autenticación de dos factores.',
+  })
+  async obtenerSetupTotp(@Req() req: any) {
+    return this.authService.obtenerSetupTotp(req.user.sub || req.user.rut);
+  }
+
+  @Post('totp/verificar')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Verificar código OTP TOTP dinámico de 6 dígitos' })
+  async verificarTotp(@Body() dto: VerificarTotpDto, @Req() req: any) {
+    const valido = await this.authService.verificarCodigoTotpUsuario(
+      req.user.sub || req.user.rut,
+      dto.codigo,
+    );
+    if (!valido) {
+      return { valido: false, mensaje: 'Código OTP inválido o expirado. Verifique la hora en su app.' };
+    }
+    return { valido: true, mensaje: 'Código OTP validado correctamente.' };
+  }
+
+  @Post('totp/regenerar')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Regenerar nueva clave secreta TOTP para el funcionario' })
+  async regenerarTotp(@Req() req: any) {
+    return this.authService.regenerarSecretoTotp(req.user.sub || req.user.rut);
   }
 }
