@@ -76,8 +76,8 @@ services:
   # Backend Core (NestJS + TypeScript + Prisma + Socket.io + BullMQ)
   backend:
     build:
-      context: ./backend
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: ./backend/Dockerfile
     container_name: gestion-firmas-backend
     restart: unless-stopped
     environment:

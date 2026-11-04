@@ -386,12 +386,24 @@ export class TelemetriaService {
       };
     }
 
-    // Leer el código fuente real de ghost-app/main.js para incrustarlo en Base64 dentro del autoinstalador 1-Clic
-    const mainJsPath = path.resolve(process.cwd(), '../ghost-app/main.js');
+    // Buscar el archivo main.js del agente Ghost App (en local o dentro del contenedor)
+    const posiblesRutas = [
+      path.resolve(process.cwd(), 'ghost-app/main.js'),
+      path.resolve(process.cwd(), '../ghost-app/main.js'),
+      path.resolve(__dirname, '../../ghost-app/main.js'),
+    ];
+
     let mainJsContent = '';
-    try {
-      mainJsContent = fs.readFileSync(mainJsPath, 'utf8');
-    } catch {
+    for (const r of posiblesRutas) {
+      if (fs.existsSync(r)) {
+        try {
+          mainJsContent = fs.readFileSync(r, 'utf8');
+          break;
+        } catch {}
+      }
+    }
+
+    if (!mainJsContent) {
       mainJsContent = `console.log("Agente GhostApp Coquimbo");`;
     }
     const mainJsBase64 = Buffer.from(mainJsContent, 'utf8').toString('base64');
