@@ -7,10 +7,36 @@ export class AuditoriaService {
 
   constructor(private readonly prisma: PrismaService) {}
 
-  async listarEventosAuditoria(filtro?: string, accion?: string) {
+  async listarEventosAuditoria(
+    filtro?: string,
+    accion?: string,
+    modo?: string,
+    mes?: string,
+  ) {
     try {
+      let whereClause: Record<string, any> = {};
+
+      if (modo === 'POR_MES' && mes && /^\d{4}-\d{2}$/.test(mes)) {
+        const [yStr, mStr] = mes.split('-');
+        const year = Number(yStr);
+        const month = Number(mStr);
+        whereClause.createdAt = {
+          gte: new Date(year, month - 1, 1, 0, 0, 0, 0),
+          lte: new Date(year, month, 0, 23, 59, 59, 999),
+        };
+      } else if (modo === 'ULTIMOS_30_DIAS') {
+        const fin = new Date();
+        const inicio = new Date(fin.getTime() - 29 * 24 * 60 * 60 * 1000);
+        inicio.setHours(0, 0, 0, 0);
+        whereClause.createdAt = {
+          gte: inicio,
+          lte: fin,
+        };
+      }
+
       const registros = await this.prisma.historialCambio.findMany({
-        take: 100,
+        where: whereClause,
+        take: 250,
         orderBy: { createdAt: 'desc' },
         include: { usuario: true },
       });

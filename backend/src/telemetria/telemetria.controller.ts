@@ -41,6 +41,18 @@ export class TelemetriaController {
     return this.telemetriaService.obtenerUltimosEventos();
   }
 
+  @Roles('ADMIN', 'SUPERVISOR')
+  @Get('metricas')
+  @ApiOperation({
+    summary: 'Métricas de trazabilidad, estadísticas operacionales y porcentajes (Por Mes o Últimos 30 días)',
+  })
+  async obtenerMetricas(
+    @Query('modo') modo?: string,
+    @Query('mes') mes?: string,
+  ) {
+    return this.telemetriaService.obtenerMetricasTrazabilidad(modo, mes);
+  }
+
   @Roles('ADMIN')
   @Post('limpiar')
   @HttpCode(HttpStatus.OK)

@@ -14,8 +14,13 @@ export class AuditoriaController {
   @ApiOperation({
     summary: 'Consultar bitácora de auditoría inalterable (Solo ADMIN y SUPERVISOR)',
   })
-  async listar(@Query('q') q?: string, @Query('accion') accion?: string) {
-    return this.auditoriaService.listarEventosAuditoria(q, accion);
+  async listar(
+    @Query('q') q?: string,
+    @Query('accion') accion?: string,
+    @Query('modo') modo?: string,
+    @Query('mes') mes?: string,
+  ) {
+    return this.auditoriaService.listarEventosAuditoria(q, accion, modo, mes);
   }
 
   @Get('estadisticas')

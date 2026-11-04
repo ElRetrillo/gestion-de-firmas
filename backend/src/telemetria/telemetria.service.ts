@@ -453,4 +453,574 @@ export class TelemetriaService {
       buffer: Buffer.from(batContent, 'utf8'),
     };
   }
+
+  /**
+   * Calcula métricas de trazabilidad, estadísticas operacionales y porcentajes
+   * reportables en dos modalidades:
+   * 1) POR_MES (mes calendario específico YYYY-MM)
+   * 2) ULTIMOS_30_DIAS (ventana móvil de los últimos 30 días)
+   */
+  async obtenerMetricasTrazabilidad(modoInput?: string, mesInput?: string) {
+    const nombresMeses = [
+      'Enero',
+      'Febrero',
+      'Marzo',
+      'Abril',
+      'Mayo',
+      'Junio',
+      'Julio',
+      'Agosto',
+      'Septiembre',
+      'Octubre',
+      'Noviembre',
+      'Diciembre',
+    ];
+
+    const modo = modoInput === 'POR_MES' ? 'POR_MES' : 'ULTIMOS_30_DIAS';
+    const ahora = new Date();
+    const defaultMes = `${ahora.getFullYear()}-${String(ahora.getMonth() + 1).padStart(2, '0')}`;
+    const mesSeleccionado =
+      mesInput && /^\d{4}-\d{2}$/.test(mesInput) ? mesInput : defaultMes;
+
+    let fechaInicio: Date;
+    let fechaFin: Date;
+    let etiquetaPeriodo: string;
+
+    if (modo === 'POR_MES') {
+      const [yStr, mStr] = mesSeleccionado.split('-');
+      const year = Number(yStr);
+      const month = Number(mStr); // 1..12
+      fechaInicio = new Date(year, month - 1, 1, 0, 0, 0, 0);
+      fechaFin = new Date(year, month, 0, 23, 59, 59, 999);
+      const nombreMes = nombresMeses[(month - 1 + 12) % 12] || mStr;
+      etiquetaPeriodo = `${nombreMes} ${year}`;
+    } else {
+      fechaFin = new Date();
+      fechaInicio = new Date(fechaFin.getTime() - 29 * 24 * 60 * 60 * 1000);
+      fechaInicio.setHours(0, 0, 0, 0);
+      etiquetaPeriodo = 'Últimos 30 días';
+    }
+
+    // Construir lista de meses disponibles (últimos 12 meses + mes seleccionado)
+    const mesesMap = new Map<string, string>();
+    for (let i = 0; i < 12; i++) {
+      const d = new Date(ahora.getFullYear(), ahora.getMonth() - i, 1);
+      const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+      mesesMap.set(key, `${nombresMeses[d.getMonth()]} ${d.getFullYear()}`);
+    }
+    if (!mesesMap.has(mesSeleccionado)) {
+      const [yStr, mStr] = mesSeleccionado.split('-');
+      const mIdx = (Number(mStr) - 1 + 12) % 12;
+      mesesMap.set(mesSeleccionado, `${nombresMeses[mIdx]} ${yStr}`);
+    }
+
+    const pct = (parte: number, total: number) =>
+      total > 0 ? Math.round((parte / total) * 1000) / 10 : 0;
+
+    try {
+      const [
+        estacionesVivo,
+        tokensHardware,
+        eventosTelemetria,
+        solicitudesPeriodo,
+        usuarios,
+        certificados,
+        actasPeriodo,
+        historialPeriodo,
+      ] = await Promise.all([
+        this.obtenerEstadosEstaciones(),
+        this.prisma.tokenHardware.findMany({
+          include: {
+            certificados: {
+              include: {
+                usuario: {
+                  select: { id: true, nombre: true, rut: true, unidad: true, cargo: true },
+                },
+              },
+            },
+            actasCustodia: {
+              orderBy: { createdAt: 'desc' },
+              take: 1,
+              include: {
+                usuario: {
+                  select: { id: true, nombre: true, rut: true, unidad: true, cargo: true },
+                },
+              },
+            },
+          },
+        }),
+        this.prisma.telemetriaEvento.findMany({
+          where: {
+            timestamp: {
+              gte: fechaInicio,
+              lte: fechaFin,
+            },
+          },
+          include: { token: true },
+          orderBy: { timestamp: 'desc' },
+        }),
+        this.prisma.solicitudFirma.findMany({
+          where: {
+            createdAt: {
+              gte: fechaInicio,
+              lte: fechaFin,
+            },
+          },
+          include: {
+            usuarioSolicitante: {
+              select: { id: true, nombre: true, unidad: true, rut: true },
+            },
+          },
+        }),
+        this.prisma.usuario.findMany(),
+        this.prisma.certificado.findMany(),
+        this.prisma.actaCustodia.findMany({
+          where: {
+            createdAt: {
+              gte: fechaInicio,
+              lte: fechaFin,
+            },
+          },
+        }),
+        this.prisma.historialCambio.findMany({
+          where: {
+            createdAt: {
+              gte: fechaInicio,
+              lte: fechaFin,
+            },
+          },
+          orderBy: { createdAt: 'desc' },
+        }),
+      ]);
+
+      // 1. Métricas de Estaciones y Telemetría USB
+      const totalEstaciones = estacionesVivo.length;
+      const estacionesConectadas = estacionesVivo.filter(
+        (e: any) => e.estadoEnVivo === 'CONECTADO' || e.estadoEnVivo === 'FIRMANDO',
+      ).length;
+      const estacionesFirmando = estacionesVivo.filter(
+        (e: any) => e.estadoEnVivo === 'FIRMANDO',
+      ).length;
+      const estacionesDesconectadas = estacionesVivo.filter(
+        (e: any) => e.estadoEnVivo === 'DESCONECTADO',
+      ).length;
+      const porcentajeDisponibilidad = pct(estacionesConectadas, totalEstaciones);
+
+      const totalEventosPeriodo = eventosTelemetria.length;
+      const eventosConectado = eventosTelemetria.filter((e) => e.evento === 'CONECTADO').length;
+      const eventosFirmando = eventosTelemetria.filter((e) => e.evento === 'FIRMANDO').length;
+      const eventosDesconectado = eventosTelemetria.filter(
+        (e) => e.evento === 'DESCONECTADO',
+      ).length;
+
+      const porcentajeEventosConectado = pct(eventosConectado, totalEventosPeriodo);
+      const porcentajeEventosFirmando = pct(eventosFirmando, totalEventosPeriodo);
+      const porcentajeEventosDesconectado = pct(eventosDesconectado, totalEventosPeriodo);
+
+      const tokensRegistrados = tokensHardware.length;
+      const tokensOperativos = tokensHardware.filter(
+        (t) => t.estadoPatrimonial === 'OPERATIVO' || t.estadoPatrimonial === 'ASIGNADO',
+      ).length;
+      const porcentajeTokensOperativos = pct(tokensOperativos, tokensRegistrados);
+
+      // Trazabilidad por Estación de Trabajo en el período
+      const mapaEstaciones = new Map<
+        string,
+        {
+          codigoPc: string;
+          dependenciaFisica: string;
+          ipAsignada: string;
+          estadoActual: string;
+          serialTokenActivo: string | null;
+          totalEventos: number;
+          conexiones: number;
+          firmas: number;
+          desconexiones: number;
+          ultimoPing: string;
+        }
+      >();
+
+      for (const est of estacionesVivo as any[]) {
+        mapaEstaciones.set(est.codigoPc, {
+          codigoPc: est.codigoPc,
+          dependenciaFisica: est.dependenciaFisica || 'Red Interna Municipal',
+          ipAsignada: est.ipAsignada || '-',
+          estadoActual: est.estadoEnVivo || 'DESCONECTADO',
+          serialTokenActivo: est.tokenInfo?.serialNumber || est.serialTokenActivo || null,
+          totalEventos: 0,
+          conexiones: 0,
+          firmas: 0,
+          desconexiones: 0,
+          ultimoPing:
+            est.ultimoPing instanceof Date
+              ? est.ultimoPing.toISOString()
+              : String(est.ultimoPing || new Date().toISOString()),
+        });
+      }
+
+      for (const ev of eventosTelemetria) {
+        const meta = (ev.metadatosJsonb as Record<string, any>) || {};
+        if (!mapaEstaciones.has(ev.codigoPc)) {
+          mapaEstaciones.set(ev.codigoPc, {
+            codigoPc: ev.codigoPc,
+            dependenciaFisica: meta.dependenciaFisica || 'Red Interna Municipal',
+            ipAsignada: meta.ipAsignada || '-',
+            estadoActual: 'DESCONECTADO',
+            serialTokenActivo: ev.token?.serialNumber || meta.serialNumber || null,
+            totalEventos: 0,
+            conexiones: 0,
+            firmas: 0,
+            desconexiones: 0,
+            ultimoPing: ev.timestamp.toISOString(),
+          });
+        }
+        const item = mapaEstaciones.get(ev.codigoPc)!;
+        item.totalEventos += 1;
+        if (ev.evento === 'CONECTADO') item.conexiones += 1;
+        if (ev.evento === 'FIRMANDO') item.firmas += 1;
+        if (ev.evento === 'DESCONECTADO') item.desconexiones += 1;
+        if (!item.serialTokenActivo && (ev.token?.serialNumber || meta.serialNumber)) {
+          item.serialTokenActivo = ev.token?.serialNumber || meta.serialNumber;
+        }
+      }
+
+      const rankingEstaciones = Array.from(mapaEstaciones.values())
+        .map((item) => ({
+          ...item,
+          porcentajeActividad: pct(item.totalEventos, totalEventosPeriodo),
+          tasaExitoConexion: pct(item.conexiones + item.firmas, item.totalEventos),
+        }))
+        .sort((a, b) => b.totalEventos - a.totalEventos);
+
+      // Trazabilidad detallada por Dispositivo / Token Físico en el período
+      const trazabilidadDispositivos = tokensHardware
+        .map((t: any) => {
+          const eventosDelToken = eventosTelemetria.filter(
+            (ev) =>
+              ev.tokenId === t.id ||
+              ev.token?.serialNumber === t.serialNumber ||
+              (ev.metadatosJsonb as any)?.serialNumber === t.serialNumber,
+          );
+          const conexiones = eventosDelToken.filter((ev) => ev.evento === 'CONECTADO').length;
+          const firmas = eventosDelToken.filter((ev) => ev.evento === 'FIRMANDO').length;
+          const desconexiones = eventosDelToken.filter((ev) => ev.evento === 'DESCONECTADO').length;
+          const totalEventos = eventosDelToken.length;
+
+          const estacionViva = (estacionesVivo as any[]).find(
+            (est) =>
+              est.tokenInfo?.serialNumber === t.serialNumber ||
+              est.serialTokenActivo === t.serialNumber,
+          );
+
+          const certAsignado = t.certificados?.[0];
+          const actaReciente = t.actasCustodia?.[0];
+          const usuarioTitular = certAsignado?.usuario || actaReciente?.usuario || null;
+
+          return {
+            id: t.id,
+            serialNumber: t.serialNumber,
+            marca: t.marca,
+            modelo: t.modelo,
+            vendorId: t.vendorId,
+            estadoPatrimonial: t.estadoPatrimonial,
+            funcionarioAsignado: usuarioTitular
+              ? {
+                  nombre: usuarioTitular.nombre,
+                  rut: usuarioTitular.rut,
+                  unidad: usuarioTitular.unidad,
+                }
+              : null,
+            estacionActual: estacionViva?.codigoPc || eventosDelToken[0]?.codigoPc || null,
+            estadoEnVivo: estacionViva?.estadoEnVivo || 'DESCONECTADO',
+            totalEventosPeriodo: totalEventos,
+            conexionesPeriodo: conexiones,
+            firmasPeriodo: firmas,
+            desconexionesPeriodo: desconexiones,
+            porcentajeUsoPeriodo: pct(totalEventos, totalEventosPeriodo),
+            ultimaActividad:
+              eventosDelToken[0]?.timestamp?.toISOString() ||
+              estacionViva?.ultimoPing ||
+              t.updatedAt.toISOString(),
+          };
+        })
+        .sort((a, b) => b.totalEventosPeriodo - a.totalEventosPeriodo);
+
+      // 2. Métricas Documentales y de Firmas en el período
+      const totalSolicitudesPeriodo = solicitudesPeriodo.length;
+      const firmadas = solicitudesPeriodo.filter((s) => s.estadoAprobacion === 'FIRMADA').length;
+      const rechazadas = solicitudesPeriodo.filter(
+        (s) => s.estadoAprobacion === 'RECHAZADA',
+      ).length;
+      const pendientes = solicitudesPeriodo.filter(
+        (s) =>
+          s.estadoAprobacion === 'PENDIENTE' ||
+          s.estadoAprobacion === 'EN_VISACION' ||
+          s.estadoAprobacion === 'APROBADA',
+      ).length;
+
+      const tasaExitoFirmaPct = pct(firmadas, totalSolicitudesPeriodo);
+      const tasaRechazoPct = pct(rechazadas, totalSolicitudesPeriodo);
+      const tasaPendientesPct = pct(pendientes, totalSolicitudesPeriodo);
+
+      const fePublicaRequerida = solicitudesPeriodo.filter(
+        (s) => s.estadoFePublica && s.estadoFePublica !== 'NO_APLICA',
+      );
+      const fePublicaOtorgada = fePublicaRequerida.filter(
+        (s) =>
+          s.estadoFePublica === 'VALIDADO_FE_PUBLICA' ||
+          s.estadoFePublica === 'OTORGADA' ||
+          Boolean(s.codigoRegistroNotarial),
+      ).length;
+      const fePublicaPendiente = fePublicaRequerida.length - fePublicaOtorgada;
+      const porcentajeFePublica = pct(fePublicaOtorgada, fePublicaRequerida.length);
+
+      const nivelesClasificacion = ['PUBLICA', 'INTERNA', 'CONFIDENCIAL', 'CRITICA'];
+      const porClasificacion = nivelesClasificacion.map((nivel) => {
+        const cantidad = solicitudesPeriodo.filter((s) => s.clasificacion === nivel).length;
+        return {
+          clasificacion: nivel,
+          cantidad,
+          porcentaje: pct(cantidad, totalSolicitudesPeriodo),
+        };
+      });
+
+      const mapaUnidades = new Map<
+        string,
+        { unidad: string; total: number; firmadas: number; pendientes: number; rechazadas: number }
+      >();
+      for (const sol of solicitudesPeriodo) {
+        const nombreUnidad = sol.usuarioSolicitante?.unidad || 'Unidad General Municipal';
+        if (!mapaUnidades.has(nombreUnidad)) {
+          mapaUnidades.set(nombreUnidad, {
+            unidad: nombreUnidad,
+            total: 0,
+            firmadas: 0,
+            pendientes: 0,
+            rechazadas: 0,
+          });
+        }
+        const u = mapaUnidades.get(nombreUnidad)!;
+        u.total += 1;
+        if (sol.estadoAprobacion === 'FIRMADA') u.firmadas += 1;
+        else if (sol.estadoAprobacion === 'RECHAZADA') u.rechazadas += 1;
+        else u.pendientes += 1;
+      }
+
+      const porUnidad = Array.from(mapaUnidades.values())
+        .map((u) => ({
+          ...u,
+          porcentajeExito: pct(u.firmadas, u.total),
+          porcentajeParticipacion: pct(u.total, totalSolicitudesPeriodo),
+        }))
+        .sort((a, b) => b.total - a.total);
+
+      // 3. Métricas de Administración, Custodia, Certificados y Auditoría
+      const totalUsuarios = usuarios.length;
+      const usuariosActivos = usuarios.filter(
+        (u) => u.estado === 'ACTIVO' && u.rol !== 'PENDIENTE',
+      ).length;
+      const usuariosPendientesAprobacion = usuarios.filter((u) => u.rol === 'PENDIENTE').length;
+      const usuariosNuevosPeriodo = usuarios.filter(
+        (u) => u.createdAt >= fechaInicio && u.createdAt <= fechaFin,
+      ).length;
+      const porcentajeUsuariosActivos = pct(usuariosActivos, totalUsuarios);
+
+      const totalCertificados = certificados.length;
+      const certificadosVigentes = certificados.filter((c) => c.estado === 'VIGENTE').length;
+      const certificadosPorVencer = certificados.filter((c) => c.estado === 'POR_VENCER').length;
+      const certificadosRevocadosVencidos = certificados.filter(
+        (c) => c.estado === 'REVOCADO' || c.estado === 'VENCIDO',
+      ).length;
+      const porcentajeVigenciaCertificados = pct(certificadosVigentes, totalCertificados);
+
+      const custodiaTokenFisico = certificados.filter((c) => c.custodia === 'TOKEN_FISICO').length;
+      const custodiaCloud = certificados.filter((c) => c.custodia === 'CLOUD').length;
+      const porcentajeTokenFisico = pct(custodiaTokenFisico, totalCertificados);
+      const porcentajeCloud = pct(custodiaCloud, totalCertificados);
+
+      const actasPorTipo = {
+        ENTREGA: actasPeriodo.filter((a) => a.tipoActa === 'ENTREGA').length,
+        DEVOLUCION: actasPeriodo.filter((a) => a.tipoActa === 'DEVOLUCION').length,
+        TRASPASO: actasPeriodo.filter((a) => a.tipoActa === 'TRASPASO').length,
+        BAJA: actasPeriodo.filter((a) => a.tipoActa === 'BAJA').length,
+      };
+
+      const totalEventosAuditoriaPeriodo = historialPeriodo.length;
+      const conteoAcciones = new Map<string, number>();
+      const conteoModulos = new Map<string, number>();
+
+      for (const h of historialPeriodo) {
+        conteoAcciones.set(h.accion, (conteoAcciones.get(h.accion) || 0) + 1);
+        conteoModulos.set(h.tablaAfectada, (conteoModulos.get(h.tablaAfectada) || 0) + 1);
+      }
+
+      const auditoriaPorAccion = Array.from(conteoAcciones.entries())
+        .map(([accion, cantidad]) => ({
+          accion,
+          cantidad,
+          porcentaje: pct(cantidad, totalEventosAuditoriaPeriodo),
+        }))
+        .sort((a, b) => b.cantidad - a.cantidad);
+
+      const auditoriaPorModulo = Array.from(conteoModulos.entries())
+        .map(([modulo, cantidad]) => ({
+          modulo,
+          cantidad,
+          porcentaje: pct(cantidad, totalEventosAuditoriaPeriodo),
+        }))
+        .sort((a, b) => b.cantidad - a.cantidad);
+
+      // 4. Serie Temporal Diaria del Período
+      const diasMap = new Map<
+        string,
+        {
+          fecha: string;
+          etiqueta: string;
+          eventosTelemetria: number;
+          conexionesUsb: number;
+          firmasRealizadas: number;
+          operacionesAuditoria: number;
+          totalActividad: number;
+        }
+      >();
+
+      const cursor = new Date(fechaInicio);
+      cursor.setHours(0, 0, 0, 0);
+      const finCursor = new Date(fechaFin);
+      finCursor.setHours(23, 59, 59, 999);
+
+      while (cursor <= finCursor) {
+        const yyyy = cursor.getFullYear();
+        const mm = String(cursor.getMonth() + 1).padStart(2, '0');
+        const dd = String(cursor.getDate()).padStart(2, '0');
+        const key = `${yyyy}-${mm}-${dd}`;
+        const mesCorto = nombresMeses[cursor.getMonth()].slice(0, 3);
+        diasMap.set(key, {
+          fecha: key,
+          etiqueta: `${dd} ${mesCorto}`,
+          eventosTelemetria: 0,
+          conexionesUsb: 0,
+          firmasRealizadas: 0,
+          operacionesAuditoria: 0,
+          totalActividad: 0,
+        });
+        cursor.setDate(cursor.getDate() + 1);
+      }
+
+      const toDateKey = (d: Date) => {
+        const yyyy = d.getFullYear();
+        const mm = String(d.getMonth() + 1).padStart(2, '0');
+        const dd = String(d.getDate()).padStart(2, '0');
+        return `${yyyy}-${mm}-${dd}`;
+      };
+
+      for (const ev of eventosTelemetria) {
+        const key = toDateKey(new Date(ev.timestamp));
+        const slot = diasMap.get(key);
+        if (slot) {
+          slot.eventosTelemetria += 1;
+          if (ev.evento === 'CONECTADO') slot.conexionesUsb += 1;
+          if (ev.evento === 'FIRMANDO') slot.firmasRealizadas += 1;
+          slot.totalActividad += 1;
+        }
+      }
+
+      for (const sol of solicitudesPeriodo) {
+        if (sol.estadoAprobacion === 'FIRMADA') {
+          const fechaRef = sol.tsaTimestamp ? new Date(sol.tsaTimestamp) : new Date(sol.updatedAt);
+          const key = toDateKey(fechaRef);
+          const slot = diasMap.get(key);
+          if (slot) {
+            slot.firmasRealizadas += 1;
+            slot.totalActividad += 1;
+          }
+        }
+      }
+
+      for (const aud of historialPeriodo) {
+        const key = toDateKey(new Date(aud.createdAt));
+        const slot = diasMap.get(key);
+        if (slot) {
+          slot.operacionesAuditoria += 1;
+          slot.totalActividad += 1;
+        }
+      }
+
+      const serieTemporal = Array.from(diasMap.values());
+
+      return {
+        periodo: {
+          modo,
+          mesSeleccionado,
+          etiquetaPeriodo,
+          fechaInicio: fechaInicio.toISOString(),
+          fechaFin: fechaFin.toISOString(),
+          mesesDisponibles: Array.from(mesesMap.entries()).map(([valor, etiqueta]) => ({
+            valor,
+            etiqueta,
+          })),
+        },
+        telemetria: {
+          totalEstaciones,
+          estacionesConectadas,
+          estacionesFirmando,
+          estacionesDesconectadas,
+          porcentajeDisponibilidad,
+          totalEventosPeriodo,
+          eventosConectado,
+          eventosFirmando,
+          eventosDesconectado,
+          porcentajeEventosConectado,
+          porcentajeEventosFirmando,
+          porcentajeEventosDesconectado,
+          tokensRegistrados,
+          tokensOperativos,
+          porcentajeTokensOperativos,
+          rankingEstaciones,
+          trazabilidadDispositivos,
+        },
+        firmas: {
+          totalSolicitudesPeriodo,
+          firmadas,
+          pendientes,
+          rechazadas,
+          tasaExitoFirmaPct,
+          tasaPendientesPct,
+          tasaRechazoPct,
+          fePublicaOtorgada,
+          fePublicaPendiente,
+          porcentajeFePublica,
+          porClasificacion,
+          porUnidad,
+        },
+        administracion: {
+          totalUsuarios,
+          usuariosActivos,
+          usuariosPendientesAprobacion,
+          usuariosNuevosPeriodo,
+          porcentajeUsuariosActivos,
+          totalCertificados,
+          certificadosVigentes,
+          certificadosPorVencer,
+          certificadosRevocadosVencidos,
+          porcentajeVigenciaCertificados,
+          custodiaTokenFisico,
+          custodiaCloud,
+          porcentajeTokenFisico,
+          porcentajeCloud,
+          actasPeriodo: actasPeriodo.length,
+          actasPorTipo,
+          totalEventosAuditoriaPeriodo,
+          auditoriaPorAccion,
+          auditoriaPorModulo,
+        },
+        serieTemporal,
+      };
+    } catch (error) {
+      this.logger.error(
+        `Error al calcular métricas de trazabilidad: ${(error as Error).message}`,
+      );
+      throw error;
+    }
+  }
 }
