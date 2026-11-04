@@ -2,7 +2,7 @@ import { NestFactory } from '@nestjs/core';
 import { AppModule } from './app.module';
 import { ValidationPipe, Logger } from '@nestjs/common';
 import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
-import { Request, Response, NextFunction } from 'express';
+import { Request, Response, NextFunction, json, urlencoded } from 'express';
 
 async function bootstrap() {
   const logger = new Logger('Bootstrap');
@@ -17,6 +17,10 @@ async function bootstrap() {
   }
 
   const app = await NestFactory.create(AppModule);
+
+  // Soporte de payloads JSON/Base64 hasta 15MB para permitir archivos de hasta 5MB según protocolo FirmaGob v2
+  app.use(json({ limit: '15mb' }));
+  app.use(urlencoded({ extended: true, limit: '15mb' }));
 
   // Cabeceras de seguridad HTTP estándar (Equivalente Helmet sin dependencias externas)
   app.use((req: Request, res: Response, next: NextFunction) => {

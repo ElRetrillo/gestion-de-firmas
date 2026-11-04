@@ -44,7 +44,7 @@ COPY backend/docker-entrypoint.sh ./docker-entrypoint.sh
 COPY ghost-app ./ghost-app
 
 # Asignar permisos al usuario no privilegiado y cambiar de usuario
-RUN chmod +x docker-entrypoint.sh && chown -R node:node /app
+RUN mkdir -p /app/storage/documentos && chmod +x docker-entrypoint.sh && chown -R node:node /app
 USER node
 
 EXPOSE 3001

@@ -1,6 +1,6 @@
 import { Module } from '@nestjs/common';
 import { BullModule } from '@nestjs/bullmq';
-import { FirmasController } from './firmas.controller';
+import { FirmasController, FirmaGobProtocoloController } from './firmas.controller';
 import { FirmasService } from './firmas.service';
 import { FirmasProcessor } from './firmas.processor';
 import { AuthModule } from '../auth/auth.module';
@@ -12,7 +12,7 @@ import { AuthModule } from '../auth/auth.module';
     }),
     AuthModule,
   ],
-  controllers: [FirmasController],
+  controllers: [FirmasController, FirmaGobProtocoloController],
   providers: [FirmasService, FirmasProcessor],
   exports: [FirmasService],
 })
