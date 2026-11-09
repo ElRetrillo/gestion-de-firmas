@@ -266,3 +266,21 @@ model ClasificacionInformacion {
 
   @@map("clasificacion_informacion")
 }
+
+model ContratoToken {
+  id               String   @id @default(uuid())
+  codigoContrato   String   @unique @map("codigo_contrato")
+  titulo           String
+  proveedor        String
+  fechaInicio      DateTime @map("fecha_inicio")
+  fechaCaducidad   DateTime @map("fecha_caducidad")
+  cantidadTokens   Int      @default(1) @map("cantidad_tokens")
+  montoReferencial String?  @map("monto_referencial")
+  descripcion      String?
+  documentoUrl     String   @default("") @map("documento_url")
+  createdAt        DateTime @default(now()) @map("created_at")
+  updatedAt        DateTime @updatedAt @map("updated_at")
+
+  @@index([fechaCaducidad])
+  @@map("contratos_tokens")
+}

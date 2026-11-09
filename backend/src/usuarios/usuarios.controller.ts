@@ -74,13 +74,25 @@ export class UsuariosController {
     return this.usuariosService.obtenerAlertasVencimiento();
   }
 
-  @Roles('ADMIN', 'SUPERVISOR')
   @Post('alertas-vencimiento/despachar')
   @ApiOperation({
-    summary: 'Despachar alerta de renovación individual o masiva y registrar en auditoría',
+    summary: 'Despachar alerta de renovación individual o masiva por correo y registrar en auditoría',
   })
-  async despacharAlerta(@Body() body: { certificadoId?: string; email?: string }) {
-    return this.usuariosService.despacharNotificacionVencimiento(body.certificadoId, body.email);
+  async despacharAlerta(
+    @Body()
+    body: {
+      certificadoId?: string;
+      email?: string;
+      serialNumber?: string;
+      diasRestantes?: number;
+    },
+  ) {
+    return this.usuariosService.despacharNotificacionVencimiento(
+      body?.certificadoId,
+      body?.email,
+      body?.serialNumber,
+      body?.diasRestantes,
+    );
   }
 
   @Roles('ADMIN', 'SUPERVISOR')

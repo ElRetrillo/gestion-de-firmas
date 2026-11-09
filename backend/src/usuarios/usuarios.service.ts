@@ -404,10 +404,9 @@ export class UsuariosService implements OnModuleInit, OnModuleDestroy {
         where: {
           validoHasta: {
             lte: en60Dias,
-            gte: ahora,
           },
           estado: {
-            in: ['VIGENTE', 'POR_VENCER'],
+            in: ['VIGENTE', 'POR_VENCER', 'VENCIDO'],
           },
         },
         include: {
@@ -418,25 +417,51 @@ export class UsuariosService implements OnModuleInit, OnModuleDestroy {
       });
 
       return certs.map((c) => {
-        const diasRestantes = Math.max(
-          1,
-          Math.ceil((c.validoHasta.getTime() - ahora.getTime()) / (1000 * 60 * 60 * 24)),
+        const diasRestantes = Math.ceil(
+          (c.validoHasta.getTime() - ahora.getTime()) / (1000 * 60 * 60 * 24),
         );
-        const severidad = diasRestantes <= 15 ? 'ALTA' : diasRestantes <= 30 ? 'MEDIA' : 'BAJA';
+        const tramoAlerta: 'EXPIRADO' | '15_DIAS' | '30_DIAS' | '60_DIAS' =
+          diasRestantes < 0
+            ? 'EXPIRADO'
+            : diasRestantes <= 15
+            ? '15_DIAS'
+            : diasRestantes <= 30
+            ? '30_DIAS'
+            : '60_DIAS';
+
+        const severidad: 'ALTA' | 'MEDIA' | 'BAJA' =
+          diasRestantes <= 15 ? 'ALTA' : diasRestantes <= 30 ? 'MEDIA' : 'BAJA';
+
+        const tiempoExpiracionTexto =
+          diasRestantes < 0
+            ? `Expirado hace ${Math.abs(diasRestantes)} días`
+            : diasRestantes === 0
+            ? 'Vence hoy'
+            : `${diasRestantes} días restantes`;
+
         return {
           id: c.id,
           numeroSerie: c.numeroSerie,
-          tipo: c.tipo === 'FIRMAGOB' ? 'FIRMAGOB (Token Criptográfico)' : 'FEA ESIGN (Cloudsigner HSM)',
+          serialNumberToken: c.tokenHardware?.serialNumber || c.numeroSerie,
+          tipo: c.tipo === 'FIRMAGOB' ? 'FIRMAGOB (Token Criptográfico)' : 'FEA ESIGN (Token USB)',
           custodia: c.custodia,
           hardwareModelo: c.tokenHardware
             ? `${c.tokenHardware.marca} ${c.tokenHardware.modelo}`
-            : 'Thales Luna HSM Cloud',
+            : 'Token Criptográfico USB',
+          tokenHardware: c.tokenHardware,
           diasRestantes,
+          tramoAlerta,
           severidad,
+          tiempoExpiracionTexto,
+          fechaInicio: c.createdAt.toISOString().split('T')[0],
           fechaExpiracion: c.validoHasta.toISOString().split('T')[0],
+          validoHasta: c.validoHasta.toISOString(),
+          estado: diasRestantes < 0 ? 'EXPIRADO' : c.estado,
           usuario: {
+            id: c.usuario.id,
             nombre: c.usuario.nombre,
             unidad: c.usuario.unidad,
+            cargo: c.usuario.cargo,
             email: c.usuario.email,
             rut: c.usuario.rut,
           },
@@ -448,19 +473,112 @@ export class UsuariosService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
-  async despacharNotificacionVencimiento(certificadoId?: string, emailDestino?: string) {
+  async despacharNotificacionVencimiento(
+    certificadoId?: string,
+    emailDestino?: string,
+    serialNumber?: string,
+    diasRestantesInput?: number,
+  ) {
+    const ahora = new Date();
+    let certEncontrado: any = null;
+
+    if (certificadoId || serialNumber) {
+      try {
+        certEncontrado = await this.prisma.certificado.findFirst({
+          where: {
+            OR: [
+              ...(certificadoId ? [{ id: certificadoId }, { numeroSerie: certificadoId }] : []),
+              ...(serialNumber
+                ? [{ numeroSerie: serialNumber }, { tokenHardware: { serialNumber } }]
+                : []),
+            ],
+          },
+          include: {
+            usuario: true,
+            tokenHardware: true,
+          },
+        });
+      } catch {
+        // Ignorar
+      }
+    }
+
+    const destinatarioFinal =
+      emailDestino || certEncontrado?.usuario?.email || 'notificaciones-tokens@municoquimbo.cl';
+    const nombreFuncionario = certEncontrado?.usuario?.nombre || 'Funcionario(a) Municipal';
+    const rutFuncionario = certEncontrado?.usuario?.rut || '-';
+    const tokenSerial =
+      certEncontrado?.tokenHardware?.serialNumber ||
+      serialNumber ||
+      certEncontrado?.numeroSerie ||
+      certificadoId ||
+      'TODOS-EN-UMBRAL';
+
+    const diasCalculados =
+      diasRestantesInput !== undefined
+        ? diasRestantesInput
+        : certEncontrado?.validoHasta
+        ? Math.ceil((new Date(certEncontrado.validoHasta).getTime() - ahora.getTime()) / (1000 * 60 * 60 * 24))
+        : 15;
+
+    const fechaExpStr = certEncontrado?.validoHasta
+      ? new Date(certEncontrado.validoHasta).toISOString().split('T')[0]
+      : 'Próxima a vencer';
+
+    const umbralTexto =
+      diasCalculados < 0
+        ? 'EXPIRADO (Renovación Urgente)'
+        : diasCalculados <= 15
+        ? '15 DÍAS (Alerta Crítica)'
+        : diasCalculados <= 30
+        ? '30 DÍAS (Alerta Preventiva Media)'
+        : '60 DÍAS (Aviso Preventivo)';
+
+    const asunto = certEncontrado || certificadoId
+      ? `[AVISO VENCIMIENTO TOKEN FEA - ${umbralTexto}] Dispositivo ${tokenSerial} (${nombreFuncionario})`
+      : `[AVISO MASIVO DE VIGENCIA DE TOKENS FEA] Control de Vencimientos 15, 30 y 60 Días - I. Municipalidad de Coquimbo`;
+
+    const cuerpoCorreo =
+      certEncontrado || certificadoId
+        ? [
+            `Estimado(a) ${nombreFuncionario} (RUT: ${rutFuncionario}):`,
+            ``,
+            `El Sistema de Control y Seguimiento de Tokens de Firma Electrónica de la Ilustre Municipalidad de Coquimbo le informa el estado de vigencia de su dispositivo criptográfico asignado:`,
+            ``,
+            `• Dispositivo / Token S/N : ${tokenSerial}`,
+            `• Fecha de Expiración     : ${fechaExpStr}`,
+            `• Tiempo Restante         : ${diasCalculados < 0 ? `Expirado hace ${Math.abs(diasCalculados)} días` : `${diasCalculados} días restantes`}`,
+            `• Nivel de Alerta         : ${umbralTexto}`,
+            ``,
+            `Por favor coordine la renovación de su certificado digital con el Departamento de Gestión de Sistemas y TICs antes de la fecha de caducidad para evitar la interrupción de su firma electrónica.`,
+            ``,
+            `Atentamente,`,
+            `Unidad de Control de Tokens y Firma Electrónica - I. Municipalidad de Coquimbo`,
+          ].join('\n')
+        : [
+            `Aviso Institucional Masivo - Control de Vigencia de Tokens (Umbrales 15, 30 y 60 días):`,
+            `Se han despachado los correos electrónicos de alerta de vencimiento a todos los funcionarios cuyos tokens se encuentran dentro de las ventanas de 15, 30 y 60 días previos a su expiración.`,
+          ].join('\n');
+
     try {
       await this.prisma.historialCambio.create({
         data: {
           tablaAfectada: 'certificados',
-          registroId: certificadoId || 'MASIVO_CRON_60_30_15',
-          accion: 'NOTIFICACION_VENCIMIENTO',
-          usuarioEmail: emailDestino || 'cron-alertas@municoquimbo.cl',
+          registroId: tokenSerial,
+          accion: 'NOTIFICACION_VENCIMIENTO_CORREO',
+          usuarioId: certEncontrado?.usuario?.id || null,
+          usuarioEmail: destinatarioFinal,
           diffJsonb: {
-            certificadoId: certificadoId || 'TODOS_EN_UMBRAL',
-            destinatario: emailDestino || 'TODOS_LOS_FUNCIONARIOS_POR_VENCER',
+            certificadoId: certEncontrado?.id || certificadoId || 'MASIVO_60_30_15',
+            serialNumberToken: tokenSerial,
+            funcionario: nombreFuncionario,
+            destinatario: destinatarioFinal,
+            diasRestantes: diasCalculados,
+            umbralAlerta: umbralTexto,
+            asunto,
+            cuerpoCorreo,
             escalasMonitoreadas: ['15_DIAS_CRITICO', '30_DIAS_MEDIA', '60_DIAS_PREVENTIVO'],
-            timestamp: new Date().toISOString(),
+            timestamp: ahora.toISOString(),
           },
         },
       });
@@ -470,9 +588,15 @@ export class UsuariosService implements OnModuleInit, OnModuleDestroy {
 
     return {
       status: 'dispatched',
-      certificadoId: certificadoId || 'ALL',
-      emailDestino: emailDestino || 'multiple',
-      timestamp: new Date().toISOString(),
+      certificadoId: certEncontrado?.id || certificadoId || 'ALL',
+      serialNumberToken: tokenSerial,
+      funcionarioNombre: nombreFuncionario,
+      emailDestino: destinatarioFinal,
+      diasRestantes: diasCalculados,
+      umbralAlerta: umbralTexto,
+      asunto,
+      cuerpoCorreo,
+      timestamp: ahora.toISOString(),
     };
   }
 

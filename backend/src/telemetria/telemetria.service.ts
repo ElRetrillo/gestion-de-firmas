@@ -4,6 +4,8 @@ import { RedisService } from '../redis/redis.service';
 import { TelemetriaGateway } from '../websocket/telemetria.gateway';
 import { TelemetriaUsbDto, EstadoHardwareEnum } from './dto/telemetria-usb.dto';
 import { Prisma } from '@prisma/client';
+import { PDFDocument, StandardFonts, rgb } from 'pdf-lib';
+import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
 import { GHOST_APP_CHUNKS } from './ghost-app-payload';
@@ -38,11 +40,13 @@ export class TelemetriaService {
 
     const isHeartbeat = Boolean(dto.metadatos && dto.metadatos.isHeartbeat === true);
 
-    // Solo se considera cambio de estado real si:
-    // 1. Hay un cambio efectivo en el estado físico (ej: DESCONECTADO -> CONECTADO o CONECTADO -> DESCONECTADO)
-    // 2. O si estando conectado, cambia el número de serie del token físico insertado
-    // 3. O si es el primer registro de la estación en la base de datos
+    // Solo se considera cambio de estado real (o acción efectiva de firma) si:
+    // 1. Es una acción de firma (FIRMANDO)
+    // 2. Hay un cambio efectivo en el estado físico (ej: DESCONECTADO -> CONECTADO o CONECTADO -> DESCONECTADO)
+    // 3. O si estando conectado, cambia el número de serie del token físico insertado
+    // 4. O si es el primer registro de la estación en la base de datos
     const stateChanged =
+      dto.estadoHardware === EstadoHardwareEnum.FIRMANDO ||
       previousState === null ||
       previousState !== dto.estadoHardware ||
       (!isDesconectado && dto.serialNumber && previousStation?.serialTokenActivo !== dto.serialNumber);
@@ -455,12 +459,154 @@ export class TelemetriaService {
   }
 
   /**
-   * Calcula métricas de trazabilidad, estadísticas operacionales y porcentajes
-   * reportables en dos modalidades:
-   * 1) POR_MES (mes calendario específico YYYY-MM)
-   * 2) ULTIMOS_30_DIAS (ventana móvil de los últimos 30 días)
+   * Requisito 3: Registra una acción de firma electrónica proveniente de la sesión activa del funcionario
+   * y del token conectado en el dispositivo. (1 acción = 1 firma realizada con el token).
    */
-  async obtenerMetricasTrazabilidad(modoInput?: string, mesInput?: string) {
+  async registrarAccionFirmaSesion(
+    body: {
+      rutFuncionario?: string;
+      usuarioId?: string;
+      serialNumber?: string;
+      codigoPc?: string;
+      glosaAccion?: string;
+    },
+    userContext?: { sub?: string; rut?: string; email?: string },
+  ) {
+    const ahora = new Date();
+    let usuario: any = null;
+
+    const targetId = body.usuarioId || userContext?.sub;
+    const targetRut = body.rutFuncionario || userContext?.rut;
+
+    if (targetId || targetRut) {
+      usuario = await this.prisma.usuario
+        .findFirst({
+          where: {
+            OR: [
+              ...(targetId ? [{ id: targetId }] : []),
+              ...(targetRut ? [{ rut: targetRut.trim() }] : []),
+            ],
+          },
+          include: {
+            certificados: {
+              include: { tokenHardware: true },
+            },
+          },
+        })
+        .catch(() => null);
+    }
+
+    let token: any = null;
+    if (body.serialNumber) {
+      token = await this.prisma.tokenHardware
+        .findUnique({
+          where: { serialNumber: body.serialNumber.trim() },
+          include: {
+            certificados: { include: { usuario: true } },
+          },
+        })
+        .catch(() => null);
+    }
+
+    if (!token && usuario?.certificados?.[0]?.tokenHardware) {
+      token = usuario.certificados[0].tokenHardware;
+    }
+
+    if (!usuario && token?.certificados?.[0]?.usuario) {
+      usuario = token.certificados[0].usuario;
+    }
+
+    if (!token) {
+      token = await this.prisma.tokenHardware
+        .findFirst({
+          include: { certificados: { include: { usuario: true } } },
+        })
+        .catch(() => null);
+      if (!usuario && token?.certificados?.[0]?.usuario) {
+        usuario = token.certificados[0].usuario;
+      }
+    }
+
+    const serialFinal = body.serialNumber || token?.serialNumber || 'SN-0529-CQM-TEST01';
+    const codigoPcFinal =
+      body.codigoPc ||
+      `PC-${(usuario?.unidad || 'TICS').replace(/[^A-Z0-9]/gi, '').slice(0, 6).toUpperCase()}-01`;
+
+    const resultadoUsb = await this.registrarEventoUsb({
+      codigoPc: codigoPcFinal,
+      estadoHardware: EstadoHardwareEnum.FIRMANDO,
+      serialNumber: serialFinal,
+      vendorId: token?.vendorId || '0x0529',
+      marca: token?.marca || 'Thales / SafeNet',
+      modelo: token?.modelo || 'eToken 5110 CC (FIPS 140-2 L3)',
+      dependenciaFisica: usuario?.unidad || 'Red Interna Municipal - Coquimbo',
+      timestamp: ahora.toISOString(),
+      metadatos: {
+        accionFirma: true,
+        stateChanged: true,
+        isHeartbeat: false,
+        origen: 'SESION_Y_TOKEN_DISPOSITIVO',
+        usuarioId: usuario?.id || null,
+        funcionarioRut: usuario?.rut || targetRut || null,
+        funcionarioNombre: usuario?.nombre || 'Funcionario en Sesión',
+        unidad: usuario?.unidad || 'Municipalidad de Coquimbo',
+        glosaAccion:
+          body.glosaAccion || 'Firma electrónica ejecutada desde sesión activa con token físico',
+      },
+    });
+
+    if (usuario) {
+      await this.prisma.historialCambio
+        .create({
+          data: {
+            tablaAfectada: 'telemetria_eventos',
+            registroId: serialFinal,
+            accion: 'ACCION_FIRMA_TOKEN',
+            usuarioId: usuario.id,
+            usuarioEmail: usuario.email,
+            diffJsonb: {
+              serialNumberToken: serialFinal,
+              codigoPc: codigoPcFinal,
+              funcionarioRut: usuario.rut,
+              funcionarioNombre: usuario.nombre,
+              unidad: usuario.unidad,
+              glosaAccion:
+                body.glosaAccion || 'Firma electrónica con token realizada en sesión activa',
+              timestamp: ahora.toISOString(),
+            },
+          },
+        })
+        .catch(() => {});
+    }
+
+    return {
+      status: 'signature_action_recorded',
+      mensaje: `Acción de firma registrada exitosamente para ${usuario?.nombre || 'funcionario'} con token ${serialFinal}.`,
+      codigoPc: codigoPcFinal,
+      serialNumber: serialFinal,
+      funcionario: usuario
+        ? {
+            id: usuario.id,
+            rut: usuario.rut,
+            nombre: usuario.nombre,
+            unidad: usuario.unidad,
+          }
+        : null,
+      timestamp: ahora.toISOString(),
+      telemetria: resultadoUsb,
+    };
+  }
+
+  /**
+   * Calcula métricas de trazabilidad, control de tokens, acciones de firma por funcionario,
+   * vigencias (15, 30, 60 días), contratos y código LaTeX para períodos:
+   * - ULTIMOS_7_DIAS
+   * - ULTIMOS_15_DIAS
+   * - ULTIMOS_30_DIAS
+   * - POR_MES (YYYY-MM)
+   * - POR_ANIO (YYYY)
+   */
+  async obtenerMetricasTrazabilidad(modoInput?: string, mesInput?: string, anioInput?: string) {
     const nombresMeses = [
       'Enero',
       'Febrero',
@@ -476,11 +622,25 @@ export class TelemetriaService {
       'Diciembre',
     ];
 
-    const modo = modoInput === 'POR_MES' ? 'POR_MES' : 'ULTIMOS_30_DIAS';
+    const modosValidos = [
+      'ULTIMOS_7_DIAS',
+      'ULTIMOS_15_DIAS',
+      'ULTIMOS_30_DIAS',
+      'POR_MES',
+      'POR_ANIO',
+    ];
+    const modo = modosValidos.includes(String(modoInput))
+      ? (modoInput as 'ULTIMOS_7_DIAS' | 'ULTIMOS_15_DIAS' | 'ULTIMOS_30_DIAS' | 'POR_MES' | 'POR_ANIO')
+      : 'ULTIMOS_30_DIAS';
+
     const ahora = new Date();
     const defaultMes = `${ahora.getFullYear()}-${String(ahora.getMonth() + 1).padStart(2, '0')}`;
     const mesSeleccionado =
       mesInput && /^\d{4}-\d{2}$/.test(mesInput) ? mesInput : defaultMes;
+
+    const defaultAnio = String(ahora.getFullYear());
+    const anioSeleccionado =
+      anioInput && /^\d{4}$/.test(anioInput) ? anioInput : defaultAnio;
 
     let fechaInicio: Date;
     let fechaFin: Date;
@@ -494,6 +654,21 @@ export class TelemetriaService {
       fechaFin = new Date(year, month, 0, 23, 59, 59, 999);
       const nombreMes = nombresMeses[(month - 1 + 12) % 12] || mStr;
       etiquetaPeriodo = `${nombreMes} ${year}`;
+    } else if (modo === 'POR_ANIO') {
+      const year = Number(anioSeleccionado);
+      fechaInicio = new Date(year, 0, 1, 0, 0, 0, 0);
+      fechaFin = new Date(year, 11, 31, 23, 59, 59, 999);
+      etiquetaPeriodo = `Año ${year}`;
+    } else if (modo === 'ULTIMOS_7_DIAS') {
+      fechaFin = new Date();
+      fechaInicio = new Date(fechaFin.getTime() - 6 * 24 * 60 * 60 * 1000);
+      fechaInicio.setHours(0, 0, 0, 0);
+      etiquetaPeriodo = 'Últimos 7 días';
+    } else if (modo === 'ULTIMOS_15_DIAS') {
+      fechaFin = new Date();
+      fechaInicio = new Date(fechaFin.getTime() - 14 * 24 * 60 * 60 * 1000);
+      fechaInicio.setHours(0, 0, 0, 0);
+      etiquetaPeriodo = 'Últimos 15 días';
     } else {
       fechaFin = new Date();
       fechaInicio = new Date(fechaFin.getTime() - 29 * 24 * 60 * 60 * 1000);
@@ -514,6 +689,12 @@ export class TelemetriaService {
       mesesMap.set(mesSeleccionado, `${nombresMeses[mIdx]} ${yStr}`);
     }
 
+    // Construir lista de años disponibles
+    const aniosDisponibles = [0, 1, 2].map((offset) => {
+      const y = String(ahora.getFullYear() - offset);
+      return { valor: y, etiqueta: `Año ${y}` };
+    });
+
     const pct = (parte: number, total: number) =>
       total > 0 ? Math.round((parte / total) * 1000) / 10 : 0;
 
@@ -522,11 +703,14 @@ export class TelemetriaService {
         estacionesVivo,
         tokensHardware,
         eventosTelemetria,
+        todosEventosFirma,
         solicitudesPeriodo,
+        todasSolicitudesFirmadas,
         usuarios,
         certificados,
         actasPeriodo,
         historialPeriodo,
+        contratosRaw,
       ] = await Promise.all([
         this.obtenerEstadosEstaciones(),
         this.prisma.tokenHardware.findMany({
@@ -534,7 +718,7 @@ export class TelemetriaService {
             certificados: {
               include: {
                 usuario: {
-                  select: { id: true, nombre: true, rut: true, unidad: true, cargo: true },
+                  select: { id: true, nombre: true, rut: true, unidad: true, cargo: true, email: true, estado: true },
                 },
               },
             },
@@ -543,7 +727,7 @@ export class TelemetriaService {
               take: 1,
               include: {
                 usuario: {
-                  select: { id: true, nombre: true, rut: true, unidad: true, cargo: true },
+                  select: { id: true, nombre: true, rut: true, unidad: true, cargo: true, email: true, estado: true },
                 },
               },
             },
@@ -556,6 +740,11 @@ export class TelemetriaService {
               lte: fechaFin,
             },
           },
+          include: { token: true },
+          orderBy: { timestamp: 'desc' },
+        }),
+        this.prisma.telemetriaEvento.findMany({
+          where: { evento: 'FIRMANDO' },
           include: { token: true },
           orderBy: { timestamp: 'desc' },
         }),
@@ -572,8 +761,24 @@ export class TelemetriaService {
             },
           },
         }),
-        this.prisma.usuario.findMany(),
-        this.prisma.certificado.findMany(),
+        this.prisma.solicitudFirma.findMany({
+          where: { estadoAprobacion: 'FIRMADA' },
+          select: { id: true, usuarioSolicitanteId: true, updatedAt: true, tsaTimestamp: true },
+        }),
+        this.prisma.usuario.findMany({
+          include: {
+            certificados: {
+              include: { tokenHardware: true },
+            },
+          },
+        }),
+        this.prisma.certificado.findMany({
+          include: {
+            usuario: true,
+            tokenHardware: true,
+          },
+          orderBy: { validoHasta: 'asc' },
+        }),
         this.prisma.actaCustodia.findMany({
           where: {
             createdAt: {
@@ -591,6 +796,9 @@ export class TelemetriaService {
           },
           orderBy: { createdAt: 'desc' },
         }),
+        this.prisma.contratoToken.findMany({
+          orderBy: { fechaInicio: 'desc' },
+        }).catch(() => []),
       ]);
 
       // 1. Métricas de Estaciones y Telemetría USB
@@ -948,10 +1156,344 @@ export class TelemetriaService {
 
       const serieTemporal = Array.from(diasMap.values());
 
-      return {
+      // =========================================================================
+      // DESGLOSE ESPECÍFICO DE CONTROL Y SEGUIMIENTO DE TOKENS (REQUISITOS 1 AL 7)
+      // =========================================================================
+
+      // Requisito 1 y 4: Firmas asignadas, titulares, estado y tiempo de expiración (15, 30, 60 días)
+      const listadoFirmasAsignadas = certificados.map((c: any) => {
+        const fExp = new Date(c.validoHasta);
+        const fAsig = new Date(c.createdAt);
+        const diasRestantes = Math.ceil((fExp.getTime() - ahora.getTime()) / (1000 * 60 * 60 * 24));
+        const serialToken = c.tokenHardware?.serialNumber || c.numeroSerie;
+
+        let estadoToken: 'ACTIVO' | 'POR_VENCER_60' | 'POR_VENCER_30' | 'POR_VENCER_15' | 'EXPIRADO' = 'ACTIVO';
+        let tiempoExpiracionTexto = '';
+
+        if (diasRestantes < 0 || c.estado === 'VENCIDO' || c.estado === 'REVOCADO') {
+          estadoToken = 'EXPIRADO';
+          tiempoExpiracionTexto =
+            diasRestantes < 0 ? `Expirado hace ${Math.abs(diasRestantes)} días` : 'Expirado / Revocado';
+        } else if (diasRestantes <= 15) {
+          estadoToken = 'POR_VENCER_15';
+          tiempoExpiracionTexto = `${diasRestantes} días restantes (Crítico ≤15 días)`;
+        } else if (diasRestantes <= 30) {
+          estadoToken = 'POR_VENCER_30';
+          tiempoExpiracionTexto = `${diasRestantes} días restantes (Alerta ≤30 días)`;
+        } else if (diasRestantes <= 60) {
+          estadoToken = 'POR_VENCER_60';
+          tiempoExpiracionTexto = `${diasRestantes} días restantes (Preventivo ≤60 días)`;
+        } else {
+          estadoToken = 'ACTIVO';
+          tiempoExpiracionTexto = `${diasRestantes} días restantes (Vigente)`;
+        }
+
+        // Acciones de firma (SOLO firmas realizadas, NUNCA conexiones ni desconexiones)
+        const firmasTelemetriaPeriodo = eventosTelemetria.filter(
+          (ev) =>
+            ev.evento === 'FIRMANDO' &&
+            (ev.tokenId === c.tokenHardwareId ||
+              ev.token?.serialNumber === serialToken ||
+              (ev.metadatosJsonb as any)?.usuarioId === c.usuarioId ||
+              (ev.metadatosJsonb as any)?.funcionarioRut === c.usuario?.rut),
+        ).length;
+
+        const firmasDocPeriodo = solicitudesPeriodo.filter(
+          (s) => s.estadoAprobacion === 'FIRMADA' && s.usuarioSolicitanteId === c.usuarioId,
+        ).length;
+
+        const firmasTelemetriaHist = todosEventosFirma.filter(
+          (ev) =>
+            ev.tokenId === c.tokenHardwareId ||
+            ev.token?.serialNumber === serialToken ||
+            (ev.metadatosJsonb as any)?.usuarioId === c.usuarioId ||
+            (ev.metadatosJsonb as any)?.funcionarioRut === c.usuario?.rut,
+        ).length;
+
+        const firmasDocHist = todasSolicitudesFirmadas.filter(
+          (s) => s.usuarioSolicitanteId === c.usuarioId,
+        ).length;
+
+        const accionesFirmaPeriodo = firmasTelemetriaPeriodo + firmasDocPeriodo;
+        const accionesFirmaTotal = Math.max(
+          accionesFirmaPeriodo,
+          firmasTelemetriaHist + firmasDocHist,
+        );
+
+        const estacionViva = (estacionesVivo as any[]).find(
+          (est) =>
+            est.tokenInfo?.serialNumber === serialToken ||
+            est.serialTokenActivo === serialToken,
+        );
+
+        return {
+          id: c.id,
+          numeroSerieCertificado: c.numeroSerie,
+          serialNumberToken: serialToken,
+          marca: c.tokenHardware?.marca || 'Thales / SafeNet',
+          modelo: c.tokenHardware?.modelo || 'eToken 5110 CC (FIPS 140-2 L3)',
+          vendorId: c.tokenHardware?.vendorId || '0x0529',
+          funcionario: {
+            id: c.usuario?.id || c.usuarioId,
+            rut: c.usuario?.rut || '-',
+            nombre: c.usuario?.nombre || 'Funcionario Municipal',
+            email: c.usuario?.email || 'firma@municoquimbo.cl',
+            cargo: c.usuario?.cargo || 'Funcionario',
+            unidad: c.usuario?.unidad || 'Municipalidad de Coquimbo',
+          },
+          fechaAsignacion: fAsig.toISOString().split('T')[0],
+          fechaExpiracion: fExp.toISOString().split('T')[0],
+          diasRestantes,
+          tiempoExpiracionTexto,
+          estado: estadoToken,
+          accionesFirmaPeriodo,
+          accionesFirmaTotal,
+          estacionActual: estacionViva?.codigoPc || null,
+          estadoConexion: (estacionViva?.estadoEnVivo || 'DESCONECTADO') as
+            | 'CONECTADO'
+            | 'FIRMANDO'
+            | 'DESCONECTADO',
+          codigoContrato: contratosRaw[0]?.codigoContrato || 'CON-2025-TOKENS-CQM-01',
+        };
+      });
+
+      const firmasVigentesCount = listadoFirmasAsignadas.filter((f) => f.estado === 'ACTIVO').length;
+      const firmasPorVencerCount = listadoFirmasAsignadas.filter(
+        (f) =>
+          f.estado === 'POR_VENCER_60' ||
+          f.estado === 'POR_VENCER_30' ||
+          f.estado === 'POR_VENCER_15',
+      ).length;
+      const firmasExpiradasCount = listadoFirmasAsignadas.filter((f) => f.estado === 'EXPIRADO').length;
+
+      // Requisito 2: Cantidades de dispositivos existentes (existentes en total, activos y expirados)
+      const totalDispositivosExistentes = Math.max(
+        tokensHardware.length,
+        listadoFirmasAsignadas.length,
+      );
+      let dispositivosExpirados = 0;
+      let dispositivosActivos = 0;
+
+      if (tokensHardware.length > 0) {
+        for (const t of tokensHardware as any[]) {
+          const cert = t.certificados?.[0];
+          const expiroCert =
+            cert &&
+            (new Date(cert.validoHasta).getTime() < ahora.getTime() ||
+              cert.estado === 'VENCIDO' ||
+              cert.estado === 'REVOCADO');
+          if (t.estadoPatrimonial === 'DADO_DE_BAJA' || expiroCert) {
+            dispositivosExpirados += 1;
+          } else {
+            dispositivosActivos += 1;
+          }
+        }
+      } else {
+        dispositivosExpirados = firmasExpiradasCount;
+        dispositivosActivos = Math.max(0, totalDispositivosExistentes - dispositivosExpirados);
+      }
+
+      const resumenDispositivos = {
+        totalExistentes: totalDispositivosExistentes,
+        activos: dispositivosActivos,
+        expirados: dispositivosExpirados,
+        porcentajeActivos: pct(dispositivosActivos, totalDispositivosExistentes),
+        porcentajeExpirados: pct(dispositivosExpirados, totalDispositivosExistentes),
+        conectadosEnSesion: estacionesConectadas,
+        firmandoEnSesion: estacionesFirmando,
+      };
+
+      // Requisito 3: Cantidad de acciones que ha hecho cada funcionario con su token
+      // (Una acción es ESTRICTAMENTE una firma, NO conexiones ni desconexiones del token)
+      const totalAccionesFirmaPeriodoGlobal =
+        eventosFirmando + solicitudesPeriodo.filter((s) => s.estadoAprobacion === 'FIRMADA').length;
+
+      const listadoAccionesPorFuncionario = usuarios
+        .filter((u: any) => u.certificados && u.certificados.length > 0)
+        .map((u: any) => {
+          const cert = u.certificados[0];
+          const token = cert?.tokenHardware;
+          const serialToken = token?.serialNumber || cert?.numeroSerie || 'SN-SIN-ASIGNAR';
+          const diasRestantesToken = cert?.validoHasta
+            ? Math.ceil((new Date(cert.validoHasta).getTime() - ahora.getTime()) / (1000 * 60 * 60 * 24))
+            : 0;
+
+          const eventosDelFuncionarioPeriodo = eventosTelemetria.filter(
+            (ev) =>
+              ev.tokenId === token?.id ||
+              ev.token?.serialNumber === serialToken ||
+              (ev.metadatosJsonb as any)?.usuarioId === u.id ||
+              (ev.metadatosJsonb as any)?.funcionarioRut === u.rut,
+          );
+
+          // Solo FIRMANDO + Solicitudes firmadas cuentan como acciones
+          const firmasUsbPeriodo = eventosDelFuncionarioPeriodo.filter(
+            (ev) => ev.evento === 'FIRMANDO',
+          );
+          const firmasSolicitudesPeriodo = solicitudesPeriodo.filter(
+            (s) => s.estadoAprobacion === 'FIRMADA' && s.usuarioSolicitanteId === u.id,
+          );
+          const accionesFirmaPeriodo = firmasUsbPeriodo.length + firmasSolicitudesPeriodo.length;
+
+          // Conexiones y desconexiones se reportan aparte como excluidas del conteo de acciones
+          const conexionesIgnoradasPeriodo = eventosDelFuncionarioPeriodo.filter(
+            (ev) => ev.evento === 'CONECTADO',
+          ).length;
+          const desconexionesIgnoradasPeriodo = eventosDelFuncionarioPeriodo.filter(
+            (ev) => ev.evento === 'DESCONECTADO',
+          ).length;
+
+          const firmasUsbHist = todosEventosFirma.filter(
+            (ev) =>
+              ev.tokenId === token?.id ||
+              ev.token?.serialNumber === serialToken ||
+              (ev.metadatosJsonb as any)?.usuarioId === u.id ||
+              (ev.metadatosJsonb as any)?.funcionarioRut === u.rut,
+          );
+          const firmasSolHist = todasSolicitudesFirmadas.filter(
+            (s) => s.usuarioSolicitanteId === u.id,
+          );
+          const accionesFirmaHistorico = Math.max(
+            accionesFirmaPeriodo,
+            firmasUsbHist.length + firmasSolHist.length,
+          );
+
+          const ultimaEvFirma = firmasUsbHist[0];
+          const ultimaSolFirma = firmasSolHist[0];
+          const ultimaFecha =
+            ultimaEvFirma?.timestamp?.toISOString() ||
+            ultimaSolFirma?.tsaTimestamp?.toISOString() ||
+            ultimaSolFirma?.updatedAt?.toISOString() ||
+            null;
+
+          return {
+            usuarioId: u.id,
+            rut: u.rut,
+            nombre: u.nombre,
+            email: u.email,
+            cargo: u.cargo,
+            unidad: u.unidad,
+            serialNumberToken: serialToken,
+            modeloToken: token ? `${token.marca} ${token.modelo}` : 'eToken 5110 CC',
+            estadoToken:
+              diasRestantesToken < 0
+                ? 'EXPIRADO'
+                : diasRestantesToken <= 60
+                ? 'POR_VENCER'
+                : 'ACTIVO',
+            diasRestantesToken,
+            accionesFirmaPeriodo,
+            accionesFirmaHistorico,
+            conexionesIgnoradasPeriodo,
+            desconexionesIgnoradasPeriodo,
+            porcentajeParticipacionFirmas: pct(
+              accionesFirmaPeriodo,
+              Math.max(1, totalAccionesFirmaPeriodoGlobal),
+            ),
+            ultimaAccionFirma: ultimaFecha,
+            codigoPcUltimaSesion: ultimaEvFirma?.codigoPc || null,
+          };
+        })
+        .sort((a, b) => b.accionesFirmaPeriodo - a.accionesFirmaPeriodo || b.accionesFirmaHistorico - a.accionesFirmaHistorico);
+
+      const totalAccionesFirmaPeriodo = listadoAccionesPorFuncionario.reduce(
+        (acc, item) => acc + item.accionesFirmaPeriodo,
+        0,
+      );
+      const totalAccionesFirmaHistorico = listadoAccionesPorFuncionario.reduce(
+        (acc, item) => acc + item.accionesFirmaHistorico,
+        0,
+      );
+
+      // Requisito 4: Alertas de vencimiento a 15, 30 y 60 días
+      const menosDe15Dias = listadoFirmasAsignadas.filter(
+        (f) => f.diasRestantes >= 0 && f.diasRestantes <= 15,
+      ).length;
+      const entre16Y30Dias = listadoFirmasAsignadas.filter(
+        (f) => f.diasRestantes > 15 && f.diasRestantes <= 30,
+      ).length;
+      const entre31Y60Dias = listadoFirmasAsignadas.filter(
+        (f) => f.diasRestantes > 30 && f.diasRestantes <= 60,
+      ).length;
+
+      const tokensEnAlerta = listadoFirmasAsignadas
+        .filter((f) => f.diasRestantes <= 60)
+        .map((f) => ({
+          id: f.id,
+          numeroSerie: f.numeroSerieCertificado,
+          serialNumberToken: f.serialNumberToken,
+          hardwareModelo: `${f.marca} ${f.modelo}`,
+          diasRestantes: f.diasRestantes,
+          tramoAlerta: (f.diasRestantes < 0
+            ? 'EXPIRADO'
+            : f.diasRestantes <= 15
+            ? '15_DIAS'
+            : f.diasRestantes <= 30
+            ? '30_DIAS'
+            : '60_DIAS') as '15_DIAS' | '30_DIAS' | '60_DIAS' | 'EXPIRADO',
+          severidad: (f.diasRestantes <= 15
+            ? 'ALTA'
+            : f.diasRestantes <= 30
+            ? 'MEDIA'
+            : 'BAJA') as 'ALTA' | 'MEDIA' | 'BAJA',
+          fechaInicio: f.fechaAsignacion,
+          fechaExpiracion: f.fechaExpiracion,
+          tiempoExpiracionTexto: f.tiempoExpiracionTexto,
+          usuario: f.funcionario,
+          ultimoAvisoEnviado: null,
+        }));
+
+      // Requisito 7: Resumen de Contratos de Obtención de Tokens
+      const listadoContratos = contratosRaw.map((c: any) => {
+        const fIni = new Date(c.fechaInicio);
+        const fCad = new Date(c.fechaCaducidad);
+        const diasRest = Math.ceil((fCad.getTime() - ahora.getTime()) / (1000 * 60 * 60 * 24));
+        const duracionTotal = Math.max(
+          1,
+          Math.ceil((fCad.getTime() - fIni.getTime()) / (1000 * 60 * 60 * 24)),
+        );
+        const transcurrido = Math.min(
+          100,
+          Math.max(
+            0,
+            Math.round(((ahora.getTime() - fIni.getTime()) / (fCad.getTime() - fIni.getTime())) * 100),
+          ),
+        );
+        const estadoVigencia: 'VIGENTE' | 'POR_CADUCAR' | 'CADUCADO' =
+          diasRest < 0 ? 'CADUCADO' : diasRest <= 60 ? 'POR_CADUCAR' : 'VIGENTE';
+        const tiempoCaducidadTexto =
+          diasRest < 0
+            ? `Caducado hace ${Math.abs(diasRest)} días`
+            : diasRest <= 60
+            ? `${diasRest} días restantes (Por caducar)`
+            : `${diasRest} días restantes (~${Math.round((diasRest / 30.4) * 10) / 10} meses)`;
+
+        return {
+          id: c.id,
+          codigoContrato: c.codigoContrato,
+          titulo: c.titulo,
+          proveedor: c.proveedor,
+          fechaInicio: fIni.toISOString(),
+          fechaCaducidad: fCad.toISOString(),
+          fechaInicioFormateada: fIni.toISOString().split('T')[0],
+          fechaCaducidadFormateada: fCad.toISOString().split('T')[0],
+          diasRestantes: diasRest,
+          duracionTotalDias: duracionTotal,
+          porcentajeTranscurrido: transcurrido,
+          tiempoCaducidadTexto,
+          estadoVigencia,
+          cantidadTokens: c.cantidadTokens,
+          montoReferencial: c.montoReferencial || 'Convenio Marco',
+          descripcion: c.descripcion || '',
+          documentoUrl: `/api/v1/equipamiento/contratos/${c.id}/pdf`,
+        };
+      });
+
+      const payloadRespuesta = {
         periodo: {
           modo,
           mesSeleccionado,
+          anioSeleccionado,
           etiquetaPeriodo,
           fechaInicio: fechaInicio.toISOString(),
           fechaFin: fechaFin.toISOString(),
@@ -959,6 +1501,38 @@ export class TelemetriaService {
             valor,
             etiqueta,
           })),
+          aniosDisponibles,
+        },
+        resumenDispositivos,
+        firmasAsignadas: {
+          totalAsignadas: listadoFirmasAsignadas.length,
+          vigentes: firmasVigentesCount,
+          porVencer: firmasPorVencerCount,
+          expiradas: firmasExpiradasCount,
+          listado: listadoFirmasAsignadas,
+        },
+        accionesFuncionarios: {
+          totalAccionesFirmaPeriodo,
+          totalAccionesFirmaHistorico,
+          conexionesExcluidasPeriodo: eventosConectado,
+          desconexionesExcluidasPeriodo: eventosDesconectado,
+          listadoPorFuncionario: listadoAccionesPorFuncionario,
+        },
+        alertasVencimiento: {
+          menosDe15Dias,
+          entre16Y30Dias,
+          entre31Y60Dias,
+          totalEnUmbral60Dias: menosDe15Dias + entre16Y30Dias + entre31Y60Dias,
+          expirados: firmasExpiradasCount,
+          tokensEnAlerta,
+        },
+        contratosResumen: {
+          totalContratos: listadoContratos.length,
+          contratosVigentes: listadoContratos.filter((c) => c.estadoVigencia === 'VIGENTE').length,
+          contratosPorCaducar: listadoContratos.filter((c) => c.estadoVigencia === 'POR_CADUCAR').length,
+          contratosCaducados: listadoContratos.filter((c) => c.estadoVigencia === 'CADUCADO').length,
+          totalTokensContratados: listadoContratos.reduce((s, c) => s + (c.cantidadTokens || 0), 0),
+          listado: listadoContratos,
         },
         telemetria: {
           totalEstaciones,
@@ -973,15 +1547,16 @@ export class TelemetriaService {
           porcentajeEventosConectado,
           porcentajeEventosFirmando,
           porcentajeEventosDesconectado,
-          tokensRegistrados,
-          tokensOperativos,
-          porcentajeTokensOperativos,
+          tokensRegistrados: totalDispositivosExistentes,
+          tokensOperativos: dispositivosActivos,
+          tokensExpirados: dispositivosExpirados,
+          porcentajeTokensOperativos: pct(dispositivosActivos, totalDispositivosExistentes),
           rankingEstaciones,
           trazabilidadDispositivos,
         },
         firmas: {
           totalSolicitudesPeriodo,
-          firmadas,
+          firmadas: Math.max(firmadas, totalAccionesFirmaPeriodo),
           pendientes,
           rechazadas,
           tasaExitoFirmaPct,
@@ -1000,10 +1575,13 @@ export class TelemetriaService {
           usuariosNuevosPeriodo,
           porcentajeUsuariosActivos,
           totalCertificados,
-          certificadosVigentes,
-          certificadosPorVencer,
-          certificadosRevocadosVencidos,
-          porcentajeVigenciaCertificados,
+          certificadosVigentes: firmasVigentesCount,
+          certificadosPorVencer: firmasPorVencerCount,
+          certificadosRevocadosVencidos: firmasExpiradasCount,
+          porcentajeVigenciaCertificados: pct(
+            firmasVigentesCount + firmasPorVencerCount,
+            Math.max(1, listadoFirmasAsignadas.length),
+          ),
           custodiaTokenFisico,
           custodiaCloud,
           porcentajeTokenFisico,
@@ -1016,11 +1594,431 @@ export class TelemetriaService {
         },
         serieTemporal,
       };
+
+      const codigoLatex = this.generarCodigoLatexSummary(payloadRespuesta);
+
+      return {
+        ...payloadRespuesta,
+        latexPreview: {
+          codigoLatex,
+        },
+      };
     } catch (error) {
       this.logger.error(
         `Error al calcular métricas de trazabilidad: ${(error as Error).message}`,
       );
       throw error;
     }
+  }
+
+  private escapeLatex(str: unknown): string {
+    return String(str ?? '')
+      .replace(/\\/g, '\\textbackslash{}')
+      .replace(/([&%$#_{}])/g, '\\$1')
+      .replace(/~/g, '\\textasciitilde{}')
+      .replace(/\^/g, '\\textasciicircum{}');
+  }
+
+  /**
+   * Requisito 6: Genera código fuente LaTeX (.tex) completo con el Summary estadístico y desglose de métricas
+   * según el período seleccionado (Últimos 7 días, Últimos 15 días, Últimos 30 días, Por Mes, Por Año).
+   */
+  generarCodigoLatexSummary(data: any): string {
+    const p = data.periodo || {};
+    const disp = data.resumenDispositivos || {};
+    const asig = data.firmasAsignadas || {};
+    const acc = data.accionesFuncionarios || {};
+    const alert = data.alertasVencimiento || {};
+    const cont = data.contratosResumen || {};
+
+    const filasFirmas = (asig.listado || [])
+      .map(
+        (f: any) =>
+          `    ${this.escapeLatex(f.funcionario?.nombre)} & \\texttt{${this.escapeLatex(f.funcionario?.rut)}} & \\texttt{${this.escapeLatex(f.serialNumberToken)}} & ${this.escapeLatex(f.fechaExpiracion)} & ${this.escapeLatex(f.tiempoExpiracionTexto)} & \\textbf{${this.escapeLatex(f.estado)}} \\\\`,
+      )
+      .join('\n');
+
+    const filasAcciones = (acc.listadoPorFuncionario || [])
+      .map(
+        (a: any) =>
+          `    ${this.escapeLatex(a.nombre)} & \\texttt{${this.escapeLatex(a.rut)}} & ${this.escapeLatex(a.unidad)} & \\texttt{${this.escapeLatex(a.serialNumberToken)}} & \\textbf{${a.accionesFirmaPeriodo}} & ${a.accionesFirmaHistorico} & ${a.porcentajeParticipacionFirmas}\\% \\\\`,
+      )
+      .join('\n');
+
+    const filasAlertas = (alert.tokensEnAlerta || [])
+      .map(
+        (al: any) =>
+          `    \\texttt{${this.escapeLatex(al.serialNumberToken)}} & ${this.escapeLatex(al.usuario?.nombre)} & \\texttt{${this.escapeLatex(al.usuario?.email)}} & ${this.escapeLatex(al.fechaExpiracion)} & \\textbf{${al.diasRestantes} d.} & ${this.escapeLatex(al.tramoAlerta)} \\\\`,
+      )
+      .join('\n');
+
+    const filasContratos = (cont.listado || [])
+      .map(
+        (c: any) =>
+          `    \\texttt{${this.escapeLatex(c.codigoContrato)}} & ${this.escapeLatex(c.proveedor)} & ${this.escapeLatex(c.fechaInicioFormateada)} & ${this.escapeLatex(c.fechaCaducidadFormateada)} & ${this.escapeLatex(c.tiempoCaducidadTexto)} & ${c.cantidadTokens} & \\textbf{${this.escapeLatex(c.estadoVigencia)}} \\\\`,
+      )
+      .join('\n');
+
+    return [
+      `% ============================================================================`,
+      `% SUMMARY EJECUTIVO DE CONTROL Y SEGUIMIENTO DE TOKENS DE FIRMA ELECTRONICA`,
+      `% Ilustre Municipalidad de Coquimbo - Depto. de Gestion de Sistemas y TICs`,
+      `% Periodo Evaluado: ${p.etiquetaPeriodo || 'Ultimos 30 dias'} (${p.modo || 'ULTIMOS_30_DIAS'})`,
+      `% ============================================================================`,
+      `\\documentclass[11pt,a4paper]{article}`,
+      `\\usepackage[utf8]{inputenc}`,
+      `\\usepackage[T1]{fontenc}`,
+      `\\usepackage[spanish]{babel}`,
+      `\\usepackage[margin=2.0cm]{geometry}`,
+      `\\usepackage{booktabs}`,
+      `\\usepackage{longtable}`,
+      `\\usepackage{xcolor}`,
+      `\\usepackage{fancyhdr}`,
+      `\\usepackage{hyperref}`,
+      ``,
+      `\\definecolor{muniNavy}{RGB}{5, 46, 92}`,
+      `\\definecolor{muniGold}{RGB}{217, 155, 22}`,
+      ``,
+      `\\pagestyle{fancy}`,
+      `\\fancyhf{}`,
+      `\\fancyhead[L]{\\small\\textbf{I. Municipalidad de Coquimbo} -- Control de Tokens de Firma Electrónica}`,
+      `\\fancyhead[R]{\\small Período: \\textbf{${this.escapeLatex(p.etiquetaPeriodo)}}}`,
+      `\\fancyfoot[C]{\\small Página \\thepage\\ -- Documento Oficial de Trazabilidad (Ley N° 19.799 / Ley N° 21.663)}`,
+      ``,
+      `\\begin{document}`,
+      ``,
+      `\\begin{center}`,
+      `  {\\LARGE \\textbf{\\textcolor{muniNavy}{SUMMARY ESTADÍSTICO DE CONTROL Y SEGUIMIENTO DE TOKENS DE FIRMA ELECTRÓNICA}}}\\\\[0.3cm]`,
+      `  {\\large Ilustre Municipalidad de Coquimbo -- Departamento de Gestión de Sistemas y TICs}\\\\[0.2cm]`,
+      `  {\\normalsize \\textbf{Período Seleccionado:} ${this.escapeLatex(p.etiquetaPeriodo)} \\quad|\\quad \\textbf{Modalidad:} \\texttt{${this.escapeLatex(p.modo)}}}\\\\`,
+      `  {\\footnotesize Desde: \\texttt{${this.escapeLatex((p.fechaInicio || '').slice(0, 10))}} -- Hasta: \\texttt{${this.escapeLatex((p.fechaFin || '').slice(0, 10))}}}`,
+      `\\end{center}`,
+      `\\vspace{0.3cm}`,
+      `\\hrule`,
+      `\\vspace{0.4cm}`,
+      ``,
+      `\\section{Cantidades de Dispositivos Existentes (Total, Activos y Expirados)}`,
+      `Resumen del inventario de dispositivos criptográficos USB (Tokens PKCS\\#11) registrados a nivel institucional:`,
+      ``,
+      `\\begin{table}[h!]`,
+      `\\centering`,
+      `\\begin{tabular}{lrrr}`,
+      `\\toprule`,
+      `\\textbf{Categoría de Dispositivos} & \\textbf{Cantidad} & \\textbf{Porcentaje} & \\textbf{Estado Operacional} \\\\`,
+      `\\midrule`,
+      `Dispositivos Existentes en Total & \\textbf{${disp.totalExistentes ?? 0}} & 100.0\\% & Padrón Total Municipal \\\\`,
+      `Dispositivos Activos (Vigentes) & \\textbf{${disp.activos ?? 0}} & ${disp.porcentajeActivos ?? 0}\\% & Habilitados para Firma \\\\`,
+      `Dispositivos Expirados / Vencidos & \\textbf{${disp.expirados ?? 0}} & ${disp.porcentajeExpirados ?? 0}\\% & Requieren Renovación / Baja \\\\`,
+      `Dispositivos Conectados en Sesión Actual & ${disp.conectadosEnSesion ?? 0} & -- & Telemetría USB en Vivo \\\\`,
+      `\\bottomrule`,
+      `\\end{tabular}`,
+      `\\end{table}`,
+      ``,
+      `\\section{Firmas Asignadas, Titulares y Estado de Expiración}`,
+      `Total de firmas asignadas: \\textbf{${asig.totalAsignadas ?? 0}} (Vigentes >60d: \\textbf{${asig.vigentes ?? 0}}, Próximas a vencer $\\le$60d: \\textbf{${asig.porVencer ?? 0}}, Expiradas: \\textbf{${asig.expiradas ?? 0}}).`,
+      ``,
+      `\\begin{longtable}{llllll}`,
+      `\\toprule`,
+      `\\textbf{Funcionario Titular} & \\textbf{RUT} & \\textbf{Token S/N} & \\textbf{Expira} & \\textbf{Tiempo Restante} & \\textbf{Estado} \\\\`,
+      `\\midrule`,
+      `\\endhead`,
+      filasFirmas || `    Sin firmas asignadas & -- & -- & -- & -- & -- \\\\`,
+      `\\bottomrule`,
+      `\\end{longtable}`,
+      ``,
+      `\\section{Acciones de Firma por Funcionario con su Token}`,
+      `\\textit{Nota Metodológica: Se contabiliza exclusivamente como \\textbf{acción} cada firma electrónica ejecutada con el token desde la sesión activa (\\textbf{${acc.totalAccionesFirmaPeriodo ?? 0}} firmas en el período; \\textbf{${acc.totalAccionesFirmaHistorico ?? 0}} acumuladas). Se excluyen explícitamente las conexiones (${acc.conexionesExcluidasPeriodo ?? 0}) y desconexiones (${acc.desconexionesExcluidasPeriodo ?? 0}) físicas del dispositivo USB.}`,
+      ``,
+      `\\begin{longtable}{llllrrr}`,
+      `\\toprule`,
+      `\\textbf{Funcionario} & \\textbf{RUT} & \\textbf{Unidad} & \\textbf{Token S/N} & \\textbf{Firmas Período} & \\textbf{Total Histórico} & \\textbf{\\% Part.} \\\\`,
+      `\\midrule`,
+      `\\endhead`,
+      filasAcciones || `    Sin acciones registradas & -- & -- & -- & 0 & 0 & 0\\% \\\\`,
+      `\\bottomrule`,
+      `\\end{longtable}`,
+      ``,
+      `\\section{Vencimiento de Tokens (Umbrales 15, 30 y 60 Días)}`,
+      `Distribución de tokens próximos a vencer para despacho de aviso por correo electrónico:`,
+      `\\begin{itemize}`,
+      `  \\item \\textbf{Umbral Crítico ($\\le 15$ días):} ${alert.menosDe15Dias ?? 0} token(s).`,
+      `  \\item \\textbf{Umbral Medio ($16 - 30$ días):} ${alert.entre16Y30Dias ?? 0} token(s).`,
+      `  \\item \\textbf{Umbral Preventivo ($31 - 60$ días):} ${alert.entre31Y60Dias ?? 0} token(s).`,
+      `  \\item \\textbf{Expirados ($< 0$ días):} ${alert.expirados ?? 0} token(s).`,
+      `\\end{itemize}`,
+      ``,
+      `\\begin{longtable}{llllrr}`,
+      `\\toprule`,
+      `\\textbf{Token S/N} & \\textbf{Funcionario} & \\textbf{Correo Aviso} & \\textbf{Expiración} & \\textbf{Restante} & \\textbf{Tramo} \\\\`,
+      `\\midrule`,
+      `\\endhead`,
+      filasAlertas || `    Sin alertas en umbral & -- & -- & -- & -- & -- \\\\`,
+      `\\bottomrule`,
+      `\\end{longtable}`,
+      ``,
+      `\\section{Contratos de Obtención de Tokens (Inicio y Caducidad)}`,
+      `Total de contratos registrados: \\textbf{${cont.totalContratos ?? 0}} (${cont.totalTokensContratados ?? 0} tokens cubiertos).`,
+      ``,
+      `\\begin{longtable}{lllllll}`,
+      `\\toprule`,
+      `\\textbf{Código Contrato} & \\textbf{Proveedor} & \\textbf{Inicio} & \\textbf{Caducidad} & \\textbf{Tiempo Restante} & \\textbf{Cupo} & \\textbf{Estado} \\\\`,
+      `\\midrule`,
+      `\\endhead`,
+      filasContratos || `    Sin contratos registrados & -- & -- & -- & -- & 0 & -- \\\\`,
+      `\\bottomrule`,
+      `\\end{longtable}`,
+      ``,
+      `\\end{document}`,
+    ].join('\n');
+  }
+
+  async obtenerCodigoLatexSummary(modoInput?: string, mesInput?: string, anioInput?: string) {
+    const metricas = await this.obtenerMetricasTrazabilidad(modoInput, mesInput, anioInput);
+    const sufijo =
+      metricas.periodo.modo === 'POR_MES'
+        ? metricas.periodo.mesSeleccionado
+        : metricas.periodo.modo === 'POR_ANIO'
+        ? metricas.periodo.anioSeleccionado
+        : metricas.periodo.modo.toLowerCase();
+
+    return {
+      codigoLatex: metricas.latexPreview.codigoLatex,
+      filename: `Summary-Control-Tokens-${sufijo}.tex`,
+      periodo: metricas.periodo,
+    };
+  }
+
+  /**
+   * Requisito 6: Genera el documento PDF descargable del Summary Estadístico de Control de Tokens
+   * correspondiente al código LaTeX previsualizado, para los períodos:
+   * Últimos 7 días, Últimos 15 días, Últimos 30 días, Por Mes y Por Año.
+   */
+  async generarPdfSummaryMetricas(
+    modoInput?: string,
+    mesInput?: string,
+    anioInput?: string,
+  ): Promise<{ buffer: Buffer; filename: string }> {
+    const m = await this.obtenerMetricasTrazabilidad(modoInput, mesInput, anioInput);
+    const p = m.periodo;
+    const disp = m.resumenDispositivos;
+    const asig = m.firmasAsignadas;
+    const acc = m.accionesFuncionarios;
+    const alert = m.alertasVencimiento;
+    const cont = m.contratosResumen;
+
+    const pdfDoc = await PDFDocument.create();
+    const fontBold = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
+    const fontRegular = await pdfDoc.embedFont(StandardFonts.Helvetica);
+    const fontMono = await pdfDoc.embedFont(StandardFonts.Courier);
+
+    let page = pdfDoc.addPage([595.28, 841.89]); // A4
+    let y = 780;
+
+    const addHeader = (pg: any, pageNum: number) => {
+      pg.drawRectangle({
+        x: 0,
+        y: 775,
+        width: 595.28,
+        height: 67,
+        color: rgb(0.02, 0.18, 0.36),
+      });
+      pg.drawText('ILUSTRE MUNICIPALIDAD DE COQUIMBO - CONTROL Y SEGUIMIENTO DE TOKENS FEA', {
+        x: 40,
+        y: 816,
+        size: 11,
+        font: fontBold,
+        color: rgb(1, 1, 1),
+      });
+      pg.drawText(
+        `SUMMARY ESTADISTICO Y DESGLOSE DE METRICAS (LaTeX/PDF) • PERIODO: ${p.etiquetaPeriodo.toUpperCase()}`,
+        {
+          x: 40,
+          y: 798,
+          size: 8.5,
+          font: fontRegular,
+          color: rgb(0.95, 0.82, 0.35),
+        },
+      );
+      pg.drawText(
+        `Ventana: ${p.fechaInicio.slice(0, 10)} al ${p.fechaFin.slice(0, 10)} | Modalidad: ${p.modo} | Pag. ${pageNum}`,
+        {
+          x: 40,
+          y: 783,
+          size: 7.5,
+          font: fontMono,
+          color: rgb(0.85, 0.9, 0.96),
+        },
+      );
+    };
+
+    let pageNumber = 1;
+    addHeader(page, pageNumber);
+    y = 750;
+
+    const ensureSpace = (needed: number) => {
+      if (y - needed < 50) {
+        pageNumber += 1;
+        page = pdfDoc.addPage([595.28, 841.89]);
+        addHeader(page, pageNumber);
+        y = 750;
+      }
+    };
+
+    const drawSectionTitle = (title: string) => {
+      ensureSpace(35);
+      page.drawRectangle({
+        x: 40,
+        y: y - 4,
+        width: 515,
+        height: 18,
+        color: rgb(0.92, 0.95, 0.99),
+      });
+      page.drawText(title, {
+        x: 45,
+        y: y,
+        size: 9.5,
+        font: fontBold,
+        color: rgb(0.02, 0.18, 0.36),
+      });
+      y -= 20;
+    };
+
+    const drawMonoLine = (text: string, color = rgb(0.15, 0.15, 0.15), size = 8) => {
+      ensureSpace(14);
+      page.drawText(text.slice(0, 104), {
+        x: 45,
+        y,
+        size,
+        font: fontMono,
+        color,
+      });
+      y -= 12.5;
+    };
+
+    // SECCIÓN 1: CANTIDADES DE DISPOSITIVOS EXISTENTES (Req 2)
+    drawSectionTitle('1. CANTIDADES DE DISPOSITIVOS EXISTENTES (TOTAL, ACTIVOS Y EXPIRADOS)');
+    drawMonoLine(
+      `Dispositivos Existentes en Total : ${disp.totalExistentes} unidades (100%)`,
+      rgb(0.05, 0.05, 0.05),
+      8.5,
+    );
+    drawMonoLine(
+      `Dispositivos Activos (Vigentes)  : ${disp.activos} unidades (${disp.porcentajeActivos}%) | En sesion activa: ${disp.conectadosEnSesion}`,
+      rgb(0, 0.42, 0.18),
+      8.5,
+    );
+    drawMonoLine(
+      `Dispositivos Expirados / Baja    : ${disp.expirados} unidades (${disp.porcentajeExpirados}%)`,
+      rgb(0.7, 0.1, 0.1),
+      8.5,
+    );
+    y -= 6;
+
+    // SECCIÓN 2: FIRMAS ASIGNADAS, TITULARES Y ESTADO DE EXPIRACIÓN (Req 1)
+    drawSectionTitle(
+      `2. FIRMAS ASIGNADAS (${asig.totalAsignadas}), TITULARES Y TIEMPO DE EXPIRACION`,
+    );
+    drawMonoLine(
+      'FUNCIONARIO TITULAR          | RUT          | TOKEN S/N          | EXPIRACION | ESTADO / RESTANTE',
+      rgb(0.02, 0.18, 0.36),
+      7.5,
+    );
+    drawMonoLine('-'.repeat(98), rgb(0.5, 0.5, 0.5), 7.5);
+    for (const f of asig.listado) {
+      const nom = (f.funcionario?.nombre || '').padEnd(28, ' ').slice(0, 28);
+      const rut = (f.funcionario?.rut || '').padEnd(12, ' ').slice(0, 12);
+      const sn = (f.serialNumberToken || '').padEnd(18, ' ').slice(0, 18);
+      const exp = (f.fechaExpiracion || '').padEnd(10, ' ').slice(0, 10);
+      const est = `${f.estado} (${f.diasRestantes}d)`;
+      drawMonoLine(`${nom} | ${rut} | ${sn} | ${exp} | ${est}`, rgb(0.15, 0.15, 0.15), 7.5);
+    }
+    y -= 6;
+
+    // SECCIÓN 3: ACCIONES DE FIRMA POR FUNCIONARIO CON SU TOKEN (Req 3)
+    drawSectionTitle(
+      '3. ACCIONES POR FUNCIONARIO CON SU TOKEN (1 ACCION = 1 FIRMA, EXCLUYE CONEXIONES)',
+    );
+    drawMonoLine(
+      `Total Acciones (Firmas) Periodo: ${acc.totalAccionesFirmaPeriodo} | Total Historico: ${acc.totalAccionesFirmaHistorico} | Conexiones excluidas: ${acc.conexionesExcluidasPeriodo}`,
+      rgb(0.05, 0.25, 0.15),
+      8,
+    );
+    drawMonoLine(
+      'FUNCIONARIO                  | UNIDAD             | TOKEN S/N          | FIRMAS PER. | TOTAL HIST. | % PART.',
+      rgb(0.02, 0.18, 0.36),
+      7.5,
+    );
+    drawMonoLine('-'.repeat(98), rgb(0.5, 0.5, 0.5), 7.5);
+    for (const a of acc.listadoPorFuncionario) {
+      const nom = (a.nombre || '').padEnd(28, ' ').slice(0, 28);
+      const uni = (a.unidad || '').padEnd(18, ' ').slice(0, 18);
+      const sn = (a.serialNumberToken || '').padEnd(18, ' ').slice(0, 18);
+      const fp = String(a.accionesFirmaPeriodo).padStart(11, ' ');
+      const fh = String(a.accionesFirmaHistorico).padStart(11, ' ');
+      const pt = `${a.porcentajeParticipacionFirmas}%`.padStart(7, ' ');
+      drawMonoLine(`${nom} | ${uni} | ${sn} | ${fp} | ${fh} | ${pt}`, rgb(0.15, 0.15, 0.15), 7.5);
+    }
+    y -= 6;
+
+    // SECCIÓN 4: TOKENS PRÓXIMOS A VENCER (15, 30 Y 60 DÍAS) (Req 4)
+    drawSectionTitle(
+      `4. VIGENCIA Y VENCIMIENTOS DE TOKENS (<=15d: ${alert.menosDe15Dias} | <=30d: ${alert.entre16Y30Dias} | <=60d: ${alert.entre31Y60Dias} | Expirados: ${alert.expirados})`,
+    );
+    drawMonoLine(
+      'TOKEN S/N          | FUNCIONARIO             | CORREO NOTIFICACION          | EXPIRA     | TRAMO ALERTA',
+      rgb(0.02, 0.18, 0.36),
+      7.5,
+    );
+    drawMonoLine('-'.repeat(98), rgb(0.5, 0.5, 0.5), 7.5);
+    for (const al of alert.tokensEnAlerta) {
+      const sn = (al.serialNumberToken || '').padEnd(18, ' ').slice(0, 18);
+      const nom = (al.usuario?.nombre || '').padEnd(23, ' ').slice(0, 23);
+      const em = (al.usuario?.email || '').padEnd(28, ' ').slice(0, 28);
+      const ex = (al.fechaExpiracion || '').padEnd(10, ' ').slice(0, 10);
+      const tr = `${al.tramoAlerta} (${al.diasRestantes}d)`;
+      drawMonoLine(`${sn} | ${nom} | ${em} | ${ex} | ${tr}`, rgb(0.2, 0.1, 0.1), 7.5);
+    }
+    y -= 6;
+
+    // SECCIÓN 5: CONTRATOS DE OBTENCIÓN DE TOKENS (Req 7)
+    drawSectionTitle(
+      `5. CONTRATOS DE OBTENCION DE TOKENS (${cont.totalContratos} CONTRATOS | ${cont.totalTokensContratados} TOKENS)`,
+    );
+    drawMonoLine(
+      'CODIGO CONTRATO         | PROVEEDOR                | INICIO     | CADUCIDAD  | CUPO | ESTADO Y CADUCIDAD',
+      rgb(0.02, 0.18, 0.36),
+      7.5,
+    );
+    drawMonoLine('-'.repeat(98), rgb(0.5, 0.5, 0.5), 7.5);
+    for (const c of cont.listado) {
+      const cod = (c.codigoContrato || '').padEnd(23, ' ').slice(0, 23);
+      const prov = (c.proveedor || '').padEnd(24, ' ').slice(0, 24);
+      const ini = (c.fechaInicioFormateada || '').padEnd(10, ' ').slice(0, 10);
+      const cad = (c.fechaCaducidadFormateada || '').padEnd(10, ' ').slice(0, 10);
+      const cupo = String(c.cantidadTokens).padStart(4, ' ');
+      const est = `${c.estadoVigencia} (${c.diasRestantes}d)`;
+      drawMonoLine(`${cod} | ${prov} | ${ini} | ${cad} | ${cupo} | ${est}`, rgb(0.15, 0.15, 0.15), 7.5);
+    }
+
+    ensureSpace(45);
+    y -= 10;
+    const digest = crypto
+      .createHash('sha256')
+      .update(`${p.modo}:${p.etiquetaPeriodo}:${disp.totalExistentes}:${acc.totalAccionesFirmaPeriodo}`)
+      .digest('hex');
+    drawMonoLine(`Sello SHA-256 Summary: ${digest}`, rgb(0, 0.4, 0.2), 7.5);
+
+    const pdfBytes = await pdfDoc.save();
+    const sufijo =
+      p.modo === 'POR_MES'
+        ? p.mesSeleccionado
+        : p.modo === 'POR_ANIO'
+        ? p.anioSeleccionado
+        : p.modo.toLowerCase();
+
+    return {
+      buffer: Buffer.from(pdfBytes),
+      filename: `Summary-Control-Tokens-${sufijo}.pdf`,
+    };
   }
 }

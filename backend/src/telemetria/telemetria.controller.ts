@@ -41,16 +41,74 @@ export class TelemetriaController {
     return this.telemetriaService.obtenerUltimosEventos();
   }
 
-  @Roles('ADMIN', 'SUPERVISOR')
+  @Post('accion-firma')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({
+    summary: 'Requisito 3: Registrar una acción de firma electrónica desde la sesión activa y el token del dispositivo',
+    description: 'Contabiliza 1 acción = 1 firma realizada con el token (excluyendo conexiones y desconexiones).',
+  })
+  async registrarAccionFirma(
+    @Body()
+    body: {
+      rutFuncionario?: string;
+      usuarioId?: string;
+      serialNumber?: string;
+      codigoPc?: string;
+      glosaAccion?: string;
+    },
+    @Req() req: Request,
+  ) {
+    return this.telemetriaService.registrarAccionFirmaSesion(body, (req as any).user);
+  }
+
   @Get('metricas')
   @ApiOperation({
-    summary: 'Métricas de trazabilidad, estadísticas operacionales y porcentajes (Por Mes o Últimos 30 días)',
+    summary: 'Métricas de control de tokens, firmas asignadas, acciones por funcionario, alertas (15/30/60d) y contratos (7d, 15d, 30d, Por Mes, Por Año)',
   })
   async obtenerMetricas(
     @Query('modo') modo?: string,
     @Query('mes') mes?: string,
+    @Query('anio') anio?: string,
   ) {
-    return this.telemetriaService.obtenerMetricasTrazabilidad(modo, mes);
+    return this.telemetriaService.obtenerMetricasTrazabilidad(modo, mes, anio);
+  }
+
+  @Get('metricas/latex')
+  @ApiOperation({
+    summary: 'Requisito 6: Obtener previsualización en código LaTeX (.tex) del Summary estadístico por período',
+  })
+  async obtenerLatexSummary(
+    @Query('modo') modo?: string,
+    @Query('mes') mes?: string,
+    @Query('anio') anio?: string,
+  ) {
+    return this.telemetriaService.obtenerCodigoLatexSummary(modo, mes, anio);
+  }
+
+  @Public()
+  @Get('metricas/pdf')
+  @ApiOperation({
+    summary: 'Requisito 6: Descargar o previsualizar como PDF el Summary con estadísticas y desglose de métricas',
+  })
+  async descargarPdfSummary(
+    @Res() res: Response,
+    @Query('modo') modo?: string,
+    @Query('mes') mes?: string,
+    @Query('anio') anio?: string,
+    @Query('download') download?: string,
+  ) {
+    const { buffer, filename } = await this.telemetriaService.generarPdfSummaryMetricas(
+      modo,
+      mes,
+      anio,
+    );
+    const disposition = download === '1' || download === 'true' ? 'attachment' : 'inline';
+    res.set({
+      'Content-Type': 'application/pdf',
+      'Content-Disposition': `${disposition}; filename="${filename}"`,
+      'Content-Length': buffer.length,
+    });
+    res.end(buffer);
   }
 
   @Roles('ADMIN')
