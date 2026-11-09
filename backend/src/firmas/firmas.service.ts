@@ -342,7 +342,7 @@ export class FirmasService {
       // Detectar estación con Token USB conectado en vivo para trazabilidad de hardware
       const estacionActiva = await this.prisma.estacionTrabajo.findFirst({
         where: {
-          estadoHardware: { in: ['CONECTADO', 'FIRMANDO'] },
+          estadoHardware: 'CONECTADO',
         },
         orderBy: { ultimoPing: 'desc' },
       });
@@ -351,35 +351,6 @@ export class FirmasService {
         estacionActiva?.serialTokenActivo ||
         firmante?.certificados?.[0]?.tokenHardware?.serialNumber ||
         null;
-
-      if (estacionActiva && accion === 'FIRMAR') {
-        try {
-          await this.redis.setPresence(estacionActiva.codigoPc, 'FIRMANDO');
-          await this.prisma.telemetriaEvento
-            .create({
-              data: {
-                codigoPc: estacionActiva.codigoPc,
-                evento: 'FIRMANDO',
-                metadatosJsonb: {
-                  serialNumber: serialTokenDetectado,
-                  codigoDocumento: solicitud.codigoDocumento,
-                  rutFirmante: dto.rutFirmante,
-                },
-              },
-            })
-            .catch(() => {});
-          this.wsGateway.broadcastEstadoPc({
-            codigoPc: estacionActiva.codigoPc,
-            estadoHardware: 'FIRMANDO',
-            serialNumber: serialTokenDetectado || undefined,
-            ipAsignada: estacionActiva.ipAsignada,
-            dependenciaFisica: estacionActiva.dependenciaFisica,
-            timestamp: new Date().toISOString(),
-          });
-        } catch {
-          // Continuar si Redis/WS no responde
-        }
-      }
 
       const ahora = new Date();
       const bufferOriginal =
@@ -556,24 +527,7 @@ export class FirmasService {
         },
       });
 
-      // Restaurar estado de estación a CONECTADO tras completar la operación de firma
-      if (estacionActiva && accion === 'FIRMAR') {
-        setTimeout(async () => {
-          try {
-            await this.redis.setPresence(estacionActiva.codigoPc, 'CONECTADO');
-            this.wsGateway.broadcastEstadoPc({
-              codigoPc: estacionActiva.codigoPc,
-              estadoHardware: 'CONECTADO',
-              serialNumber: serialTokenDetectado || undefined,
-              ipAsignada: estacionActiva.ipAsignada,
-              dependenciaFisica: estacionActiva.dependenciaFisica,
-              timestamp: new Date().toISOString(),
-            });
-          } catch {
-            // Ignorar
-          }
-        }, 1500);
-      }
+
 
       this.wsGateway.emitirActualizacionPresencia({
         tipo: 'DOCUMENTO_ACTUALIZADO',
@@ -1445,7 +1399,7 @@ export class FirmasService {
     const maxIntentosActuales = Math.max(intentosFallidosAtendida, intentosFallidosFunc);
 
     const estacionConectada = await this.prisma.estacionTrabajo.findFirst({
-      where: { estadoHardware: { in: ['CONECTADO', 'FIRMANDO'] } },
+      where: { estadoHardware: 'CONECTADO' },
       orderBy: { ultimoPing: 'desc' },
     });
 
@@ -1820,7 +1774,7 @@ export class FirmasService {
 
     // 5. Procesar y firmar cada archivo en Banco de Firma (Loop Firmar(Hash) -> Armar doc firmado)
     const estacionActiva = await this.prisma.estacionTrabajo.findFirst({
-      where: { estadoHardware: { in: ['CONECTADO', 'FIRMANDO'] } },
+      where: { estadoHardware: 'CONECTADO' },
       orderBy: { ultimoPing: 'desc' },
     });
 

@@ -119,7 +119,7 @@ export class SeedService implements OnModuleInit {
             vendorId: '0x0529',
             diasVigencia: 9, // <= 15 días (Crítico)
             codigoPc: 'PC-TRANSITO-01',
-            estadoPc: 'FIRMANDO',
+            estadoPc: 'CONECTADO',
             firmasRecientes: [0, 0, 1, 2, 3, 5, 8, 12, 18, 25, 45],
           },
           {
@@ -359,6 +359,48 @@ export class SeedService implements OnModuleInit {
               .catch(() => {});
           }
 
+          const codContrato = `CT-OBT-2026-00${funcionariosTest.indexOf(item) + 1}`;
+          await this.prisma.contratoToken
+            .upsert({
+              where: { codigoContrato: codContrato },
+              update: {
+                titulo: `Contrato de Obtención y Responsabilidad de Token FEA — ${item.nombre}`,
+                proveedor: 'E-Certchile / Municipalidad de Coquimbo',
+                fechaInicio: new Date(ahora.getTime() - 180 * 24 * 60 * 60 * 1000),
+                fechaCaducidad: validoHasta,
+                cantidadTokens: 1,
+                descripcion: JSON.stringify({
+                  funcionarioNombre: item.nombre,
+                  funcionarioRut: item.rut,
+                  funcionarioCargo: item.cargo,
+                  funcionarioUnidad: item.unidad,
+                  serialNumberToken: item.serialNumber,
+                  marcaModeloToken: `${item.marca} ${item.modelo}`,
+                  firmadoObtencion: true,
+                }),
+                documentoUrl: `/api/v1/equipamiento/contratos/${codContrato}/pdf`,
+              },
+              create: {
+                codigoContrato: codContrato,
+                titulo: `Contrato de Obtención y Responsabilidad de Token FEA — ${item.nombre}`,
+                proveedor: 'E-Certchile / Municipalidad de Coquimbo',
+                fechaInicio: new Date(ahora.getTime() - 180 * 24 * 60 * 60 * 1000),
+                fechaCaducidad: validoHasta,
+                cantidadTokens: 1,
+                descripcion: JSON.stringify({
+                  funcionarioNombre: item.nombre,
+                  funcionarioRut: item.rut,
+                  funcionarioCargo: item.cargo,
+                  funcionarioUnidad: item.unidad,
+                  serialNumberToken: item.serialNumber,
+                  marcaModeloToken: `${item.marca} ${item.modelo}`,
+                  firmadoObtencion: true,
+                }),
+                documentoUrl: `/api/v1/equipamiento/contratos/${codContrato}/pdf`,
+              },
+            })
+            .catch(() => {});
+
           await this.prisma.estacionTrabajo.upsert({
             where: { codigoPc: item.codigoPc },
             update: {
@@ -401,24 +443,41 @@ export class SeedService implements OnModuleInit {
                   },
                 },
               });
-              await this.prisma.telemetriaEvento.create({
+              await this.prisma.historialCambio.create({
                 data: {
-                  codigoPc: item.codigoPc,
-                  tokenId: token.id,
-                  evento: 'FIRMANDO',
-                  timestamp: fechaEv,
-                  metadatosJsonb: {
-                    accionFirma: true,
+                  usuarioId: user.id,
+                  usuarioEmail: user.email,
+                  accion: 'DOCUMENTO_FIRMADA',
+                  tablaAfectada: 'solicitudes_firma',
+                  registroId: `DOC-${item.codigoPc}-${diasAtras}`,
+                  diffJsonb: {
+                    accion: 'FIRMAR',
+                    estadoNuevo: 'FIRMADA',
                     serialNumber: item.serialNumber,
-                    usuarioId: user.id,
-                    funcionarioRut: user.rut,
-                    funcionarioNombre: user.nombre,
+                    codigoPc: item.codigoPc,
                     unidad: item.unidad,
-                    glosaAccion: 'Firma electrónica con token realizada desde sesión activa',
-                    stateChanged: true,
                   },
+                  ipOrigen: '10.10.10.22',
+                  createdAt: fechaEv,
                 },
               });
+              await this.prisma.solicitudFirma
+                .create({
+                  data: {
+                    codigoDocumento: `DOC-HIST-${item.codigoPc}-${diasAtras}-${Math.random().toString(36).substring(2, 6)}`,
+                    titulo: `Documento Firmado Histórico (${item.unidad})`,
+                    tipoTramite: 'DECRETO',
+                    documentoUrl: '/api/v1/firmas/documentos/dummy.pdf',
+                    hashSha256: 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855',
+                    estadoAprobacion: 'FIRMADA',
+                    usuarioSolicitanteId: user.id,
+                    estacionAsignada: item.codigoPc,
+                    createdAt: fechaEv,
+                    updatedAt: fechaEv,
+                    tsaTimestamp: fechaEv,
+                  },
+                })
+                .catch(() => {});
             }
           }
         }

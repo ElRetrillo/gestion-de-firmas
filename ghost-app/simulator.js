@@ -38,7 +38,7 @@ const ESTACIONES_SIMULADAS = [
     vendorId: '0x0529',
     marca: 'Thales / SafeNet',
     modelo: 'eToken 5110 CC (FIPS 140-2 Nivel 3)',
-    estadoHardware: 'FIRMANDO',
+    estadoHardware: 'CONECTADO',
   },
   {
     codigoPc: 'PC-DOM-05',

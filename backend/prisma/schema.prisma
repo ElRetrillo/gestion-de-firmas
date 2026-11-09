@@ -50,13 +50,11 @@ enum EstadoPatrimonial {
 enum EstadoHardware {
   DESCONECTADO
   CONECTADO
-  FIRMANDO
 }
 
 enum EventoTelemetria {
   CONECTADO
   DESCONECTADO
-  FIRMANDO
 }
 
 enum EstadoAprobacion {

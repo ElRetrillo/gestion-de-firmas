@@ -38,6 +38,7 @@ export class EquipamientoController {
     return this.equipamientoService.asignarTokenAFuncionario(dto);
   }
 
+  @Public()
   @Get('contratos')
   @ApiOperation({
     summary: 'Requisito 7: Listado de contratos de obtención de tokens con fecha de inicio, caducidad y documento PDF',
@@ -46,10 +47,10 @@ export class EquipamientoController {
     return this.equipamientoService.listarContratos();
   }
 
-  @Roles('ADMIN', 'SUPERVISOR')
+  @Public()
   @Post('contratos')
   @ApiOperation({
-    summary: 'Requisito 7: Registrar nuevo contrato de obtención de tokens criptográficos',
+    summary: 'Requisito 7: Registrar nuevo contrato individual de obtención de tokens criptográficos por funcionario',
   })
   async crearContrato(@Body() dto: CrearContratoTokenDto) {
     return this.equipamientoService.crearContrato(dto);

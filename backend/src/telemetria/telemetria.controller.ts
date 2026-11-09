@@ -43,6 +43,7 @@ export class TelemetriaController {
     return this.telemetriaService.registrarEventoUsb(dto);
   }
 
+  @Public()
   @Get('estaciones')
   @ApiOperation({
     summary: 'Listado de estaciones de trabajo con estado de hardware en tiempo real',
@@ -52,6 +53,7 @@ export class TelemetriaController {
     return this.telemetriaService.obtenerEstadosEstaciones();
   }
 
+  @Public()
   @Get('eventos-recientes')
   @ApiOperation({
     summary: 'Auditoría forense de eventos de telemetría recientes',
@@ -60,6 +62,7 @@ export class TelemetriaController {
     return this.telemetriaService.obtenerUltimosEventos();
   }
 
+  @Public()
   @Post('accion-firma')
   @HttpCode(HttpStatus.OK)
   @ApiOperation({
@@ -80,6 +83,7 @@ export class TelemetriaController {
     return this.telemetriaService.registrarAccionFirmaSesion(body, (req as any).user);
   }
 
+  @Public()
   @Get('metricas')
   @ApiOperation({
     summary: 'Métricas de control de tokens, firmas asignadas, acciones por funcionario, alertas (15/30/60d) y contratos (7d, 15d, 30d, Por Mes, Por Año)',
@@ -92,6 +96,7 @@ export class TelemetriaController {
     return this.telemetriaService.obtenerMetricasTrazabilidad(modo, mes, anio);
   }
 
+  @Public()
   @Get('metricas/latex')
   @ApiOperation({
     summary: 'Requisito 6: Obtener previsualización en código LaTeX (.tex) del Summary estadístico por período',
@@ -102,6 +107,28 @@ export class TelemetriaController {
     @Query('anio') anio?: string,
   ) {
     return this.telemetriaService.obtenerCodigoLatexSummary(modo, mes, anio);
+  }
+
+  @Public()
+  @Post('metricas/compile-latex')
+  @ApiOperation({
+    summary: 'Compilar dinámicamente código fuente LaTeX a documento PDF de Summary Estadístico',
+  })
+  async compilarLatexAPdf(
+    @Body() body: { codigoLatex: string; modo?: string; etiquetaPeriodo?: string },
+    @Res() res: Response,
+  ) {
+    const buffer = await this.telemetriaService.compilarLatexAPdf(
+      body?.codigoLatex || '',
+      body?.modo,
+      body?.etiquetaPeriodo,
+    );
+    res.set({
+      'Content-Type': 'application/pdf',
+      'Content-Disposition': 'inline; filename="Summary-LaTeX.pdf"',
+      'Content-Length': buffer.length,
+    });
+    res.end(buffer);
   }
 
   @Public()

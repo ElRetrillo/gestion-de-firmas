@@ -66,13 +66,11 @@ Invoke-RestMethod -Uri "http://localhost:3001/api/v1/telemetria/usb" -Method POS
 }'
 ```
 
-#### B. Simular Operación de Firma Activa (`FIRMANDO`):
+#### B. Simular Acción de Firma con Token Activo:
 ```powershell
-Invoke-RestMethod -Uri "http://localhost:3001/api/v1/telemetria/usb" -Method POST -Headers @{ "Content-Type" = "application/json" } -Body '{
+Invoke-RestMethod -Uri "http://localhost:3001/api/v1/telemetria/simular-accion-firma" -Method POST -Headers @{ "Content-Type" = "application/json" } -Body '{
   "codigoPc": "PC-DOM-05",
-  "estadoHardware": "FIRMANDO",
-  "serialNumber": "SN-SAF-98214",
-  "vendorId": "0x0529"
+  "serialNumber": "SN-SAF-98214"
 }'
 ```
 

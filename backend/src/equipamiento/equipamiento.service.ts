@@ -42,25 +42,61 @@ export class CrearContratoTokenDto {
   codigoContrato?: string;
 
   @IsString()
-  @IsNotEmpty()
-  titulo!: string;
+  @IsOptional()
+  titulo?: string;
 
   @IsString()
-  @IsNotEmpty()
-  proveedor!: string;
+  @IsOptional()
+  proveedor?: string;
 
   @IsString()
-  @IsNotEmpty()
-  fechaInicio!: string;
+  @IsOptional()
+  funcionarioNombre?: string;
 
   @IsString()
-  @IsNotEmpty()
-  fechaCaducidad!: string;
+  @IsOptional()
+  funcionarioRut?: string;
+
+  @IsString()
+  @IsOptional()
+  funcionarioCargo?: string;
+
+  @IsString()
+  @IsOptional()
+  funcionarioUnidad?: string;
+
+  @IsString()
+  @IsOptional()
+  serialNumberToken?: string;
+
+  @IsString()
+  @IsOptional()
+  marcaModeloToken?: string;
+
+  @IsOptional()
+  firmadoObtencion?: boolean;
+
+  @IsString()
+  @IsOptional()
+  fechaInicio?: string;
+
+  @IsString()
+  @IsOptional()
+  fechaTermino?: string;
+
+  @IsString()
+  @IsOptional()
+  fechaCaducidad?: string;
 
   @Type(() => Number)
   @IsInt()
   @IsOptional()
   cantidadTokens?: number;
+
+  @Type(() => Number)
+  @IsInt()
+  @IsOptional()
+  cantidadTokensContratados?: number;
 
   @IsString()
   @IsOptional()
@@ -781,25 +817,128 @@ export class EquipamientoService {
   }
 
   /**
-   * Requisito 7: Listado de Contratos de Obtención de Tokens con cálculo de tiempo de caducidad y fecha de inicio
+   * Requisito 7: Listado de Contratos Individuales de Obtención y Responsabilidad de Token FEA por Funcionario.
+   * Flujo de Negocio: Cada funcionario con un token asignado formaliza su contrato individual de obtención al recibirlo.
    */
   async listarContratos() {
     const ahora = new Date();
     try {
-      const contratos = await this.prisma.contratoToken.findMany({
+      // 1. Contratos registrados explícitamente en BD
+      const contratosDb = await this.prisma.contratoToken.findMany({
         orderBy: { fechaInicio: 'desc' },
       });
 
-      return contratos.map((c) => this.enriquecerContrato(c, ahora));
+      // 2. Asignaciones de tokens y certificados por funcionario
+      const asignaciones = await this.prisma.certificado.findMany({
+        where: {
+          tokenHardwareId: { not: null },
+        },
+        include: {
+          usuario: true,
+          tokenHardware: true,
+        },
+        orderBy: { validoHasta: 'asc' },
+      });
+
+      // Mapear contratos por número de serie de token y por RUT de funcionario
+      const contratosPorSerial = new Map<string, any>();
+      const contratosPorRut = new Map<string, any>();
+      const contratosPorCodigo = new Map<string, any>();
+
+      for (const c of contratosDb) {
+        let meta: any = {};
+        if (c.descripcion) {
+          try {
+            meta = JSON.parse(c.descripcion);
+          } catch {
+            meta = {};
+          }
+        }
+        const serial = meta.serialNumberToken || (c as any).serialNumberToken;
+        const rut = meta.funcionarioRut || (c as any).funcionarioRut;
+        if (serial) contratosPorSerial.set(serial.trim(), c);
+        if (rut) contratosPorRut.set(rut.trim(), c);
+        contratosPorCodigo.set(c.codigoContrato, c);
+      }
+
+      const contratosFinales: any[] = [];
+      const procesadosCodigos = new Set<string>();
+
+      // 3. Asegurar 1 contrato individual por cada funcionario con token asignado
+      let idx = 1;
+      for (const asig of asignaciones) {
+        const serial = asig.tokenHardware?.serialNumber || `SN-TOKEN-${idx}`;
+        const rut = asig.usuario?.rut || '';
+        const codigoAuto = `CT-OBT-2026-00${idx}`;
+
+        let contratoEncontrado =
+          contratosPorSerial.get(serial) ||
+          contratosPorRut.get(rut) ||
+          contratosPorCodigo.get(codigoAuto);
+
+        if (!contratoEncontrado) {
+          // Persistir el contrato individual de obtención del funcionario
+          const metaPayload = {
+            funcionarioNombre: asig.usuario?.nombre || 'Funcionario Municipal',
+            funcionarioRut: asig.usuario?.rut || '-',
+            funcionarioCargo: asig.usuario?.cargo || 'Funcionario Municipal',
+            funcionarioUnidad: asig.usuario?.unidad || 'Municipalidad de Coquimbo',
+            serialNumberToken: serial,
+            marcaModeloToken: `${asig.tokenHardware?.marca || 'Thales'} ${asig.tokenHardware?.modelo || 'eToken 5110 CC'}`,
+            firmadoObtencion: true,
+            descripcion: `Contrato individual de obtención y tenencia de dispositivo criptográfico PKCS#11 FIPS 140-2 firmado en conformidad a la Ley N° 19.799.`,
+          };
+
+          contratoEncontrado = await this.prisma.contratoToken
+            .upsert({
+              where: { codigoContrato: codigoAuto },
+              update: {
+                titulo: `Contrato de Obtención y Responsabilidad de Token FEA — ${asig.usuario?.nombre || 'Funcionario'}`,
+                proveedor: 'E-Certchile / Municipalidad de Coquimbo',
+                fechaInicio: asig.createdAt || new Date(ahora.getTime() - 120 * 24 * 60 * 60 * 1000),
+                fechaCaducidad: asig.validoHasta,
+                cantidadTokens: 1,
+                descripcion: JSON.stringify(metaPayload),
+                documentoUrl: `/api/v1/equipamiento/contratos/${codigoAuto}/pdf`,
+              },
+              create: {
+                codigoContrato: codigoAuto,
+                titulo: `Contrato de Obtención y Responsabilidad de Token FEA — ${asig.usuario?.nombre || 'Funcionario'}`,
+                proveedor: 'E-Certchile / Municipalidad de Coquimbo',
+                fechaInicio: asig.createdAt || new Date(ahora.getTime() - 120 * 24 * 60 * 60 * 1000),
+                fechaCaducidad: asig.validoHasta,
+                cantidadTokens: 1,
+                descripcion: JSON.stringify(metaPayload),
+                documentoUrl: `/api/v1/equipamiento/contratos/${codigoAuto}/pdf`,
+              },
+            })
+            .catch(() => null);
+        }
+
+        if (contratoEncontrado) {
+          procesadosCodigos.add(contratoEncontrado.codigoContrato);
+          contratosFinales.push(this.enriquecerContrato(contratoEncontrado, ahora, asig));
+        }
+        idx++;
+      }
+
+      // 4. Incluir contratos adicionales que estuvieran en la BD
+      for (const c of contratosDb) {
+        if (!procesadosCodigos.has(c.codigoContrato)) {
+          contratosFinales.push(this.enriquecerContrato(c, ahora));
+        }
+      }
+
+      return contratosFinales;
     } catch (err) {
-      this.logger.warn(`Error al consultar contratos_tokens: ${(err as Error).message}`);
+      this.logger.warn(`Error al consultar contratos individuales de obtención: ${(err as Error).message}`);
       return [];
     }
   }
 
-  public enriquecerContrato(c: any, ahora = new Date()) {
+  public enriquecerContrato(c: any, ahora = new Date(), contextAsig?: any) {
     const fInicio = new Date(c.fechaInicio);
-    const fCaducidad = new Date(c.fechaCaducidad);
+    const fCaducidad = new Date(c.fechaCaducidad || c.fechaTermino);
     const msRestantes = fCaducidad.getTime() - ahora.getTime();
     const diasRestantes = Math.ceil(msRestantes / (1000 * 60 * 60 * 24));
     const duracionTotalDias = Math.max(
@@ -810,144 +949,301 @@ export class EquipamientoService {
       0,
       Math.ceil((ahora.getTime() - fInicio.getTime()) / (1000 * 60 * 60 * 24)),
     );
-    const porcentajeTranscurrido = Math.min(
+    const porcentajeVigenciaTranscurrida = Math.min(
       100,
       Math.max(0, Math.round((diasTranscurridos / duracionTotalDias) * 100)),
     );
 
-    let estadoVigencia: 'VIGENTE' | 'POR_CADUCAR' | 'CADUCADO' = 'VIGENTE';
+    let estadoContrato: 'VIGENTE' | 'POR_CADUCAR' | 'CADUCADO' = 'VIGENTE';
     let tiempoCaducidadTexto = '';
 
     if (diasRestantes < 0) {
-      estadoVigencia = 'CADUCADO';
+      estadoContrato = 'CADUCADO';
       tiempoCaducidadTexto = `Caducado hace ${Math.abs(diasRestantes)} días`;
     } else if (diasRestantes === 0) {
-      estadoVigencia = 'POR_CADUCAR';
+      estadoContrato = 'POR_CADUCAR';
       tiempoCaducidadTexto = 'Caduca hoy';
     } else if (diasRestantes <= 60) {
-      estadoVigencia = 'POR_CADUCAR';
+      estadoContrato = 'POR_CADUCAR';
       tiempoCaducidadTexto = `${diasRestantes} días restantes (Próximo a caducar)`;
     } else {
       const mesesAprox = Math.round((diasRestantes / 30.4) * 10) / 10;
       tiempoCaducidadTexto = `${diasRestantes} días restantes (~${mesesAprox} meses)`;
     }
 
+    let meta: any = {};
+    if (c.descripcion) {
+      try {
+        meta = JSON.parse(c.descripcion);
+      } catch {
+        // Plain text descripcion
+      }
+    }
+
+    const funcionarioNombre =
+      c.funcionarioNombre ||
+      meta.funcionarioNombre ||
+      contextAsig?.usuario?.nombre ||
+      'Funcionario Municipal';
+    const funcionarioRut =
+      c.funcionarioRut ||
+      meta.funcionarioRut ||
+      contextAsig?.usuario?.rut ||
+      '-';
+    const funcionarioCargo =
+      c.funcionarioCargo ||
+      meta.funcionarioCargo ||
+      contextAsig?.usuario?.cargo ||
+      'Funcionario Municipal';
+    const funcionarioUnidad =
+      c.funcionarioUnidad ||
+      meta.funcionarioUnidad ||
+      contextAsig?.usuario?.unidad ||
+      'Municipalidad de Coquimbo';
+    const serialNumberToken =
+      c.serialNumberToken ||
+      meta.serialNumberToken ||
+      contextAsig?.tokenHardware?.serialNumber ||
+      'SN-TOKEN-FEA';
+    const marcaModeloToken =
+      c.marcaModeloToken ||
+      meta.marcaModeloToken ||
+      (contextAsig?.tokenHardware
+        ? `${contextAsig.tokenHardware.marca} ${contextAsig.tokenHardware.modelo}`
+        : 'Thales SafeNet eToken 5110 CC (FIPS 140-2)');
+    const firmadoObtencion = c.firmadoObtencion ?? meta.firmadoObtencion ?? true;
+
+    const codigo = c.codigoContrato || c.id;
+
     return {
       id: c.id,
-      codigoContrato: c.codigoContrato,
-      titulo: c.titulo,
-      proveedor: c.proveedor,
+      codigoContrato: codigo,
+      titulo: c.titulo || `Contrato de Obtención y Responsabilidad de Token FEA — ${funcionarioNombre}`,
+      proveedor: c.proveedor || 'E-Certchile / Municipalidad de Coquimbo',
+      funcionarioNombre,
+      funcionarioRut,
+      funcionarioCargo,
+      funcionarioUnidad,
+      serialNumberToken,
+      marcaModeloToken,
+      firmadoObtencion,
       fechaInicio: fInicio.toISOString(),
+      fechaTermino: fCaducidad.toISOString(),
       fechaCaducidad: fCaducidad.toISOString(),
       fechaInicioFormateada: fInicio.toISOString().split('T')[0],
       fechaCaducidadFormateada: fCaducidad.toISOString().split('T')[0],
       diasRestantes,
+      mesesRestantes: Math.max(0, Math.floor(diasRestantes / 30)),
       duracionTotalDias,
-      porcentajeTranscurrido,
+      porcentajeVigenciaTranscurrida,
+      porcentajeTranscurrido: porcentajeVigenciaTranscurrida,
       tiempoCaducidadTexto,
-      estadoVigencia,
-      cantidadTokens: c.cantidadTokens,
+      estadoContrato,
+      estadoVigencia: estadoContrato,
+      cantidadTokensContratados: 1,
+      cantidadTokensActivos: diasRestantes > 0 ? 1 : 0,
+      cantidadTokens: c.cantidadTokens || 1,
       montoReferencial: c.montoReferencial || 'Convenio Marco ID 2239-4-LR25',
       descripcion:
-        c.descripcion ||
-        'Suministro de dispositivos criptográficos USB PKCS#11 FIPS 140-2 Nivel 3 y certificados de Firma Electrónica Avanzada (Ley N° 19.799).',
-      documentoUrl: `/api/v1/equipamiento/contratos/${c.id}/pdf`,
+        meta.descripcion ||
+        (typeof c.descripcion === 'string' && !c.descripcion.startsWith('{')
+          ? c.descripcion
+          : `Contrato individual de obtención y responsabilidad de token FEA firmado por ${funcionarioNombre}.`),
+      pdfUrl: `/api/v1/equipamiento/contratos/${codigo}/pdf`,
+      documentoUrl: `/api/v1/equipamiento/contratos/${codigo}/pdf`,
     };
   }
 
   async crearContrato(dto: CrearContratoTokenDto) {
+    const ahora = new Date();
     const codigo =
       (dto.codigoContrato || '').trim() ||
-      `CON-TOKENS-${new Date().getFullYear()}-${Math.floor(100 + Math.random() * 900)}`;
+      `CT-OBT-2026-${Math.floor(100 + Math.random() * 900)}`;
 
-    const fInicio = new Date(dto.fechaInicio);
-    const fCaducidad = new Date(dto.fechaCaducidad);
+    const fInicio = dto.fechaInicio ? new Date(dto.fechaInicio) : ahora;
+    const fCaducidadRaw = dto.fechaTermino || dto.fechaCaducidad;
+    const fCaducidad = fCaducidadRaw
+      ? new Date(fCaducidadRaw)
+      : new Date(fInicio.getTime() + 365 * 24 * 60 * 60 * 1000);
+
     if (isNaN(fInicio.getTime()) || isNaN(fCaducidad.getTime())) {
-      throw new BadRequestException('Las fechas de inicio y caducidad del contrato deben ser válidas.');
+      throw new BadRequestException('Las fechas de inicio y término/caducidad del contrato deben ser válidas.');
     }
+
+    const funcionarioNombre = (dto.funcionarioNombre || '').trim() || 'Funcionario Municipal';
+    const funcionarioRut = (dto.funcionarioRut || '').trim() || '-';
+    const funcionarioCargo = (dto.funcionarioCargo || '').trim() || 'Funcionario Municipal';
+    const funcionarioUnidad = (dto.funcionarioUnidad || '').trim() || 'Municipalidad de Coquimbo';
+    const serialNumberToken = (dto.serialNumberToken || '').trim() || 'SN-TOKEN-FEA';
+    const marcaModeloToken = (dto.marcaModeloToken || '').trim() || 'Thales eToken 5110 CC';
+    const firmadoObtencion = dto.firmadoObtencion ?? true;
+
+    const tituloFinal =
+      (dto.titulo || '').trim() ||
+      `Contrato de Obtención y Responsabilidad de Token FEA — ${funcionarioNombre}`;
+    const proveedorFinal =
+      (dto.proveedor || '').trim() || 'E-Certchile / Municipalidad de Coquimbo';
+
+    const metaData = {
+      funcionarioNombre,
+      funcionarioRut,
+      funcionarioCargo,
+      funcionarioUnidad,
+      serialNumberToken,
+      marcaModeloToken,
+      firmadoObtencion,
+      descripcion:
+        dto.descripcion ||
+        `Contrato individual de obtención y tenencia de token FEA formalizado por ${funcionarioNombre}.`,
+    };
 
     const creado = await this.prisma.contratoToken.upsert({
       where: { codigoContrato: codigo },
       update: {
-        titulo: dto.titulo.trim(),
-        proveedor: dto.proveedor.trim(),
+        titulo: tituloFinal,
+        proveedor: proveedorFinal,
         fechaInicio: fInicio,
         fechaCaducidad: fCaducidad,
-        cantidadTokens: Number(dto.cantidadTokens || 10),
+        cantidadTokens: Number(dto.cantidadTokensContratados || dto.cantidadTokens || 1),
         montoReferencial: dto.montoReferencial || 'Convenio Marco',
-        descripcion: dto.descripcion || null,
+        descripcion: JSON.stringify(metaData),
+        documentoUrl: `/api/v1/equipamiento/contratos/${codigo}/pdf`,
       },
       create: {
         codigoContrato: codigo,
-        titulo: dto.titulo.trim(),
-        proveedor: dto.proveedor.trim(),
+        titulo: tituloFinal,
+        proveedor: proveedorFinal,
         fechaInicio: fInicio,
         fechaCaducidad: fCaducidad,
-        cantidadTokens: Number(dto.cantidadTokens || 10),
+        cantidadTokens: Number(dto.cantidadTokensContratados || dto.cantidadTokens || 1),
         montoReferencial: dto.montoReferencial || 'Convenio Marco',
-        descripcion: dto.descripcion || null,
+        descripcion: JSON.stringify(metaData),
         documentoUrl: `/api/v1/equipamiento/contratos/${codigo}/pdf`,
       },
     });
 
-    await this.prisma.historialCambio.create({
-      data: {
-        tablaAfectada: 'contratos_tokens',
-        registroId: creado.codigoContrato,
-        accion: 'REGISTRO_CONTRATO_TOKENS',
-        usuarioEmail: 'adquisiciones-tics@municoquimbo.cl',
-        diffJsonb: {
-          codigoContrato: creado.codigoContrato,
-          titulo: creado.titulo,
-          proveedor: creado.proveedor,
-          fechaInicio: fInicio.toISOString(),
-          fechaCaducidad: fCaducidad.toISOString(),
-          cantidadTokens: creado.cantidadTokens,
-        },
-      },
-    }).catch(() => {});
+    // Si viene funcionarioRut y serialNumberToken, asegurar o actualizar asignación activa
+    if (dto.funcionarioRut && dto.funcionarioRut !== '-' && dto.serialNumberToken) {
+      await this.asignarTokenAFuncionario({
+        rutUsuario: dto.funcionarioRut,
+        serialNumber: dto.serialNumberToken,
+        fechaInicio: fInicio.toISOString(),
+        fechaExpiracion: fCaducidad.toISOString(),
+        codigoContrato: codigo,
+      }).catch(() => {});
+    }
 
-    return this.enriquecerContrato(creado);
+    await this.prisma.historialCambio
+      .create({
+        data: {
+          tablaAfectada: 'contratos_tokens',
+          registroId: creado.codigoContrato,
+          accion: 'REGISTRO_CONTRATO_OBTENCION_TOKEN',
+          usuarioEmail: 'adquisiciones-tics@municoquimbo.cl',
+          diffJsonb: {
+            codigoContrato: creado.codigoContrato,
+            titulo: creado.titulo,
+            funcionarioNombre,
+            funcionarioRut,
+            serialNumberToken,
+            fechaInicio: fInicio.toISOString(),
+            fechaTermino: fCaducidad.toISOString(),
+            firmadoObtencion: true,
+          },
+        },
+      })
+      .catch(() => {});
+
+    return this.enriquecerContrato(creado, ahora);
   }
 
   /**
-   * Requisito 7: Genera la copia en PDF del Contrato de Obtención de Tokens para previsualización y descarga
+   * Requisito 7: Genera el documento PDF del Contrato Individual de Obtención y Responsabilidad de Token FEA
+   * firmado digitalmente por el funcionario titular y el responsable de seguridad institucional.
    */
   async generarPdfContrato(idOrCodigo: string): Promise<Buffer> {
-    let contrato = await this.prisma.contratoToken
+    const ahora = new Date();
+    let contrato: any = await this.prisma.contratoToken
       .findFirst({
         where: { OR: [{ id: idOrCodigo }, { codigoContrato: idOrCodigo }] },
       })
       .catch(() => null);
 
+    let contextAsig: any = null;
+
     if (!contrato) {
-      const todos = await this.prisma.contratoToken.findMany().catch(() => []);
-      contrato = todos[0] || null;
+      // Buscar si idOrCodigo corresponde al serial de un token o RUT de funcionario
+      const cert = await this.prisma.certificado
+        .findFirst({
+          where: {
+            OR: [
+              { tokenHardware: { serialNumber: idOrCodigo } },
+              { usuario: { rut: idOrCodigo } },
+              { usuario: { id: idOrCodigo } },
+            ],
+          },
+          include: { usuario: true, tokenHardware: true },
+        })
+        .catch(() => null);
+
+      if (cert) {
+        contextAsig = cert;
+        const cod = `CT-OBT-2026-${(cert.tokenHardware?.serialNumber || '01').slice(-4)}`;
+        contrato = {
+          id: cert.id,
+          codigoContrato: cod,
+          titulo: `Contrato de Obtención y Responsabilidad de Token FEA — ${cert.usuario.nombre}`,
+          proveedor: 'E-Certchile / Municipalidad de Coquimbo',
+          fechaInicio: cert.createdAt || new Date(ahora.getTime() - 120 * 24 * 60 * 60 * 1000),
+          fechaCaducidad: cert.validoHasta,
+          cantidadTokens: 1,
+          descripcion: JSON.stringify({
+            funcionarioNombre: cert.usuario.nombre,
+            funcionarioRut: cert.usuario.rut,
+            funcionarioCargo: cert.usuario.cargo,
+            funcionarioUnidad: cert.usuario.unidad,
+            serialNumberToken: cert.tokenHardware?.serialNumber,
+            marcaModeloToken: `${cert.tokenHardware?.marca || 'Thales'} ${cert.tokenHardware?.modelo || 'eToken 5110'}`,
+            firmadoObtencion: true,
+          }),
+        };
+      }
     }
 
-    const ahora = new Date();
-    const info = contrato
-      ? this.enriquecerContrato(contrato, ahora)
-      : {
-          codigoContrato: idOrCodigo || 'CON-2025-TOKENS-CQM-01',
-          titulo: 'Contrato de Suministro de Tokens Criptográficos USB y Certificados FEA',
-          proveedor: 'E-Sign Chile S.A. / Thales Cloud Protection & Licensing',
-          fechaInicioFormateada: '2025-03-01',
-          fechaCaducidadFormateada: '2027-03-01',
-          diasRestantes: 112,
-          duracionTotalDias: 730,
-          porcentajeTranscurrido: 84,
-          tiempoCaducidadTexto: '112 días restantes (~3.7 meses)',
-          estadoVigencia: 'VIGENTE',
-          cantidadTokens: 25,
-          montoReferencial: 'Orden de Compra N° 4291-188-CM25 (UTM 185)',
-          descripcion:
-            'Provisión, enrolamiento y soporte técnico de dispositivos físicos USB PKCS#11 FIPS 140-2 Nivel 3 para Firma Electrónica Avanzada Municipal.',
-        };
+    if (!contrato) {
+      const todos = await this.listarContratos();
+      if (todos.length > 0) {
+        return this.generarPdfContrato(todos[0].codigoContrato);
+      }
+    }
+
+    const info = this.enriquecerContrato(
+      contrato || {
+        codigoContrato: idOrCodigo || 'CT-OBT-2026-001',
+        titulo: 'Contrato de Obtención y Responsabilidad de Token FEA — Funcionario Municipal',
+        proveedor: 'E-Certchile / Municipalidad de Coquimbo',
+        fechaInicio: new Date(ahora.getTime() - 120 * 24 * 60 * 60 * 1000),
+        fechaCaducidad: new Date(ahora.getTime() + 245 * 24 * 60 * 60 * 1000),
+        cantidadTokens: 1,
+        descripcion: JSON.stringify({
+          funcionarioNombre: 'Juan Pérez González',
+          funcionarioRut: '16.892.415-3',
+          funcionarioCargo: 'Analista de Gestión Documental',
+          funcionarioUnidad: 'Dirección de Tránsito y Transporte',
+          serialNumberToken: 'SN-0529-CQM-8841',
+          marcaModeloToken: 'Thales / SafeNet eToken 5110 CC (FIPS 140-2 L3)',
+          firmadoObtencion: true,
+        }),
+      },
+      ahora,
+      contextAsig,
+    );
 
     const hashContrato = crypto
       .createHash('sha256')
-      .update(`${info.codigoContrato}:${info.proveedor}:${info.fechaInicioFormateada}:${info.fechaCaducidadFormateada}`)
+      .update(
+        `${info.codigoContrato}:${info.funcionarioRut}:${info.serialNumberToken}:${info.fechaInicioFormateada}:${info.fechaCaducidadFormateada}`,
+      )
       .digest('hex');
 
     const pdfDoc = await PDFDocument.create();
@@ -956,7 +1252,7 @@ export class EquipamientoService {
     const fontRegular = await pdfDoc.embedFont(StandardFonts.Helvetica);
     const fontMono = await pdfDoc.embedFont(StandardFonts.Courier);
 
-    // Encabezado Institucional
+    // Encabezado Institucional Azul Marino con Borde Dorado
     page.drawRectangle({
       x: 0,
       y: 765,
@@ -964,22 +1260,29 @@ export class EquipamientoService {
       height: 77,
       color: rgb(0.02, 0.18, 0.36),
     });
+    page.drawRectangle({
+      x: 0,
+      y: 762,
+      width: 595.28,
+      height: 3,
+      color: rgb(0.85, 0.65, 0.15),
+    });
 
     page.drawText('ILUSTRE MUNICIPALIDAD DE COQUIMBO', {
       x: 45,
       y: 812,
-      size: 14,
+      size: 13,
       font: fontBold,
       color: rgb(1, 1, 1),
     });
-    page.drawText('DIRECCION DE ADMINISTRACION Y FINANZAS • DEPARTAMENTO DE GESTION DE SISTEMAS Y TICs', {
+    page.drawText('DEPARTAMENTO DE GESTION DE SISTEMAS Y TICs • SEGURIDAD CRIPTOGRAFICA', {
       x: 45,
       y: 794,
       size: 8.5,
       font: fontRegular,
       color: rgb(0.85, 0.9, 0.96),
     });
-    page.drawText(`COPIA DIGITALIZADA DE CONTRATO DE OBTENCION DE TOKENS CRIPTOGRAFICOS`, {
+    page.drawText('CONTRATO INDIVIDUAL DE OBTENCION, TENENCIA Y RESPONSABILIDAD DE TOKEN FEA', {
       x: 45,
       y: 777,
       size: 9,
@@ -987,242 +1290,330 @@ export class EquipamientoService {
       color: rgb(0.98, 0.82, 0.35),
     });
 
-    // Título y Folio
-    page.drawText('CONTRATO DE SUMINISTRO Y VIGENCIA DE TOKENS DE FIRMA ELECTRONICA', {
-      x: 45,
-      y: 732,
-      size: 12,
-      font: fontBold,
-      color: rgb(0.02, 0.18, 0.36),
-    });
-
+    // Identificador Contractual y Estado de Vigencia
     page.drawText(`EXPEDIENTE CONTRACTUAL N°: ${info.codigoContrato}`, {
       x: 45,
-      y: 712,
-      size: 10,
-      font: fontMono,
-      color: rgb(0.2, 0.2, 0.2),
+      y: 738,
+      size: 11,
+      font: fontBold,
+      color: rgb(0.02, 0.18, 0.36),
     });
 
-    // Cuadro Resumen de Fechas y Caducidad (Requisito 7)
+    const colorBadge =
+      info.estadoContrato === 'VIGENTE'
+        ? rgb(0, 0.45, 0.2)
+        : info.estadoContrato === 'POR_CADUCAR'
+        ? rgb(0.75, 0.45, 0)
+        : rgb(0.7, 0.1, 0.1);
+
+    page.drawRectangle({
+      x: 430,
+      y: 732,
+      width: 120,
+      height: 20,
+      borderColor: colorBadge,
+      borderWidth: 1,
+      color: rgb(0.97, 0.98, 1),
+    });
+    page.drawText(`ESTADO: ${info.estadoContrato}`, {
+      x: 442,
+      y: 738,
+      size: 8.5,
+      font: fontBold,
+      color: colorBadge,
+    });
+
+    // SECCIÓN 1: Identificación del Funcionario Titular Receptor
     page.drawRectangle({
       x: 45,
-      y: 595,
+      y: 636,
       width: 505,
-      height: 105,
+      height: 86,
       borderColor: rgb(0.02, 0.18, 0.36),
-      borderWidth: 1.2,
-      color: rgb(0.96, 0.98, 1),
+      borderWidth: 1,
+      color: rgb(0.965, 0.98, 1),
     });
 
-    page.drawText('1. FICHA DE VIGENCIA Y PLAZO DE CADUCIDAD DEL CONTRATO', {
+    page.drawText('1. INDIVIDUALIZACION DEL FUNCIONARIO TITULAR RECEPTOR', {
       x: 55,
-      y: 682,
-      size: 9.5,
+      y: 708,
+      size: 9,
       font: fontBold,
       color: rgb(0.02, 0.18, 0.36),
     });
 
-    const fichaLines = [
-      `Fecha de Inicio de Vigencia : ${info.fechaInicioFormateada}`,
-      `Fecha de Termino / Caducidad: ${info.fechaCaducidadFormateada}`,
-      `Tiempo de Caducidad Restante: ${info.tiempoCaducidadTexto} (${info.duracionTotalDias} dias totales)`,
-      `Estado Actual del Contrato  : ${info.estadoVigencia} (${info.porcentajeTranscurrido}% del plazo transcurrido)`,
-      `Cupo de Dispositivos Tokens : ${info.cantidadTokens} Unidades USB PKCS#11 FIPS 140-2 Nivel 3`,
+    const datosFuncionario = [
+      `Nombre Completo : ${info.funcionarioNombre}`,
+      `RUN / RUT       : ${info.funcionarioRut}`,
+      `Cargo Titular   : ${info.funcionarioCargo}`,
+      `Unidad / Depto. : ${info.funcionarioUnidad}`,
     ];
 
-    let fy = 664;
-    for (const fl of fichaLines) {
-      page.drawText(fl, {
+    let yFunc = 692;
+    for (const df of datosFuncionario) {
+      page.drawText(df, {
         x: 55,
-        y: fy,
-        size: 9,
+        y: yFunc,
+        size: 8.5,
         font: fontMono,
-        color: rgb(0.1, 0.1, 0.1),
+        color: rgb(0.12, 0.12, 0.12),
       });
-      fy -= 14;
+      yFunc -= 14;
     }
 
-    // Datos Generales
-    page.drawText('2. ANTECEDENTES DE LA CONTRATACION Y PROVEEDOR ACREDITADO', {
+    // SECCIÓN 2: Identificación del Dispositivo Criptográfico
+    page.drawRectangle({
       x: 45,
-      y: 572,
-      size: 10,
+      y: 536,
+      width: 505,
+      height: 88,
+      borderColor: rgb(0.65, 0.72, 0.8),
+      borderWidth: 1,
+      color: rgb(0.985, 0.99, 1),
+    });
+
+    page.drawText('2. IDENTIFICACION DEL DISPOSITIVO CRIPTOGRAFICO ASIGNADO', {
+      x: 55,
+      y: 610,
+      size: 9,
       font: fontBold,
       color: rgb(0.02, 0.18, 0.36),
     });
 
-    const datosContrato = [
-      `Denominacion Contrato : ${info.titulo.slice(0, 68)}`,
-      `Entidad Contratante   : Ilustre Municipalidad de Coquimbo (RUT 69.040.100-2)`,
-      `Proveedor Adjudicado  : ${info.proveedor}`,
-      `Referencia Presupuesto: ${info.montoReferencial}`,
-      `Normativa Aplicable   : Ley N° 19.799 (Firma Electronica Avanzada) y Ley N° 19.886 (Compras Publicas)`,
+    const datosDispositivo = [
+      `Dispositivo Token USB  : ${info.marcaModeloToken}`,
+      `Numero de Serie (S/N)  : ${info.serialNumberToken}`,
+      `Proveedor Certificador : ${info.proveedor}`,
+      `Estandar Criptografico : PKCS#11 FIPS 140-2 Nivel 3 (Firma Electronica Avanzada)`,
     ];
 
-    let yCursor = 553;
-    for (const dl of datosContrato) {
-      page.drawText(dl, {
-        x: 45,
-        y: yCursor,
-        size: 9,
-        font: fontRegular,
-        color: rgb(0.15, 0.15, 0.15),
+    let yDisp = 594;
+    for (const dd of datosDispositivo) {
+      page.drawText(dd, {
+        x: 55,
+        y: yDisp,
+        size: 8.5,
+        font: fontMono,
+        color: rgb(0.12, 0.12, 0.12),
       });
-      yCursor -= 16;
+      yDisp -= 14;
     }
 
-    // Cláusulas del Contrato
-    page.drawText('3. CLAUSULAS ESENCIALES DE VIGENCIA, RENOVACION Y CONTROL DE TOKENS', {
+    // SECCIÓN 3: Ficha de Vigencia y Plazo de Caducidad
+    page.drawRectangle({
       x: 45,
-      y: 458,
-      size: 10,
+      y: 442,
+      width: 505,
+      height: 82,
+      borderColor: rgb(0.65, 0.72, 0.8),
+      borderWidth: 1,
+      color: rgb(0.985, 0.99, 1),
+    });
+
+    page.drawText('3. FICHA DE VIGENCIA Y PLAZO DE CADUCIDAD DEL CONTRATO', {
+      x: 55,
+      y: 512,
+      size: 9,
+      font: fontBold,
+      color: rgb(0.02, 0.18, 0.36),
+    });
+
+    const datosVigencia = [
+      `Fecha de Obtencion / Inicio : ${info.fechaInicioFormateada}`,
+      `Fecha de Caducidad / Termino: ${info.fechaCaducidadFormateada}`,
+      `Tiempo Restante de Vigencia : ${info.tiempoCaducidadTexto}`,
+      `Plazo Transcurrido          : ${info.porcentajeVigenciaTranscurrida}% transcurrido (${info.duracionTotalDias} dias totales)`,
+    ];
+
+    let yVig = 496;
+    for (const dv of datosVigencia) {
+      page.drawText(dv, {
+        x: 55,
+        y: yVig,
+        size: 8.5,
+        font: fontMono,
+        color: rgb(0.12, 0.12, 0.12),
+      });
+      yVig -= 14;
+    }
+
+    // SECCIÓN 4: Cláusulas Contractuales de Obtención y Responsabilidad
+    page.drawText('4. CLAUSULAS ESENCIALES DE OBTENCION Y RESPONSABILIDAD (LEY N° 19.799 / LEY N° 21.663)', {
+      x: 45,
+      y: 426,
+      size: 9,
       font: fontBold,
       color: rgb(0.02, 0.18, 0.36),
     });
 
     const clausulas = [
-      'PRIMERO (OBJETO): El proveedor suministra dispositivos fisicos criptograficos USB (Tokens)',
-      'acreditados ante el Ministerio de Economia / SEGPRES para la emision de Firma Electronica',
-      'Avanzada de los funcionarios habilitados de la Ilustre Municipalidad de Coquimbo.',
+      'PRIMERO (OBJETO Y ENTREGA): En cumplimiento del flujo institucional de obtencion de medios criptograficos',
+      'para Firma Electronica Avanzada (FEA), la I. Municipalidad de Coquimbo entrega en tenencia individual',
+      'al funcionario titular quien declara recibir conforme el dispositivo token USB singularizado precedentemente.',
       '',
       `SEGUNDO (VIGENCIA Y CADUCIDAD): El presente contrato rige desde el ${info.fechaInicioFormateada} hasta`,
-      `el ${info.fechaCaducidadFormateada}. El sistema de control de tokens monitoreara automaticamente`,
-      'los umbrales preventivos de 60, 30 y 15 dias previos a la expiracion de cada certificado.',
+      `el ${info.fechaCaducidadFormateada}. El funcionario titular se compromete a coordinar con TICs la renovacion`,
+      'del certificado criptografico previo al vencimiento del umbral preventivo de 30 dias.',
       '',
-      'TERCERO (TRAZABILIDAD Y AUDITORIA): Cada accion de firma ejecutada mediante los tokens',
-      'adscritos a este contrato queda registrada en la bitacora institucional de control.',
-      `Observaciones: ${(info.descripcion || '').slice(0, 82)}`,
+      'TERCERO (CUSTODIA INDELEGABLE Y CLAVE PIN): Conforme a los articulos 4° y 5° de la Ley N° 19.799, el titular',
+      'asume la custodia directa, exclusiva e indelegable del dispositivo fisico y de su clave secreta (PIN),',
+      'respondiendo administrativa, civil y penalmente de todo documento firmado bajo su titularidad.',
+      '',
+      'CUARTO (TELEMETRIA Y ACCIONES DE FIRMA): El titular autoriza el monitoreo de telemetria de conexion USB y el',
+      'computo de acciones de firma electronica para efectos de auditoria, control de gestion y trazabilidad publica.',
+      '',
+      'QUINTO (DEVOLUCION): En caso de desvinculacion, traslado o extravio, el titular debe restituir formalmente',
+      'el dispositivo al Departamento de TICs o solicitar su inmediata revocacion ante la Entidad Certificadora.',
     ];
 
-    let cy = 440;
+    let yClaus = 412;
     for (const cl of clausulas) {
+      if (cl === '') {
+        yClaus -= 3;
+        continue;
+      }
       page.drawText(cl, {
         x: 45,
-        y: cy,
-        size: 8.8,
+        y: yClaus,
+        size: 7.6,
         font: fontRegular,
-        color: rgb(0.2, 0.2, 0.2),
+        color: rgb(0.18, 0.18, 0.18),
       });
-      cy -= 13.5;
+      yClaus -= 10.5;
     }
 
-    // Recuadros de Firmas del Contrato
-    const boxY = 200;
+    // SECCIÓN 5: Firmas Digitales de Perfeccionamiento del Contrato
+    const boxY = 135;
     page.drawRectangle({
       x: 45,
       y: boxY,
-      width: 240,
-      height: 70,
+      width: 242,
+      height: 64,
       borderColor: rgb(0.65, 0.65, 0.65),
       borderWidth: 1,
-      color: rgb(0.98, 0.98, 0.98),
+      color: rgb(0.985, 0.985, 0.985),
     });
-    page.drawText('POR LA I. MUNICIPALIDAD DE COQUIMBO:', {
+    page.drawText('FUNCIONARIO TITULAR (FIRMA DE OBTENCION):', {
       x: 55,
-      y: boxY + 52,
-      size: 8,
+      y: boxY + 48,
+      size: 7.5,
       font: fontBold,
       color: rgb(0.02, 0.18, 0.36),
     });
-    page.drawText('Direccion de Administracion y TICs', {
+    page.drawText(info.funcionarioNombre.slice(0, 36), {
       x: 55,
-      y: boxY + 36,
-      size: 8.5,
-      font: fontRegular,
-      color: rgb(0.15, 0.15, 0.15),
-    });
-    page.drawText('RUT Institucional: 69.040.100-2', {
-      x: 55,
-      y: boxY + 22,
+      y: boxY + 34,
       size: 8,
-      font: fontMono,
-      color: rgb(0.3, 0.3, 0.3),
+      font: fontBold,
+      color: rgb(0.1, 0.1, 0.1),
     });
-    page.drawText('[ COPIA CONFORME ARCHIVO TICS ]', {
+    page.drawText(`RUT: ${info.funcionarioRut} • ${info.funcionarioCargo.slice(0, 24)}`, {
+      x: 55,
+      y: boxY + 21,
+      size: 7,
+      font: fontMono,
+      color: rgb(0.25, 0.25, 0.25),
+    });
+    page.drawText('[ FIRMA DIGITAL DE OBTENCION CONFORMADA ]', {
       x: 55,
       y: boxY + 8,
-      size: 7.5,
+      size: 7,
       font: fontBold,
       color: rgb(0, 0.45, 0.2),
     });
 
     page.drawRectangle({
-      x: 310,
+      x: 308,
       y: boxY,
-      width: 240,
-      height: 70,
+      width: 242,
+      height: 64,
       borderColor: rgb(0.65, 0.65, 0.65),
       borderWidth: 1,
-      color: rgb(0.98, 0.98, 0.98),
+      color: rgb(0.985, 0.985, 0.985),
     });
-    page.drawText('PROVEEDOR PRESTADOR ACREDITADO:', {
-      x: 320,
-      y: boxY + 52,
-      size: 8,
+    page.drawText('MINISTRO DE FE / RESPONSABLE TICs:', {
+      x: 318,
+      y: boxY + 48,
+      size: 7.5,
       font: fontBold,
       color: rgb(0.02, 0.18, 0.36),
     });
-    page.drawText(info.proveedor.slice(0, 34), {
-      x: 320,
-      y: boxY + 36,
-      size: 8.5,
-      font: fontRegular,
-      color: rgb(0.15, 0.15, 0.15),
-    });
-    page.drawText(`Cupo: ${info.cantidadTokens} Tokens USB FIPS 140-2`, {
-      x: 320,
-      y: boxY + 22,
+    page.drawText('Departamento de Gestion de Sistemas y TICs', {
+      x: 318,
+      y: boxY + 34,
       size: 8,
-      font: fontMono,
-      color: rgb(0.3, 0.3, 0.3),
+      font: fontBold,
+      color: rgb(0.1, 0.1, 0.1),
     });
-    page.drawText('[ CONTRATO VIGENTE REGISTRADO ]', {
-      x: 320,
+    page.drawText('I. Municipalidad de Coquimbo • RUT 69.040.100-2', {
+      x: 318,
+      y: boxY + 21,
+      size: 7,
+      font: fontMono,
+      color: rgb(0.25, 0.25, 0.25),
+    });
+    page.drawText('[ VERIFICADO Y REGISTRADO EN PADRON INSTITUCIONAL ]', {
+      x: 318,
       y: boxY + 8,
-      size: 7.5,
+      size: 7,
       font: fontBold,
       color: rgb(0, 0.45, 0.2),
     });
 
-    // Pie de Verificación Criptográfica
+    // Pie de Verificación Criptográfica (SHA-256)
     page.drawRectangle({
       x: 45,
-      y: 95,
+      y: 50,
       width: 505,
-      height: 85,
+      height: 72,
       borderColor: rgb(0, 0.4, 0.2),
-      borderWidth: 1.2,
-      color: rgb(0.95, 0.99, 0.96),
+      borderWidth: 1,
+      color: rgb(0.955, 0.99, 0.965),
     });
-    page.drawText('RESPALDO DOCUMENTAL DE CONTRATO - SISTEMA DE CONTROL Y SEGUIMIENTO DE TOKENS', {
-      x: 58,
-      y: 160,
-      size: 9,
+    page.drawText('RESPALDO DOCUMENTAL OFICIAL — SISTEMA DE GESTION DE FIRMAS Y TOKENS', {
+      x: 56,
+      y: 108,
+      size: 8,
       font: fontBold,
       color: rgb(0, 0.4, 0.2),
     });
     page.drawText(`SHA-256 Huella Digital : ${hashContrato}`, {
-      x: 58,
-      y: 142,
-      size: 8,
+      x: 56,
+      y: 93,
+      size: 7.2,
       font: fontMono,
       color: rgb(0.15, 0.15, 0.15),
     });
-    page.drawText(`Vigencia Contractual   : Inicio ${info.fechaInicioFormateada} -> Caducidad ${info.fechaCaducidadFormateada}`, {
-      x: 58,
-      y: 126,
-      size: 8,
-      font: fontMono,
-      color: rgb(0.15, 0.15, 0.15),
-    });
-    page.drawText(`Estado Caducidad       : ${info.tiempoCaducidadTexto}`, {
-      x: 58,
-      y: 110,
-      size: 8,
-      font: fontMono,
-      color: rgb(0.15, 0.15, 0.15),
-    });
+    page.drawText(
+      `Titular: ${info.funcionarioNombre} (${info.funcionarioRut}) | Token S/N: ${info.serialNumberToken}`,
+      {
+        x: 56,
+        y: 80,
+        size: 7.2,
+        font: fontMono,
+        color: rgb(0.15, 0.15, 0.15),
+      },
+    );
+    page.drawText(
+      `Vigencia Contractual   : ${info.fechaInicioFormateada} al ${info.fechaCaducidadFormateada} (${info.tiempoCaducidadTexto})`,
+      {
+        x: 56,
+        y: 67,
+        size: 7.2,
+        font: fontMono,
+        color: rgb(0.15, 0.15, 0.15),
+      },
+    );
+    page.drawText(
+      'Documento electronico oficial valido conforme a la Ley N° 19.799 y Ley N° 21.663 de la Republica de Chile.',
+      {
+        x: 56,
+        y: 55,
+        size: 6.8,
+        font: fontRegular,
+        color: rgb(0.35, 0.35, 0.35),
+      },
+    );
 
     const pdfBytes = await pdfDoc.save();
     return Buffer.from(pdfBytes);

@@ -4,7 +4,6 @@ import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 export enum EstadoHardwareEnum {
   DESCONECTADO = 'DESCONECTADO',
   CONECTADO = 'CONECTADO',
-  FIRMANDO = 'FIRMANDO',
 }
 
 export class TelemetriaUsbDto {

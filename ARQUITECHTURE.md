@@ -44,8 +44,7 @@
     - **Accesibilidad y Legibilidad:** Conformidad con el estándar WCAG 2.1 nivel AA (alto contraste, tipografía institucional clara, formularios estructurados).
     - **Paleta Semántica Controlada:** Fondos neutros, escalas de grises y azul institucional (`#003366`); el uso de colores saturados se reserva estrictamente para estados críticos de telemetría de hardware:
       - 🔴 **Desconectado:** Sin token físico detectado.
-      - 🟡 **Conectado:** Token presente en la ranura USB y validado en reposo.
-      - 🟢 **Firmando / Activo:** Proceso criptográfico en ejecución activa.
+      - 🟢 **Conectado:** Token presente en la ranura USB y validado.
   - **Estilos & Componentes:** **Tailwind CSS** + iconos limpios (**Lucide Icons**).
   - **Gestión de Estado & Sincronización:** **Zustand** para la gestión de estados globales reactivos y eventos en vivo del WebSocket + **TanStack Query (React Query)** para caché y deduplicación de peticiones REST.
   - **Portal Público Checksign:** Verificador de autenticidad documental mediante cálculo de hash SHA-256 e inspección de sellos de tiempo RFC 3161 y acreditación de prestador (Ley N° 19.799).
@@ -88,8 +87,7 @@
     4. **Módulo Información y Monitoreo (Dashboard en Vivo):**
        - Panel de supervisión con actualización por WebSockets:
          - 🔴 **DESCONECTADO:** Estación sin token detectado.
-         - 🟡 **CONECTADO:** Token presente y validado físicamente en el equipo.
-         - 🟢 **FIRMANDO / ACTIVO:** Proceso criptográfico en ejecución.
+         - 🟢 **CONECTADO:** Token presente y validado físicamente en el equipo.
        - Clasificación documental: *Pública, Interna, Confidencial, Crítica*.
        - Portal `Checksign` de validación de autenticidad documental.
 
@@ -142,7 +140,7 @@
   valido_hasta, estado.
   • tokens_hardware: id, serial_number, vendor_id, marca, modelo, estado_patrimonial.
   • estaciones_trabajo: id, codigo_pc (hostname), ip_asignada, dependencia_fisica, ultimo_ping.
-  • telemetria_eventos: id, codigo_pc, token_id, evento (CONECTADO, DESCONECTADO, FIRMANDO),
+  • telemetria_eventos: id, codigo_pc, token_id, evento (CONECTADO, DESCONECTADO),
   timestamp, metadatos_jsonb.
   • solicitudes_firma: id, usuario_solicitante_id, tipo_tramite, estado_aprobacion,
   flujo_visacion_jsonb.
