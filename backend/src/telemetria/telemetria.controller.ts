@@ -2,6 +2,7 @@ import { Controller, Post, Body, Get, Query, Req, Res, HttpCode, HttpStatus } fr
 import { ApiTags, ApiOperation, ApiResponse, ApiBearerAuth } from '@nestjs/swagger';
 import { Request, Response } from 'express';
 import { TelemetriaService } from './telemetria.service';
+import { SeedService } from '../prisma/seed.service';
 import { TelemetriaUsbDto } from './dto/telemetria-usb.dto';
 import { Public, Roles } from '../common/auth.guards';
 import * as fs from 'fs';
@@ -10,7 +11,25 @@ import * as fs from 'fs';
 @ApiBearerAuth()
 @Controller('api/v1/telemetria')
 export class TelemetriaController {
-  constructor(private readonly telemetriaService: TelemetriaService) {}
+  constructor(
+    private readonly telemetriaService: TelemetriaService,
+    private readonly seedService: SeedService,
+  ) {}
+
+  @Public()
+  @Post('seed-test')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({
+    summary: 'Poblar / restaurar flujo completo de datos de prueba para el entorno de test',
+  })
+  async poblarEntornoTest() {
+    await this.seedService.asegurarTablaContratosYEntornoTest(true);
+    return {
+      status: 'seeded',
+      mensaje: 'Datos de prueba del flujo de control de tokens cargados exitosamente.',
+      timestamp: new Date().toISOString(),
+    };
+  }
 
   @Public()
   @Post('usb')

@@ -20,7 +20,7 @@ export class SeedService implements OnModuleInit {
     await this.sincronizarRedisInicial();
   }
 
-  async asegurarTablaContratosYEntornoTest() {
+  async asegurarTablaContratosYEntornoTest(forzar = false) {
     try {
       await this.prisma.$executeRawUnsafe(`
         CREATE TABLE IF NOT EXISTS "contratos_tokens" (
@@ -44,60 +44,67 @@ export class SeedService implements OnModuleInit {
       `);
 
       const ahora = new Date();
-      const countContratos = await this.prisma.contratoToken.count();
-      if (countContratos === 0) {
-        const contratosSemilla = [
-          {
-            codigoContrato: 'CON-2025-TOKENS-CQM-01',
-            titulo: 'Suministro de Tokens Criptográficos USB FIPS 140-2 Nivel 3 - Lote Principal',
-            proveedor: 'E-Sign Chile S.A. / Thales SafeNet',
-            fechaInicio: new Date(ahora.getTime() - 280 * 24 * 60 * 60 * 1000),
-            fechaCaducidad: new Date(ahora.getTime() + 450 * 24 * 60 * 60 * 1000),
-            cantidadTokens: 25,
-            montoReferencial: 'OC N° 4291-188-CM25 (UTM 185)',
-            descripcion:
-              'Contrato anual renovable para provisión de dispositivos eToken 5110 CC y certificados de Firma Electrónica Avanzada.',
-            documentoUrl: '/api/v1/equipamiento/contratos/CON-2025-TOKENS-CQM-01/pdf',
-          },
-          {
-            codigoContrato: 'CON-2026-TOKENS-THALES-02',
-            titulo: 'Renovación de Tokens Criptográficos IDPrime Direcciones Operativas',
-            proveedor: 'Thales Cloud Protection & Licensing / SEGPRES',
-            fechaInicio: new Date(ahora.getTime() - 320 * 24 * 60 * 60 * 1000),
-            fechaCaducidad: new Date(ahora.getTime() + 38 * 24 * 60 * 60 * 1000),
-            cantidadTokens: 15,
-            montoReferencial: 'OC N° 4291-512-CM26 (UTM 110)',
-            descripcion:
-              'Lote complementario de dispositivos criptográficos USB para Secretaría Municipal, Jurídica y Finanzas.',
-            documentoUrl: '/api/v1/equipamiento/contratos/CON-2026-TOKENS-THALES-02/pdf',
-          },
-          {
-            codigoContrato: 'CON-2024-TOKENS-ATHENA-03',
-            titulo: 'Adquisición Histórica Tokens Athena IDProtect Key v2',
-            proveedor: 'Athena Smartcard Solutions / Certinet',
-            fechaInicio: new Date(ahora.getTime() - 760 * 24 * 60 * 60 * 1000),
-            fechaCaducidad: new Date(ahora.getTime() - 25 * 24 * 60 * 60 * 1000),
-            cantidadTokens: 10,
-            montoReferencial: 'OC N° 4291-044-CM24 (UTM 75)',
-            descripcion:
-              'Contrato histórico finalizado de dispositivos Athena IDProtect sujetos a recambio tecnológico.',
-            documentoUrl: '/api/v1/equipamiento/contratos/CON-2024-TOKENS-ATHENA-03/pdf',
-          },
-        ];
+      const contratosSemilla = [
+        {
+          codigoContrato: 'CON-2025-TOKENS-CQM-01',
+          titulo: 'Suministro de Tokens Criptográficos USB FIPS 140-2 Nivel 3 - Lote Principal',
+          proveedor: 'E-Sign Chile S.A. / Thales SafeNet',
+          fechaInicio: new Date(ahora.getTime() - 280 * 24 * 60 * 60 * 1000),
+          fechaCaducidad: new Date(ahora.getTime() + 450 * 24 * 60 * 60 * 1000),
+          cantidadTokens: 25,
+          montoReferencial: 'OC N° 4291-188-CM25 (UTM 185)',
+          descripcion:
+            'Contrato anual renovable para provisión de dispositivos eToken 5110 CC y certificados de Firma Electrónica Avanzada.',
+          documentoUrl: '/api/v1/equipamiento/contratos/CON-2025-TOKENS-CQM-01/pdf',
+        },
+        {
+          codigoContrato: 'CON-2026-TOKENS-THALES-02',
+          titulo: 'Renovación de Tokens Criptográficos IDPrime Direcciones Operativas',
+          proveedor: 'Thales Cloud Protection & Licensing / SEGPRES',
+          fechaInicio: new Date(ahora.getTime() - 320 * 24 * 60 * 60 * 1000),
+          fechaCaducidad: new Date(ahora.getTime() + 38 * 24 * 60 * 60 * 1000),
+          cantidadTokens: 15,
+          montoReferencial: 'OC N° 4291-512-CM26 (UTM 110)',
+          descripcion:
+            'Lote complementario de dispositivos criptográficos USB para Secretaría Municipal, Jurídica y Finanzas.',
+          documentoUrl: '/api/v1/equipamiento/contratos/CON-2026-TOKENS-THALES-02/pdf',
+        },
+        {
+          codigoContrato: 'CON-2026-TOKENS-FEITIAN-03',
+          titulo: 'Adquisición Tokens Feitian ePass2003-Auto FIPS Unidades Operativas',
+          proveedor: 'Feitian Technologies / Acepta.com',
+          fechaInicio: new Date(ahora.getTime() - 95 * 24 * 60 * 60 * 1000),
+          fechaCaducidad: new Date(ahora.getTime() + 270 * 24 * 60 * 60 * 1000),
+          cantidadTokens: 20,
+          montoReferencial: 'OC N° 4291-640-CM26 (UTM 140)',
+          descripcion:
+            'Dotación de tokens criptográficos para Dirección de Obras, Tránsito y Control Interno.',
+          documentoUrl: '/api/v1/equipamiento/contratos/CON-2026-TOKENS-FEITIAN-03/pdf',
+        },
+        {
+          codigoContrato: 'CON-2024-TOKENS-ATHENA-03',
+          titulo: 'Adquisición Histórica Tokens Athena IDProtect Key v2',
+          proveedor: 'Athena Smartcard Solutions / Certinet',
+          fechaInicio: new Date(ahora.getTime() - 760 * 24 * 60 * 60 * 1000),
+          fechaCaducidad: new Date(ahora.getTime() - 25 * 24 * 60 * 60 * 1000),
+          cantidadTokens: 10,
+          montoReferencial: 'OC N° 4291-044-CM24 (UTM 75)',
+          descripcion:
+            'Contrato histórico finalizado de dispositivos Athena IDProtect sujetos a recambio tecnológico.',
+          documentoUrl: '/api/v1/equipamiento/contratos/CON-2024-TOKENS-ATHENA-03/pdf',
+        },
+      ];
 
-        for (const c of contratosSemilla) {
-          await this.prisma.contratoToken.upsert({
-            where: { codigoContrato: c.codigoContrato },
-            update: c,
-            create: c,
-          });
-        }
-        this.logger.log('[Entorno Test] Contratos de obtención de tokens inicializados.');
+      for (const c of contratosSemilla) {
+        await this.prisma.contratoToken.upsert({
+          where: { codigoContrato: c.codigoContrato },
+          update: c,
+          create: c,
+        });
       }
 
-      // Poblar dispositivos, funcionarios, vigencias (15, 30, 60 días, vigentes y expirados) y acciones de firma si no existen tokens
       const countTokens = await this.prisma.tokenHardware.count();
-      if (countTokens === 0) {
+      if (countTokens < 6 || forzar) {
         const funcionariosTest = [
           {
             rut: '16.892.415-3',
@@ -110,9 +117,26 @@ export class SeedService implements OnModuleInit {
             marca: 'Thales / SafeNet',
             modelo: 'eToken 5110 CC (FIPS 140-2 L3)',
             vendorId: '0x0529',
-            diasVigencia: 11, // Umbral <= 15 días (Crítico)
+            diasVigencia: 9, // <= 15 días (Crítico)
             codigoPc: 'PC-TRANSITO-01',
-            firmasRecientes: [0, 1, 2, 4, 6, 10, 18, 25],
+            estadoPc: 'FIRMANDO',
+            firmasRecientes: [0, 0, 1, 2, 3, 5, 8, 12, 18, 25, 45],
+          },
+          {
+            rut: '14.512.309-7',
+            nombre: 'Patricia Elena Gómez Tapia',
+            email: 'pgomez@municoquimbo.cl',
+            cargo: 'Encargada de Decretos Alcaldicios',
+            unidad: 'Secretaría Municipal',
+            rol: 'FUNCIONARIO' as const,
+            serialNumber: 'SN-0529-CQM-7714',
+            marca: 'Thales / SafeNet',
+            modelo: 'eToken 5110 CC (FIPS 140-2 L3)',
+            vendorId: '0x0529',
+            diasVigencia: 14, // <= 15 días (Crítico)
+            codigoPc: 'PC-SECMUN-02',
+            estadoPc: 'CONECTADO',
+            firmasRecientes: [0, 1, 2, 4, 6, 9, 14, 21, 33, 60],
           },
           {
             rut: '15.432.890-K',
@@ -125,9 +149,26 @@ export class SeedService implements OnModuleInit {
             marca: 'Thales / SafeNet',
             modelo: 'eToken 5110 CC (FIPS 140-2 L3)',
             vendorId: '0x0529',
-            diasVigencia: 24, // Umbral <= 30 días (Media)
+            diasVigencia: 22, // <= 30 días (Media)
             codigoPc: 'PC-SECMUN-01',
-            firmasRecientes: [0, 1, 1, 3, 5, 8, 12, 14, 21, 28, 42],
+            estadoPc: 'CONECTADO',
+            firmasRecientes: [0, 1, 1, 3, 5, 7, 10, 13, 19, 27, 40, 75],
+          },
+          {
+            rut: '17.304.881-2',
+            nombre: 'Diego Ignacio Vargas Muñoz',
+            email: 'dvargas@municoquimbo.cl',
+            cargo: 'Auditor de Control Interno',
+            unidad: 'Dirección de Control Interno',
+            rol: 'SUPERVISOR' as const,
+            serialNumber: 'SN-08E6-CQM-5521',
+            marca: 'Thales / Gemalto',
+            modelo: 'IDPrime MD 840 Token USB',
+            vendorId: '0x08E6',
+            diasVigencia: 28, // <= 30 días (Media)
+            codigoPc: 'PC-CONTROL-01',
+            estadoPc: 'CONECTADO',
+            firmasRecientes: [1, 2, 5, 8, 11, 16, 24, 52],
           },
           {
             rut: '13.765.112-8',
@@ -140,9 +181,26 @@ export class SeedService implements OnModuleInit {
             marca: 'Thales / Gemalto',
             modelo: 'IDPrime MD 840 Token USB',
             vendorId: '0x08E6',
-            diasVigencia: 48, // Umbral <= 60 días (Preventivo)
+            diasVigencia: 46, // <= 60 días (Preventivo)
             codigoPc: 'PC-DAF-02',
-            firmasRecientes: [2, 5, 9, 13, 19, 27],
+            estadoPc: 'CONECTADO',
+            firmasRecientes: [0, 2, 4, 9, 13, 19, 26, 38, 90],
+          },
+          {
+            rut: '19.045.672-6',
+            nombre: 'Valentina Paz Olivares Castro',
+            email: 'volivares@municoquimbo.cl',
+            cargo: 'Coordinadora de Adquisiciones',
+            unidad: 'Dirección de Administración y Finanzas',
+            rol: 'FUNCIONARIO' as const,
+            serialNumber: 'SN-096E-CQM-6190',
+            marca: 'Feitian Technologies',
+            modelo: 'ePass2003-Auto FIPS',
+            vendorId: '0x096E',
+            diasVigencia: 55, // <= 60 días (Preventivo)
+            codigoPc: 'PC-ADQUISICIONES-01',
+            estadoPc: 'DESCONECTADO',
+            firmasRecientes: [2, 6, 12, 17, 23, 48],
           },
           {
             rut: '18.210.554-1',
@@ -157,7 +215,8 @@ export class SeedService implements OnModuleInit {
             vendorId: '0x096E',
             diasVigencia: 215, // Vigente (> 60 días)
             codigoPc: 'PC-JURIDICA-01',
-            firmasRecientes: [1, 3, 6, 11, 15, 22, 35],
+            estadoPc: 'CONECTADO',
+            firmasRecientes: [0, 1, 3, 6, 11, 15, 22, 35, 64],
           },
           {
             rut: '11.998.234-5',
@@ -172,7 +231,24 @@ export class SeedService implements OnModuleInit {
             vendorId: '0x0DC3',
             diasVigencia: -16, // Expirado
             codigoPc: 'PC-DOM-03',
-            firmasRecientes: [20, 26, 50],
+            estadoPc: 'DESCONECTADO',
+            firmasRecientes: [20, 26, 50, 85],
+          },
+          {
+            rut: '10.654.321-9',
+            nombre: 'Fernando Luis Castillo Rivera',
+            email: 'fcastillo@municoquimbo.cl',
+            cargo: 'Arquitecto Revisor DOM',
+            unidad: 'Dirección de Obras Municipales (DOM)',
+            rol: 'FUNCIONARIO' as const,
+            serialNumber: 'SN-0DC3-CQM-1088',
+            marca: 'Athena Smartcard',
+            modelo: 'IDProtect Key USB v2',
+            vendorId: '0x0DC3',
+            diasVigencia: -34, // Expirado
+            codigoPc: 'PC-DOM-04',
+            estadoPc: 'DESCONECTADO',
+            firmasRecientes: [38, 55, 110],
           },
         ];
 
@@ -226,82 +302,128 @@ export class SeedService implements OnModuleInit {
               ? 'POR_VENCER'
               : 'VIGENTE';
 
-          await this.prisma.certificado.create({
-            data: {
-              numeroSerie: `CERT-FEA-${item.serialNumber.slice(-8)}`,
-              usuarioId: user.id,
-              tokenHardwareId: token.id,
-              tipo: 'FIRMAGOB',
-              custodia: 'TOKEN_FISICO',
-              validoHasta,
-              estado: estadoCert as any,
-              createdAt: new Date(ahora.getTime() - 180 * 24 * 60 * 60 * 1000),
-            },
+          const numeroSerieCert = `CERT-FEA-${item.serialNumber.slice(-8)}`;
+          const certExistente = await this.prisma.certificado.findFirst({
+            where: { tokenHardwareId: token.id },
           });
 
-          const estadoPc = item.diasVigencia > 0 ? 'CONECTADO' : 'DESCONECTADO';
+          if (certExistente) {
+            await this.prisma.certificado.update({
+              where: { id: certExistente.id },
+              data: {
+                usuarioId: user.id,
+                validoHasta,
+                estado: estadoCert as any,
+              },
+            });
+          } else {
+            await this.prisma.certificado.create({
+              data: {
+                numeroSerie: numeroSerieCert,
+                usuarioId: user.id,
+                tokenHardwareId: token.id,
+                tipo: 'FIRMAGOB',
+                custodia: 'TOKEN_FISICO',
+                validoHasta,
+                estado: estadoCert as any,
+                createdAt: new Date(ahora.getTime() - 180 * 24 * 60 * 60 * 1000),
+              },
+            });
+          }
+
+          const actasCount = await this.prisma.actaCustodia.count({
+            where: { tokenId: token.id },
+          });
+          if (actasCount === 0) {
+            const codigoActa = `ACTA-TIC-2026-${item.serialNumber.slice(-4)}`;
+            await this.prisma.actaCustodia
+              .create({
+                data: {
+                  codigoActa,
+                  tokenId: token.id,
+                  usuarioId: user.id,
+                  tipoActa: 'ENTREGA',
+                  observaciones: JSON.stringify({
+                    detalle: `Entrega oficial de token criptográfico ${item.serialNumber} (${item.marca} ${item.modelo}).`,
+                    emisor: {
+                      rut: '21.374.808-4',
+                      nombre: 'Daniel Alejandro Trigo Tabilo',
+                      cargo: 'Administrador General de Sistemas',
+                    },
+                  }),
+                  hashSha256: `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852${item.serialNumber.slice(-4).toLowerCase()}`,
+                  documentoFirmadoUrl: `/api/v1/equipamiento/actas/${codigoActa}/pdf`,
+                  createdAt: new Date(ahora.getTime() - 175 * 24 * 60 * 60 * 1000),
+                },
+              })
+              .catch(() => {});
+          }
+
           await this.prisma.estacionTrabajo.upsert({
             where: { codigoPc: item.codigoPc },
             update: {
               dependenciaFisica: item.unidad,
-              estadoHardware: estadoPc as any,
-              serialTokenActivo: estadoPc === 'CONECTADO' ? item.serialNumber : null,
+              estadoHardware: item.estadoPc as any,
+              serialTokenActivo: item.estadoPc !== 'DESCONECTADO' ? item.serialNumber : null,
               ultimoPing: ahora,
             },
             create: {
               codigoPc: item.codigoPc,
-              ipAsignada: `10.10.14.${10 + Math.floor(Math.random() * 80)}`,
+              ipAsignada: `10.10.14.${15 + Math.floor(Math.random() * 70)}`,
               dependenciaFisica: item.unidad,
-              estadoHardware: estadoPc as any,
-              serialTokenActivo: estadoPc === 'CONECTADO' ? item.serialNumber : null,
+              estadoHardware: item.estadoPc as any,
+              serialTokenActivo: item.estadoPc !== 'DESCONECTADO' ? item.serialNumber : null,
               ultimoPing: ahora,
             },
           });
 
-          // Registrar acciones de firma (FIRMANDO) y eventos de conexión/desconexión (CONECTADO/DESCONECTADO)
-          for (const diasAtras of item.firmasRecientes) {
-            const fechaEv = new Date(
-              ahora.getTime() - diasAtras * 24 * 60 * 60 * 1000 - Math.floor(Math.random() * 3600000),
-            );
-            // Conexión previa del dispositivo (NO cuenta como acción de firma)
-            await this.prisma.telemetriaEvento.create({
-              data: {
-                codigoPc: item.codigoPc,
-                tokenId: token.id,
-                evento: 'CONECTADO',
-                timestamp: new Date(fechaEv.getTime() - 120000),
-                metadatosJsonb: {
-                  serialNumber: item.serialNumber,
-                  usuarioId: user.id,
-                  funcionarioRut: user.rut,
-                  funcionarioNombre: user.nombre,
-                  stateChanged: true,
+          const evCount = await this.prisma.telemetriaEvento.count({
+            where: { tokenId: token.id },
+          });
+
+          if (evCount === 0 || forzar) {
+            for (const diasAtras of item.firmasRecientes) {
+              const fechaEv = new Date(
+                ahora.getTime() - diasAtras * 24 * 60 * 60 * 1000 - Math.floor(Math.random() * 3600000),
+              );
+              await this.prisma.telemetriaEvento.create({
+                data: {
+                  codigoPc: item.codigoPc,
+                  tokenId: token.id,
+                  evento: 'CONECTADO',
+                  timestamp: new Date(fechaEv.getTime() - 180000),
+                  metadatosJsonb: {
+                    serialNumber: item.serialNumber,
+                    usuarioId: user.id,
+                    funcionarioRut: user.rut,
+                    funcionarioNombre: user.nombre,
+                    stateChanged: true,
+                  },
                 },
-              },
-            });
-            // Acción de firma efectiva con el token en sesión (SÍ cuenta como acción de firma)
-            await this.prisma.telemetriaEvento.create({
-              data: {
-                codigoPc: item.codigoPc,
-                tokenId: token.id,
-                evento: 'FIRMANDO',
-                timestamp: fechaEv,
-                metadatosJsonb: {
-                  accionFirma: true,
-                  serialNumber: item.serialNumber,
-                  usuarioId: user.id,
-                  funcionarioRut: user.rut,
-                  funcionarioNombre: user.nombre,
-                  unidad: user.unidad,
-                  glosaAccion: 'Firma electrónica de documento municipal con token en sesión',
-                  stateChanged: true,
+              });
+              await this.prisma.telemetriaEvento.create({
+                data: {
+                  codigoPc: item.codigoPc,
+                  tokenId: token.id,
+                  evento: 'FIRMANDO',
+                  timestamp: fechaEv,
+                  metadatosJsonb: {
+                    accionFirma: true,
+                    serialNumber: item.serialNumber,
+                    usuarioId: user.id,
+                    funcionarioRut: user.rut,
+                    funcionarioNombre: user.nombre,
+                    unidad: item.unidad,
+                    glosaAccion: 'Firma electrónica con token realizada desde sesión activa',
+                    stateChanged: true,
+                  },
                 },
-              },
-            });
+              });
+            }
           }
         }
         this.logger.log(
-          '[Entorno Test] Tokens, firmas asignadas (15/30/60 días, vigentes y expirados) y acciones por funcionario inicializados.',
+          '[Entorno Test] Flujo completo de datos de prueba (contratos, tokens activos/expirados, alertas 15/30/60d y acciones de firma) asegurado.',
         );
       }
     } catch (err) {
