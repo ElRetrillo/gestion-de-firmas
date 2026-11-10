@@ -188,6 +188,7 @@ export class TelemetriaController {
     @Res() res: Response,
     @Query('formato') formato?: string,
     @Query('unidad') unidad?: string,
+    @Query('rut') rut?: string,
   ) {
     const proto = (req.headers['x-forwarded-proto'] as string) || req.protocol || 'http';
     const host = req.get('host') || 'localhost:3001';
@@ -195,6 +196,7 @@ export class TelemetriaController {
       `${proto}://${host}`,
       formato,
       unidad || 'Red Interna Municipal - Coquimbo',
+      rut,
     );
 
     if (paquete.tipo === 'exe' && paquete.filePath && fs.existsSync(paquete.filePath)) {

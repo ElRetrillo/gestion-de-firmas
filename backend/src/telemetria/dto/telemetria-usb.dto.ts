@@ -55,6 +55,16 @@ export class TelemetriaUsbDto {
   @IsOptional()
   timestamp?: string;
 
+  @ApiPropertyOptional({ description: 'RUT del usuario para registro/asociación de Token USB', example: '21.374.808-4' })
+  @IsString()
+  @IsOptional()
+  rutUsuario?: string;
+
+  @ApiPropertyOptional({ description: 'Hash criptográfico SHA-256 del token hardware', example: 'a1b2c3d4...' })
+  @IsString()
+  @IsOptional()
+  tokenHash?: string;
+
   @ApiPropertyOptional({ description: 'Metadatos forenses en formato JSON', example: { os: 'Windows 11 Enterprise', appVersion: '1.2.0' } })
   @IsObject()
   @IsOptional()

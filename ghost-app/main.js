@@ -75,6 +75,11 @@ function loadConfig() {
     45000,
   );
 
+  const rutUsuario =
+    process.env.RUT_USUARIO ||
+    fileConfig.rutUsuario ||
+    null;
+
   // Directorio portable y resiliente para la cola offline en cualquier usuario de Windows
   const appDataRoot = process.env.LOCALAPPDATA || process.env.APPDATA || os.tmpdir();
   const queueDir = path.join(appDataRoot, 'CoquimboGhostApp');
@@ -96,6 +101,7 @@ function loadConfig() {
     dependencia,
     pollInterval,
     heartbeatInterval,
+    rutUsuario,
     queueFile,
   };
 }
@@ -107,6 +113,7 @@ const HOSTNAME = CONFIG.hostname;
 const DEPENDENCIA_FISICA = CONFIG.dependencia;
 const POLL_INTERVAL_MS = CONFIG.pollInterval;
 const HEARTBEAT_INTERVAL_MS = CONFIG.heartbeatInterval;
+const RUT_USUARIO = CONFIG.rutUsuario;
 const OFFLINE_QUEUE_FILE = CONFIG.queueFile;
 
 // Catálogo de Vendor IDs oficiales de Tokens Criptográficos Acreditados (Ley N° 19.799)
@@ -369,6 +376,16 @@ async function monitorUsbLoop() {
       }
     }
 
+    // Calcular hash criptográfico SHA-256 del Token si está conectado
+    let tokenHash = undefined;
+    if (detectedToken && detectedToken.serialNumber) {
+      const crypto = require('crypto');
+      tokenHash = crypto
+        .createHash('sha256')
+        .update(`${detectedToken.vendorId || '0529'}:${detectedToken.serialNumber}:${detectedToken.marca || 'Token'}`)
+        .digest('hex');
+    }
+
     const payload = {
       codigoPc: HOSTNAME,
       estadoHardware: currentState,
@@ -376,6 +393,8 @@ async function monitorUsbLoop() {
       vendorId: detectedToken ? detectedToken.vendorId : undefined,
       marca: detectedToken ? detectedToken.marca : undefined,
       modelo: detectedToken ? detectedToken.modelo : undefined,
+      rutUsuario: RUT_USUARIO || undefined,
+      tokenHash: tokenHash,
       ipAsignada: getLocalIpAddress(),
       dependenciaFisica: DEPENDENCIA_FISICA,
       timestamp: new Date().toISOString(),
@@ -383,6 +402,7 @@ async function monitorUsbLoop() {
         osPlatform: `${os.type()} ${os.release()}`,
         hostname: os.hostname(),
         agentVersion: '2.1.0-headless',
+        rutUsuario: RUT_USUARIO || undefined,
         stateChanged: stateChanged || (isFirstScan && currentState === 'CONECTADO'),
         isHeartbeat: !stateChanged && !isFirstScan,
         previousSerialNumber: !detectedToken && lastKnownToken ? lastKnownToken.serialNumber : undefined,

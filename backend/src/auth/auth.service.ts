@@ -187,6 +187,8 @@ export class AuthService {
       estado: u.estado,
       pinBloqueado: u.pinBloqueado,
       debeCambiarPassword: !!u.debeCambiarPassword,
+      tokenHash: u.tokenHash || null,
+      tokenRegistrado: !!u.tokenHash,
       ...(u.certificados ? { certificados: u.certificados } : {}),
     };
   }

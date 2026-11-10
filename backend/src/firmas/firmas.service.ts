@@ -347,6 +347,31 @@ export class FirmasService {
         orderBy: { ultimoPing: 'desc' },
       });
 
+      // Verificación de identidad y hardware:
+      // Si el usuario tiene un Token USB registrado (tokenHash en DB), verificar que el token conectado
+      // en la estación actual coincida con su identidad, o bien que el serial coincida.
+      if (modalidad === 'ATENDIDA' && firmante?.tokenHash) {
+        if (!estacionActiva || !estacionActiva.serialTokenActivo) {
+          throw new BadRequestException(
+            'Para firmar como ' + (firmante.nombre || firmante.rut) + ' debe tener su Token USB insertado en su estación de trabajo con el Agente Ghost activo.',
+          );
+        }
+        // Buscar el token conectado en la base de datos
+        const tokenConectado = await this.prisma.tokenHardware.findUnique({
+          where: { serialNumber: estacionActiva.serialTokenActivo },
+        });
+        const hashCalculadoConectado = crypto
+          .createHash('sha256')
+          .update(`${tokenConectado?.vendorId || '0529'}:${estacionActiva.serialTokenActivo}:${tokenConectado?.marca || 'Token'}`)
+          .digest('hex');
+
+        if (firmante.tokenHash !== hashCalculadoConectado) {
+          throw new BadRequestException(
+            `El Token USB conectado (S/N: ${estacionActiva.serialTokenActivo}) no coincide con el token registrado para ${firmante.nombre}. Verificación de identidad fallida.`,
+          );
+        }
+      }
+
       const serialTokenDetectado =
         estacionActiva?.serialTokenActivo ||
         firmante?.certificados?.[0]?.tokenHardware?.serialNumber ||

@@ -100,6 +100,7 @@ model Usuario {
   pinBloqueado        Boolean           @default(false) @map("pin_bloqueado")
   debeCambiarPassword Boolean           @default(false) @map("debe_cambiar_password")
   condicionContractual String           @default("CONTRATA") @map("condicion_contractual")
+  tokenHash           String?          @map("token_hash")
   certificados        Certificado[]
   solicitudesFirma    SolicitudFirma[]
   actasCustodia       ActaCustodia[]

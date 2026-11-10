@@ -22,6 +22,11 @@ if %errorlevel% neq 0 (
   exit /b 1
 )
 
+:: Opcion para pasar RUT por parametro o solicitarlo interactivamente si no esta en config.json
+if not "%~1"=="" (
+  set "RUT_USUARIO=%~1"
+)
+
 node main.js
 if %errorlevel% neq 0 (
   echo.

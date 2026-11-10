@@ -75,6 +75,16 @@ export class TelemetriaService {
       modelo?: string;
     } | null = null;
 
+    // Calcular o recibir el hash identificador único del token USB (SHA-256)
+    const tokenHashCalculado =
+      dto.tokenHash ||
+      (!isDesconectado && dto.serialNumber
+        ? crypto
+            .createHash('sha256')
+            .update(`${dto.vendorId || '0529'}:${dto.serialNumber}:${dto.marca || 'Token'}`)
+            .digest('hex')
+        : null);
+
     if (!isDesconectado && dto.serialNumber) {
       try {
         const token = await this.prisma.tokenHardware.upsert({
@@ -98,6 +108,54 @@ export class TelemetriaService {
           marca: token.marca,
           modelo: token.modelo,
         };
+
+        // Si se envió un RUT de usuario (al loguearse o registrarse), asociar el ID hasheado al usuario
+        const rutIdentificado =
+          dto.rutUsuario ||
+          (dto.metadatos?.rutUsuario as string | undefined) ||
+          (dto.metadatos?.rut as string | undefined);
+
+        if (rutIdentificado && tokenHashCalculado) {
+          const userObj = await this.prisma.usuario.findFirst({
+            where: {
+              OR: [
+                { rut: rutIdentificado },
+                { rut: rutIdentificado.replace(/[.-]/g, '') },
+              ],
+            },
+            include: { certificados: true },
+          });
+
+          if (userObj) {
+            await this.prisma.usuario.update({
+              where: { id: userObj.id },
+              data: { tokenHash: tokenHashCalculado },
+            });
+            this.logger.log(
+              `[TOKEN_HASH_VINCULADO] Token USB S/N=${dto.serialNumber} hasheado (${tokenHashCalculado.slice(0, 12)}...) vinculado al usuario RUT=${userObj.rut} (${userObj.nombre})`,
+            );
+
+            // Asegurar que tenga certificado activo vinculado a este tokenHardware
+            if (!userObj.certificados || userObj.certificados.length === 0) {
+              await this.prisma.certificado.create({
+                data: {
+                  numeroSerie: `CERT-${dto.serialNumber.replace(/[^A-Za-z0-9]/g, '')}`,
+                  usuarioId: userObj.id,
+                  tipo: 'FIRMAGOB',
+                  custodia: 'TOKEN_FISICO',
+                  validoHasta: new Date(Date.now() + 365 * 24 * 3600 * 1000),
+                  estado: 'VIGENTE',
+                  tokenHardwareId: token.id,
+                },
+              });
+            } else if (!userObj.certificados[0].tokenHardwareId) {
+              await this.prisma.certificado.update({
+                where: { id: userObj.certificados[0].id },
+                data: { tokenHardwareId: token.id },
+              });
+            }
+          }
+        }
       } catch (err) {
         this.logger.warn(`No se pudo upsertar tokenHardware: ${(err as Error).message}`);
         tokenInfo = {
@@ -372,6 +430,7 @@ export class TelemetriaService {
     baseUrl = 'http://localhost:3001',
     formato?: string,
     dependenciaFisica = 'Red Interna Municipal - Coquimbo',
+    rutUsuario?: string,
   ): {
     tipo: 'exe' | 'autoinstalador';
     filename: string;
@@ -401,6 +460,7 @@ export class TelemetriaService {
         apiUrl: `${baseUrl}/api/v1/telemetria/usb`,
         apiKey,
         dependenciaFisica,
+        rutUsuario: rutUsuario || undefined,
         pollIntervalMs: 2000,
         heartbeatIntervalMs: 45000,
       },
