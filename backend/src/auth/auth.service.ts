@@ -612,8 +612,18 @@ export class AuthService {
    * Valida si un código de 6 dígitos ingresado coincide con el OTP TOTP en tiempo real del usuario
    */
   async verificarCodigoTotpUsuario(rutOrUserId: string, codigo: string): Promise<boolean> {
+    const cleanQuery = (rutOrUserId || '').replace(/[^0-9kK]/g, '').toUpperCase();
     const usuario = await this.prisma.usuario.findFirst({
-      where: { OR: [{ id: rutOrUserId }, { rut: rutOrUserId }] },
+      where: {
+        OR: [
+          { id: rutOrUserId },
+          { rut: rutOrUserId },
+          ...(cleanQuery.length >= 7 ? [
+            { rut: { contains: cleanQuery.slice(0, 8) } },
+            { rut: { contains: cleanQuery } }
+          ] : [])
+        ]
+      },
     });
     if (!usuario) return false;
 
