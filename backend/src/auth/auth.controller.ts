@@ -136,4 +136,11 @@ export class AuthController {
   async regenerarTotp(@Req() req: any) {
     return this.authService.regenerarSecretoTotp(req.user.sub || req.user.rut);
   }
+
+  @Post('logout')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Registrar cierre de sesión (Sign Out) en bitácora de auditoría' })
+  async logout(@Req() req: any) {
+    return this.authService.logout(req.user, ipDe(req));
+  }
 }

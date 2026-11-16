@@ -6,6 +6,7 @@ import {
   Param,
   Query,
   Res,
+  Req,
   Headers,
   HttpCode,
   HttpStatus,
@@ -71,6 +72,45 @@ export class FirmasController {
     @Body() dto: FirmarSolicitudIndividualDto,
   ) {
     return this.firmasService.firmarSolicitudIndividual(id, dto);
+  }
+
+  @Post('pades/preparar')
+  @ApiOperation({
+    summary: 'Prepara un PDF con sello visual y ByteRange PAdES para ser firmado por el token USB local',
+  })
+  async prepararPadesToken(
+    @Body()
+    body: {
+      pdfBase64: string;
+      nombreDocumento?: string;
+      layoutXml?: string;
+      firmanteNombre?: string;
+      firmanteRut?: string;
+    },
+    @Req() req: any,
+  ) {
+    return this.firmasService.prepararPdfParaTokenPades(body, req.user);
+  }
+
+  @Post('pades/completar')
+  @ApiOperation({
+    summary: 'Incrusta la firma PKCS#7 real generada por el token USB en el PDF preparado',
+  })
+  async completarPadesToken(
+    @Body()
+    body: {
+      pdfConPlaceholderBase64: string;
+      pkcs7Base64: string;
+      nombreDocumento?: string;
+      certSubject?: string;
+      certThumbprint?: string;
+      firmanteNombre?: string;
+      firmanteRut?: string;
+      tokenSerial?: string;
+    },
+    @Req() req: any,
+  ) {
+    return this.firmasService.completarPdfConPkcs7Token(body, req.user);
   }
 
   @Roles('ADMIN', 'MINISTRO_DE_FE')

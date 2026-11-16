@@ -14,6 +14,7 @@
 const os = require('os');
 const fs = require('fs');
 const path = require('path');
+const http = require('http');
 const { exec } = require('child_process');
 
 // En Node.js v18+ nativo (global fetch), permitir certificados autofirmados si NODE_TLS_REJECT_UNAUTHORIZED=0
@@ -436,11 +437,182 @@ async function handleGracefulShutdown() {
   process.exit(0);
 }
 
+function listarCertificadosTokenWindows() {
+  return new Promise((resolve) => {
+    const ps = `
+      $certs = Get-ChildItem Cert:\\CurrentUser\\My | Where-Object { $_.HasPrivateKey -eq $true } | ForEach-Object {
+        [PSCustomObject]@{
+          thumbprint = $_.Thumbprint
+          subject = $_.Subject
+          issuer = $_.Issuer
+          serialNumber = $_.SerialNumber
+          notBefore = $_.NotBefore.ToString('o')
+          notAfter = $_.NotAfter.ToString('o')
+          esExpirado = ($_.NotAfter -lt (Get-Date))
+        }
+      }
+      if ($certs) { $certs | ConvertTo-Json -Compress } else { '[]' }
+    `;
+    const encoded = Buffer.from(ps, 'utf16le').toString('base64');
+    exec(
+      `powershell -NoProfile -NonInteractive -EncodedCommand ${encoded}`,
+      { windowsHide: true, timeout: 10000 },
+      (err, stdout) => {
+        if (err || !stdout) return resolve([]);
+        try {
+          const parsed = JSON.parse(stdout.trim());
+          const arr = Array.isArray(parsed) ? parsed : [parsed];
+          resolve(
+            arr.map((c) => {
+              const cnMatch = String(c.subject || '').match(/CN=([^,]+)/i);
+              return {
+                ...c,
+                cn: cnMatch ? cnMatch[1].trim() : c.subject,
+              };
+            }),
+          );
+        } catch {
+          resolve([]);
+        }
+      },
+    );
+  });
+}
+
+function firmarPkcs7ConTokenWindows(payloadBase64, thumbprint) {
+  return new Promise((resolve, reject) => {
+    const tmpId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const tmpIn = path.join(os.tmpdir(), `cqm-sign-in-${tmpId}.bin`);
+    const tmpOut = path.join(os.tmpdir(), `cqm-sign-out-${tmpId}.json`);
+    try {
+      fs.writeFileSync(tmpIn, Buffer.from(payloadBase64, 'base64'));
+    } catch (e) {
+      return reject(new Error(`No se pudo preparar archivo temporal de firma: ${e.message}`));
+    }
+
+    const thumbFilter = thumbprint
+      ? `$cert = Get-ChildItem Cert:\\CurrentUser\\My | Where-Object { $_.HasPrivateKey -and $_.Thumbprint -eq '${String(thumbprint).replace(/[^A-Fa-f0-9]/g, '')}' } | Select-Object -First 1`
+      : `$cert = Get-ChildItem Cert:\\CurrentUser\\My | Where-Object { $_.HasPrivateKey } | Select-Object -First 1`;
+
+    const ps = `
+      $ErrorActionPreference = 'Stop'
+      Add-Type -AssemblyName System.Security
+      ${thumbFilter}
+      if (-not $cert) { throw 'No se encontró certificado con clave privada en el token USB.' }
+      $bytes = [System.IO.File]::ReadAllBytes('${tmpIn.replace(/'/g, "''")}')
+      $contentInfo = New-Object System.Security.Cryptography.Pkcs.ContentInfo(,$bytes)
+      $signedCms = New-Object System.Security.Cryptography.Pkcs.SignedCms($contentInfo, $true)
+      $signer = New-Object System.Security.Cryptography.Pkcs.CmsSigner([System.Security.Cryptography.Pkcs.SubjectIdentifierType]::IssuerAndSerialNumber, $cert)
+      $signer.DigestAlgorithm = New-Object System.Security.Cryptography.Oid('2.16.840.1.101.3.4.2.1')
+      $signer.IncludeOption = [System.Security.Cryptography.X509Certificates.X509IncludeOption]::ExcludeRoot
+      $signedCms.ComputeSignature($signer, $false)
+      $pkcs7Bytes = $signedCms.Encode()
+      $res = [PSCustomObject]@{
+        pkcs7Base64 = [Convert]::ToBase64String($pkcs7Bytes)
+        thumbprint = $cert.Thumbprint
+        subject = $cert.Subject
+        issuer = $cert.Issuer
+      }
+      $res | ConvertTo-Json -Compress | Set-Content -Path '${tmpOut.replace(/'/g, "''")}' -Encoding UTF8
+    `;
+    const encoded = Buffer.from(ps, 'utf16le').toString('base64');
+    exec(
+      `powershell -NoProfile -EncodedCommand ${encoded}`,
+      { windowsHide: false, timeout: 60000 },
+      (err, _stdout, stderr) => {
+        try {
+          if (err) {
+            return reject(new Error(stderr || err.message || 'Error al firmar con el token USB.'));
+          }
+          const jsonText = fs.readFileSync(tmpOut, 'utf8').replace(/^\uFEFF/, '').trim();
+          const parsed = JSON.parse(jsonText);
+          resolve(parsed);
+        } catch (parseErr) {
+          reject(new Error(`Error leyendo respuesta criptográfica: ${parseErr.message}`));
+        } finally {
+          try { fs.unlinkSync(tmpIn); } catch {}
+          try { fs.unlinkSync(tmpOut); } catch {}
+        }
+      },
+    );
+  });
+}
+
+function startLocalTokenSigningBridge() {
+  const PORT = Number(process.env.GHOST_SIGN_PORT || 48921);
+  const server = http.createServer(async (req, res) => {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+
+    if (req.method === 'OPTIONS') {
+      res.writeHead(204);
+      res.end();
+      return;
+    }
+
+    if (req.method === 'GET' && req.url === '/api/token/certificado') {
+      const certificados = await listarCertificadosTokenWindows();
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(
+        JSON.stringify({
+          disponible: certificados.length > 0,
+          estacion: HOSTNAME,
+          certificados,
+        }),
+      );
+      return;
+    }
+
+    if (req.method === 'POST' && req.url === '/api/token/firmar-pkcs7') {
+      let body = '';
+      req.on('data', (chunk) => {
+        body += chunk;
+        if (body.length > 25 * 1024 * 1024) {
+          req.destroy();
+        }
+      });
+      req.on('end', async () => {
+        try {
+          const parsed = JSON.parse(body || '{}');
+          if (!parsed.payloadBase64) {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'payloadBase64 es requerido' }));
+            return;
+          }
+          const resultado = await firmarPkcs7ConTokenWindows(
+            parsed.payloadBase64,
+            parsed.thumbprint,
+          );
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify(resultado));
+        } catch (err) {
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: err.message || 'Error firmando con token' }));
+        }
+      });
+      return;
+    }
+
+    res.writeHead(404, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'Ruta no encontrada' }));
+  });
+
+  server.on('error', (err) => {
+    console.warn(`[GhostAgent] Puente de firma local en puerto ${PORT} no disponible:`, err.message);
+  });
+
+  server.listen(PORT, '127.0.0.1', () => {
+    console.log(`[GhostAgent] Puente criptográfico de token activo en http://127.0.0.1:${PORT}`);
+  });
+}
+
 function startHeadlessAgent() {
   console.log(`[GhostAgent] Iniciando Agente Silencioso v2.1 en estación: ${HOSTNAME}`);
   console.log(`[GhostAgent] Destino de Telemetría: ${API_BASE_URL}`);
   console.log(`[GhostAgent] Escaneo PnP/USB activo cada ${POLL_INTERVAL_MS}ms...`);
   loadOfflineQueue();
+  startLocalTokenSigningBridge();
   monitorUsbLoop();
   setInterval(monitorUsbLoop, POLL_INTERVAL_MS);
 

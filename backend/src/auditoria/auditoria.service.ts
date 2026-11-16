@@ -42,16 +42,24 @@ export class AuditoriaService {
       });
 
       return registros
-        .map((r) => ({
-          id: r.id,
-          tablaAfectada: r.tablaAfectada,
-          registroId: r.registroId,
-          accion: r.accion,
-          usuario: r.usuario?.email || r.usuarioEmail || 'sistema@municoquimbo.cl',
-          ip: r.ipOrigen || '10.20.1.10',
-          timestamp: r.createdAt.toISOString().replace('T', ' ').slice(0, 19),
-          diffJson: r.diffJsonb,
-        }))
+        .map((r) => {
+          const diff = (r.diffJsonb && typeof r.diffJsonb === 'object' ? r.diffJsonb : {}) as Record<string, any>;
+          const rawIp = (r.ipOrigen || '10.20.1.10').replace(/^::ffff:/i, '').split('/')[0].trim();
+          const ipv4Match = rawIp.match(/\b((?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\b/);
+          const ipLimpia = ipv4Match ? ipv4Match[0] : rawIp;
+          return {
+            id: r.id,
+            tablaAfectada: r.tablaAfectada,
+            registroId: r.registroId,
+            accion: r.accion,
+            usuario: r.usuario?.email || r.usuarioEmail || 'sistema@municoquimbo.cl',
+            personaNombre: r.usuario?.nombre || diff.personaNombre || diff.firmanteNombre || null,
+            personaRut: r.usuario?.rut || diff.personaRut || diff.rutFirmante || diff.runGob || diff.run || null,
+            ip: ipLimpia,
+            timestamp: r.createdAt.toISOString().replace('T', ' ').slice(0, 19),
+            diffJson: r.diffJsonb,
+          };
+        })
         .filter((ev) => {
           const matchTexto =
             !filtro ||

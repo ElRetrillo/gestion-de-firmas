@@ -18,6 +18,7 @@ import {
 } from '../common/crypto.util';
 import { formatRut } from '../common/rut.util';
 import { JWT_ISSUER } from '../common/auth.guards';
+import { evaluarPoliticaRbacFirma } from './rbac-firmas.policy';
 import { RedisService } from '../redis/redis.service';
 import {
   derivarSecretoUsuario,
@@ -107,6 +108,10 @@ export class RegistroFuncionarioDto {
   @IsString()
   @IsOptional()
   unidad?: string;
+
+  @IsString()
+  @IsOptional()
+  condicionContractual?: string;
 }
 
 export class ClaveUnicaAuthDto {
@@ -185,6 +190,8 @@ export class AuthService {
       unidad: u.unidad,
       rol: u.rol,
       estado: u.estado,
+      condicionContractual: u.condicionContractual || 'CONTRATA',
+      rbac: evaluarPoliticaRbacFirma(u),
       pinBloqueado: u.pinBloqueado,
       debeCambiarPassword: !!u.debeCambiarPassword,
       ...(u.certificados ? { certificados: u.certificados } : {}),
@@ -256,8 +263,9 @@ export class AuthService {
         rut,
         nombre: nombreCompleto,
         email: emailFinal,
-        cargo: (dto.cargo || 'Funcionario Municipal').trim(),
+        cargo: (dto.cargo || 'Profesionales').trim(),
         unidad: (dto.unidad || 'I. Municipalidad de Coquimbo').trim(),
+        condicionContractual: (dto.condicionContractual || 'CONTRATA').trim().toUpperCase(),
         rol: 'PENDIENTE',
         estado: 'ACTIVO',
         passwordHash: hashSecret(dto.password),
@@ -419,6 +427,16 @@ export class AuthService {
       pinBloqueado: false,
       mensaje: `Token criptográfico de ${usuario.nombre} desbloqueado y PIN restablecido.`,
     };
+  }
+
+  async logout(user: any, ipOrigen = 'desconocida') {
+    const rut = user?.rut || 'desconocido';
+    const email = user?.email || 'desconocido';
+    const sub = user?.sub;
+    await this.auditar('SIGN_OUT', rut, sub, email, ipOrigen, {
+      evento: 'Cierre de sesión del usuario',
+    });
+    return { status: 'ok', mensaje: 'Sesión cerrada y registrada en bitácora.' };
   }
 
   /**

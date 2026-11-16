@@ -693,6 +693,18 @@ export class TelemetriaService {
         .sort((a, b) => b.totalEventos - a.totalEventos);
 
       // Trazabilidad detallada por Dispositivo / Token Físico en el período
+      let diasHabilesPeriodo = 0;
+      const dCursor = new Date(fechaInicio);
+      dCursor.setHours(0, 0, 0, 0);
+      const dLimite = new Date(fechaFin);
+      dLimite.setHours(23, 59, 59, 999);
+      while (dCursor <= dLimite) {
+        const dow = dCursor.getDay();
+        if (dow !== 0 && dow !== 6) diasHabilesPeriodo += 1;
+        dCursor.setDate(dCursor.getDate() + 1);
+      }
+      const minutosLaboralesPeriodo = Math.max(1, diasHabilesPeriodo) * 8 * 60;
+
       const trazabilidadDispositivos = tokensHardware
         .map((t: any) => {
           const eventosDelToken = eventosTelemetria.filter(
@@ -710,6 +722,44 @@ export class TelemetriaService {
             (est) =>
               est.tokenInfo?.serialNumber === t.serialNumber ||
               est.serialTokenActivo === t.serialNumber,
+          );
+
+          // Calcular tiempo total de uso en minutos emparejando eventos CONECTADO/FIRMANDO -> DESCONECTADO
+          const eventosOrdenados = [...eventosDelToken].sort(
+            (a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime(),
+          );
+          let totalUsoMs = 0;
+          let inicioSesionMs: number | null = null;
+          for (const ev of eventosOrdenados) {
+            const ts = new Date(ev.timestamp).getTime();
+            if (ev.evento === 'CONECTADO' || ev.evento === 'FIRMANDO') {
+              if (inicioSesionMs === null) inicioSesionMs = ts;
+            } else if (ev.evento === 'DESCONECTADO') {
+              if (inicioSesionMs !== null && ts > inicioSesionMs) {
+                totalUsoMs += ts - inicioSesionMs;
+              }
+              inicioSesionMs = null;
+            }
+          }
+          if (inicioSesionMs !== null) {
+            const cierreMs =
+              estacionViva?.estadoEnVivo === 'CONECTADO'
+                ? Math.min(Date.now(), fechaFin.getTime())
+                : estacionViva?.ultimoPing
+                  ? Math.min(new Date(estacionViva.ultimoPing).getTime(), fechaFin.getTime())
+                  : inicioSesionMs;
+            if (cierreMs > inicioSesionMs) {
+              totalUsoMs += cierreMs - inicioSesionMs;
+            }
+          }
+          const tiempoUsoMinutos = Math.max(0, Math.round(totalUsoMs / 60000));
+          const promedioUsoDiarioMinutos = Math.max(
+            0,
+            Math.round(tiempoUsoMinutos / Math.max(1, diasHabilesPeriodo)),
+          );
+          const porcentajeUsoMensual = Math.min(
+            100,
+            Number(((tiempoUsoMinutos / minutosLaboralesPeriodo) * 100).toFixed(1)),
           );
 
           const certAsignado = t.certificados?.[0];
@@ -736,6 +786,9 @@ export class TelemetriaService {
             conexionesPeriodo: conexiones,
             firmasPeriodo: firmas,
             desconexionesPeriodo: desconexiones,
+            tiempoUsoMinutos,
+            promedioUsoDiarioMinutos,
+            porcentajeUsoMensual,
             porcentajeUsoPeriodo: pct(totalEventos, totalEventosPeriodo),
             ultimaActividad:
               eventosDelToken[0]?.timestamp?.toISOString() ||
@@ -978,6 +1031,30 @@ export class TelemetriaService {
           porcentajeTokensOperativos,
           rankingEstaciones,
           trazabilidadDispositivos,
+          tiempoUsoTotalMinutos: trazabilidadDispositivos.reduce(
+            (acc: number, d: any) => acc + (d.tiempoUsoMinutos || 0),
+            0,
+          ),
+          promedioUsoDiarioGeneralMinutos:
+            trazabilidadDispositivos.length > 0
+              ? Math.round(
+                  trazabilidadDispositivos.reduce(
+                    (acc: number, d: any) => acc + (d.promedioUsoDiarioMinutos || 0),
+                    0,
+                  ) / trazabilidadDispositivos.length,
+                )
+              : 0,
+          porcentajeUsoMedioMensual:
+            trazabilidadDispositivos.length > 0
+              ? Number(
+                  (
+                    trazabilidadDispositivos.reduce(
+                      (acc: number, d: any) => acc + (d.porcentajeUsoMensual || 0),
+                      0,
+                    ) / trazabilidadDispositivos.length
+                  ).toFixed(1),
+                )
+              : 0,
         },
         firmas: {
           totalSolicitudesPeriodo,

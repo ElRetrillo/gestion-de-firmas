@@ -7,8 +7,10 @@ import {
   BadRequestException,
   HttpException,
   HttpStatus,
+  ForbiddenException,
 } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
+import { evaluarPoliticaRbacFirma } from '../auth/rbac-firmas.policy';
 import { RedisService } from '../redis/redis.service';
 import { AuthService } from '../auth/auth.service';
 import { TelemetriaGateway } from '../websocket/telemetria.gateway';
@@ -25,6 +27,10 @@ import {
 } from './dto/crear-solicitud-firma.dto';
 import { ClasificacionDocumental, EstadoAprobacion } from '@prisma/client';
 import { PDFDocument, StandardFonts, rgb } from 'pdf-lib';
+import signpdf from '@signpdf/signpdf';
+import { pdflibAddPlaceholder } from '@signpdf/placeholder-pdf-lib';
+import { P12Signer } from '@signpdf/signer-p12';
+import * as forge from 'node-forge';
 import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -339,10 +345,19 @@ export class FirmasService {
         },
       });
 
+      if (firmante) {
+        const rbac = evaluarPoliticaRbacFirma(firmante);
+        if (!rbac.puedeFirmar) {
+          throw new ForbiddenException(
+            rbac.motivoBloqueo || 'Su grado o calidad contractual no habilita firma electrónica.',
+          );
+        }
+      }
+
       // Detectar estación con Token USB conectado en vivo para trazabilidad de hardware
       const estacionActiva = await this.prisma.estacionTrabajo.findFirst({
         where: {
-          estadoHardware: { in: ['CONECTADO', 'FIRMANDO'] },
+          estadoHardware: 'CONECTADO',
         },
         orderBy: { ultimoPing: 'desc' },
       });
@@ -1445,7 +1460,7 @@ export class FirmasService {
     const maxIntentosActuales = Math.max(intentosFallidosAtendida, intentosFallidosFunc);
 
     const estacionConectada = await this.prisma.estacionTrabajo.findFirst({
-      where: { estadoHardware: { in: ['CONECTADO', 'FIRMANDO'] } },
+      where: { estadoHardware: 'CONECTADO' },
       orderBy: { ultimoPing: 'desc' },
     });
 
@@ -1820,9 +1835,43 @@ export class FirmasService {
 
     // 5. Procesar y firmar cada archivo en Banco de Firma (Loop Firmar(Hash) -> Armar doc firmado)
     const estacionActiva = await this.prisma.estacionTrabajo.findFirst({
-      where: { estadoHardware: { in: ['CONECTADO', 'FIRMANDO'] } },
+      where: { estadoHardware: 'CONECTADO' },
       orderBy: { ultimoPing: 'desc' },
     });
+
+    const runLimpio = String(run).replace(/[^0-9kK]/g, '');
+    const usuariosGob = await this.prisma.usuario.findMany({
+      select: {
+        id: true,
+        rut: true,
+        nombre: true,
+        email: true,
+        rol: true,
+        cargo: true,
+        condicionContractual: true,
+      },
+    });
+    const usuarioFirmante = usuariosGob.find((u) => {
+      const clean = u.rut.replace(/[^0-9kK]/g, '');
+      const sinDv = clean.length > 1 ? clean.slice(0, -1) : clean;
+      return sinDv === runLimpio || clean === runLimpio;
+    });
+    if (usuarioFirmante) {
+      const rbac = evaluarPoliticaRbacFirma(usuarioFirmante);
+      if (!rbac.puedeFirmar) {
+        this.lanzarErrorGob(
+          403,
+          rbac.motivoBloqueo || 'Su grado o calidad contractual no habilita firma electrónica.',
+        );
+      }
+    }
+    const nombreFirmanteGob =
+      usuarioFirmante?.nombre ||
+      (run === '11111111'
+        ? 'Titular Prueba Firma Atendida (SEGPRES)'
+        : run === '22222222'
+          ? 'Certificado Propósito Desatendido (SEGPRES)'
+          : `Funcionario Titular RUN ${run}`);
 
     const signedFiles: Array<any> = [];
     let filesSignedCount = 0;
@@ -1867,12 +1916,7 @@ export class FirmasService {
           const signedPdfBuffer = await this.incrustarFirmaEnPdfBuffer(inputBuffer, {
             codigoDocumento: codigoDoc,
             titulo: fileItem.description || 'Documento Firmado vía Protocolo FirmaGob v2',
-            firmanteNombre:
-              run === '11111111'
-                ? 'Titular Prueba Firma Atendida (SEGPRES)'
-                : run === '22222222'
-                  ? 'Certificado Propósito Desatendido (SEGPRES)'
-                  : `Funcionario Titular RUN ${run}`,
+            firmanteNombre: nombreFirmanteGob,
             firmanteRut: `${run}`,
             firmanteCargo: String(purpose),
             unidad: String(entity),
@@ -2003,11 +2047,17 @@ export class FirmasService {
           tablaAfectada: 'solicitudes_firma',
           registroId: String(idSolicitud),
           accion: 'TICKET_FIRMAGOB_V2_PROCESADO',
-          usuarioEmail: `run-${run}@firmagob.cl`,
+          usuarioId: usuarioFirmante?.id,
+          usuarioEmail: usuarioFirmante?.email || `run-${run}@firmagob.cl`,
           diffJsonb: {
             idSolicitud,
             session_token: sessionToken,
             run,
+            personaNombre: nombreFirmanteGob,
+            personaRut: usuarioFirmante?.rut || String(run),
+            modalidadFirma: String(purpose).toLowerCase().includes('desatendid')
+              ? 'FIRMAGOB_DESATENDIDA'
+              : 'FIRMAGOB_ATENDIDA',
             entity,
             purpose,
             filesReceived: dto.files!.length,
@@ -2318,6 +2368,327 @@ export class FirmasService {
   }
 
   /**
+   * Prepara un PDF con estampa visual limpia + placeholder PAdES (ByteRange)
+   * y extrae los bytes exactos que debe firmar el token USB físico en Windows.
+   */
+  async prepararPdfParaTokenPades(
+    body: {
+      pdfBase64: string;
+      nombreDocumento?: string;
+      layoutXml?: string;
+      firmanteNombre?: string;
+      firmanteRut?: string;
+    },
+    userJwt: any,
+  ) {
+    if (!body?.pdfBase64) {
+      throw new BadRequestException('pdfBase64 es requerido.');
+    }
+    const usuario = userJwt?.sub
+      ? await this.prisma.usuario.findUnique({ where: { id: userJwt.sub } })
+      : null;
+    if (usuario) {
+      const rbac = evaluarPoliticaRbacFirma(usuario);
+      if (!rbac.puedeFirmar) {
+        throw new ForbiddenException(
+          rbac.motivoBloqueo || 'Su grado o calidad contractual no habilita firma electrónica.',
+        );
+      }
+    }
+
+    const cleanB64 = String(body.pdfBase64).replace(/^data:[^;]+;base64,/, '').trim();
+    const inputBuffer = Buffer.from(cleanB64, 'base64');
+    const checksumOriginal = crypto.createHash('sha256').update(inputBuffer).digest('hex');
+    const codigoDoc = `TOK-USB-${Date.now().toString().slice(-6)}`;
+    const codigoVerif = `VERIF-2026-CQM-${Math.floor(1000 + Math.random() * 9000)}-${checksumOriginal.slice(0, 4).toUpperCase()}`;
+
+    const firmanteNombre = body.firmanteNombre || usuario?.nombre || 'FUNCIONARIO MUNICIPAL';
+    const firmanteRut = body.firmanteRut || usuario?.rut || userJwt?.rut || '11.111.111-1';
+    const unidad = usuario?.unidad || 'I. Municipalidad de Coquimbo';
+    const cargo = usuario?.cargo || 'Funcionario';
+
+    const pdfWithPlaceholder = await this.construirPdfConPlaceholderPades(inputBuffer, {
+      codigoDocumento: codigoDoc,
+      titulo: body.nombreDocumento || 'Documento Firmado con Token USB',
+      firmanteNombre,
+      firmanteRut,
+      firmanteCargo: cargo,
+      unidad,
+      runGob: this.extraerRunSinDv(firmanteRut),
+      entityGob: 'I. Municipalidad de Coquimbo',
+      purposeGob: 'FEA Token USB',
+      codigoVerificacion: codigoVerif,
+      checksumOriginal,
+      tokenSerial: 'TOKEN-USB-FISICO',
+      timestampIso: new Date().toISOString(),
+      layoutXml: body.layoutXml || null,
+      signatureLength: 16384,
+    });
+
+    let payloadToSign: Buffer | null = null;
+    try {
+      await signpdf.sign(pdfWithPlaceholder, {
+        sign: async (bytes: Buffer) => {
+          payloadToSign = Buffer.from(bytes);
+          throw new Error('CAPTURE_BYTES_ONLY');
+        },
+      } as any);
+    } catch (e: any) {
+      if (e?.message !== 'CAPTURE_BYTES_ONLY') {
+        throw e;
+      }
+    }
+
+    if (!payloadToSign) {
+      throw new BadRequestException('No se pudo extraer el ByteRange PAdES del PDF.');
+    }
+
+    return {
+      pdfConPlaceholderBase64: pdfWithPlaceholder.toString('base64'),
+      payloadBase64: (payloadToSign as Buffer).toString('base64'),
+      codigoDocumento: codigoDoc,
+      codigoVerificacion: codigoVerif,
+      checksumOriginal,
+    };
+  }
+
+  /**
+   * Incrusta la firma PKCS#7 real generada por el token USB en el PDF preparado
+   * y registra la operación en la bitácora de auditoría.
+   */
+  async completarPdfConPkcs7Token(
+    body: {
+      pdfConPlaceholderBase64: string;
+      pkcs7Base64: string;
+      nombreDocumento?: string;
+      certSubject?: string;
+      certThumbprint?: string;
+      firmanteNombre?: string;
+      firmanteRut?: string;
+      tokenSerial?: string;
+    },
+    userJwt: any,
+  ) {
+    if (!body?.pdfConPlaceholderBase64 || !body?.pkcs7Base64) {
+      throw new BadRequestException('pdfConPlaceholderBase64 y pkcs7Base64 son requeridos.');
+    }
+
+    const pdfBuffer = Buffer.from(body.pdfConPlaceholderBase64, 'base64');
+    const pkcs7Buffer = Buffer.from(body.pkcs7Base64, 'base64');
+
+    const signedPdfBuffer = await signpdf.sign(pdfBuffer, {
+      sign: async () => pkcs7Buffer,
+    } as any);
+
+    const checksumSigned = crypto.createHash('sha256').update(signedPdfBuffer).digest('hex');
+    const cnMatch = String(body.certSubject || '').match(/CN=([^,]+)/i);
+    const personaNombre = cnMatch ? cnMatch[1].trim() : body.firmanteNombre || userJwt?.nombre || 'Funcionario';
+    const personaRut = body.firmanteRut || userJwt?.rut || '-';
+
+    await this.prisma.historialCambio
+      .create({
+        data: {
+          tablaAfectada: 'solicitudes_firma',
+          registroId: body.nombreDocumento || `TOKEN-${Date.now().toString().slice(-6)}`,
+          accion: 'FIRMA_TOKEN_USB_REAL',
+          usuarioId: userJwt?.sub,
+          usuarioEmail: userJwt?.email || 'token-usb@municoquimbo.cl',
+          diffJsonb: {
+            modalidadFirma: 'TOKEN_USB',
+            proveedorCriptografico: 'ESIGN_TOKEN_USB',
+            personaNombre,
+            personaRut,
+            certSubject: body.certSubject || null,
+            certThumbprint: body.certThumbprint || null,
+            tokenSerial: body.tokenSerial || 'TOKEN-USB-FISICO',
+            checksumSigned,
+          },
+          ipOrigen: '127.0.0.1',
+        },
+      })
+      .catch(() => {});
+
+    return {
+      status: 'FIRMADA',
+      pdfFirmadoBase64: signedPdfBuffer.toString('base64'),
+      checksumSigned,
+      personaNombre,
+    };
+  }
+
+  private async construirPdfConPlaceholderPades(
+    inputPdfBuffer: Buffer,
+    meta: {
+      codigoDocumento: string;
+      titulo: string;
+      firmanteNombre: string;
+      firmanteRut: string;
+      firmanteCargo: string;
+      unidad: string;
+      runGob: string;
+      entityGob: string;
+      purposeGob: string;
+      codigoVerificacion: string;
+      checksumOriginal: string;
+      tokenSerial: string;
+      timestampIso: string;
+      layoutXml?: string | null;
+      signatureLength?: number;
+    },
+  ): Promise<Buffer> {
+    let pdfDoc: PDFDocument;
+    try {
+      pdfDoc = await PDFDocument.load(inputPdfBuffer, { ignoreEncryption: true });
+    } catch {
+      const baseBuffer = await this.crearPdfBaseDocumento(
+        {
+          codigoDocumento: meta.codigoDocumento,
+          titulo: meta.titulo,
+          tipoTramite: 'DOCUMENTO_TOKEN_USB',
+          clasificacion: 'INTERNA',
+        },
+        {
+          nombre: meta.firmanteNombre,
+          rut: meta.firmanteRut,
+          cargo: meta.firmanteCargo,
+          unidad: meta.unidad,
+        },
+      );
+      pdfDoc = await PDFDocument.load(baseBuffer);
+    }
+
+    const pages = pdfDoc.getPages();
+    const fontBold = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
+    const fontRegular = await pdfDoc.embedFont(StandardFonts.Helvetica);
+    const fontMono = await pdfDoc.embedFont(StandardFonts.Courier);
+
+    let llx = 45;
+    let lly = 155;
+    let urx = 550;
+    let ury = 240;
+    let targetPage = pages[pages.length - 1];
+
+    if (meta.layoutXml) {
+      const extractTag = (tag: string) => {
+        const m = meta.layoutXml!.match(new RegExp(`<${tag}>([\\s\\S]*?)<\\/${tag}>`, 'i'));
+        return m ? m[1].trim() : '';
+      };
+      const pLlx = parseInt(extractTag('llx'), 10);
+      const pLly = parseInt(extractTag('lly'), 10);
+      const pUrx = parseInt(extractTag('urx'), 10);
+      const pUry = parseInt(extractTag('ury'), 10);
+      const pageTag = extractTag('page').toUpperCase();
+      if (!isNaN(pLlx) && !isNaN(pLly) && !isNaN(pUrx) && !isNaN(pUry) && pUrx > pLlx && pUry > pLly) {
+        llx = Math.max(20, Math.min(480, pLlx));
+        lly = Math.max(20, Math.min(720, pLly));
+        urx = Math.max(llx + 120, Math.min(575, pUrx));
+        ury = Math.max(lly + 60, Math.min(810, pUry));
+      }
+      if (pageTag && pageTag !== 'LAST') {
+        const pNum = parseInt(pageTag, 10);
+        if (!isNaN(pNum) && pNum >= 1 && pNum <= pages.length) {
+          targetPage = pages[pNum - 1];
+        }
+      }
+    }
+
+    const boxWidth = urx - llx;
+    const boxHeight = ury - lly;
+    const wrapTextToWidth = (text: string, maxWidth: number, font: typeof fontRegular, size: number) => {
+      const words = text.trim().split(/\s+/).filter(Boolean);
+      if (words.length === 0) return [''];
+      const lines: string[] = [];
+      let current = '';
+      for (const w of words) {
+        const cand = current ? `${current} ${w}` : w;
+        if (font.widthOfTextAtSize(cand, size) <= maxWidth) current = cand;
+        else {
+          if (current) lines.push(current);
+          current = w;
+        }
+      }
+      if (current) lines.push(current);
+      return lines;
+    };
+
+    targetPage.drawRectangle({
+      x: llx,
+      y: lly,
+      width: boxWidth,
+      height: boxHeight,
+      color: rgb(1, 1, 1),
+      borderColor: rgb(0.82, 0.85, 0.89),
+      borderWidth: 0.75,
+    });
+
+    const nombreMayus = (meta.firmanteNombre || 'FUNCIONARIO MUNICIPAL').toUpperCase();
+    const padX = Math.max(4, boxWidth * 0.025);
+    const padY = Math.max(4, boxHeight * 0.08);
+    const leftColWidth = boxWidth * 0.45;
+    const rightColX = llx + boxWidth * 0.49;
+    const rightColWidth = boxWidth * 0.48;
+
+    let leftFontSize = Math.min(12.5, Math.max(7.5, boxHeight * 0.19));
+    let leftLines = wrapTextToWidth(nombreMayus, leftColWidth, fontRegular, leftFontSize);
+    while (leftFontSize > 6.5 && leftLines.length * (leftFontSize * 1.15) > boxHeight - padY * 2) {
+      leftFontSize -= 0.5;
+      leftLines = wrapTextToWidth(nombreMayus, leftColWidth, fontRegular, leftFontSize);
+    }
+    let leftStartY = lly + boxHeight / 2 + (leftLines.length * leftFontSize * 1.15) / 2 - leftFontSize * 0.85;
+    for (const line of leftLines) {
+      targetPage.drawText(line, { x: llx + padX, y: leftStartY, size: leftFontSize, font: fontRegular, color: rgb(0.05, 0.05, 0.05) });
+      leftStartY -= leftFontSize * 1.15;
+    }
+
+    const d = new Date(meta.timestampIso);
+    const valid = isNaN(d.getTime()) ? new Date() : d;
+    const parts = new Intl.DateTimeFormat('en-CA', {
+      timeZone: 'America/Santiago',
+      year: 'numeric', month: '2-digit', day: '2-digit',
+      hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false, timeZoneName: 'shortOffset',
+    }).formatToParts(valid);
+    const get = (t: string) => parts.find((p) => p.type === t)?.value || '';
+    const tzMatch = get('timeZoneName').match(/GMT([+-])(\d{1,2})(?::(\d{2}))?/);
+    const offsetStr = tzMatch ? `${tzMatch[1]}${tzMatch[2].padStart(2, '0')}'${(tzMatch[3] || '00').padStart(2, '0')}'` : "-03'00'";
+    const fecha = `${get('year')}.${get('month')}.${get('day')}`;
+    const hora = `${get('hour') === '24' ? '00' : get('hour')}:${get('minute')}:${get('second')} ${offsetStr}`;
+
+    let rightFontSize = Math.min(8.0, Math.max(5.5, boxHeight * 0.115));
+    let rightAllLines = ['Firmado digitalmente por', ...wrapTextToWidth(nombreMayus, rightColWidth, fontRegular, rightFontSize), `Fecha: ${fecha}`, hora];
+    while (rightFontSize > 5.0 && rightAllLines.length * (rightFontSize * 1.2) > boxHeight - padY * 2) {
+      rightFontSize -= 0.4;
+      rightAllLines = ['Firmado digitalmente por', ...wrapTextToWidth(nombreMayus, rightColWidth, fontRegular, rightFontSize), `Fecha: ${fecha}`, hora];
+    }
+    let rightStartY = lly + boxHeight / 2 + (rightAllLines.length * rightFontSize * 1.2) / 2 - rightFontSize * 0.85;
+    for (const line of rightAllLines) {
+      targetPage.drawText(line, { x: rightColX, y: rightStartY, size: rightFontSize, font: fontRegular, color: rgb(0.05, 0.05, 0.05) });
+      rightStartY -= rightFontSize * 1.2;
+    }
+
+    const lastPage = pages[pages.length - 1];
+    const { width } = lastPage.getSize();
+    lastPage.drawRectangle({ x: 45, y: 35, width: width - 90, height: 62, color: rgb(0.95, 0.96, 0.99), borderColor: rgb(0.15, 0.35, 0.65), borderWidth: 0.9 });
+    lastPage.drawText(`REPOSITORIO INSTITUCIONAL I. MUNICIPALIDAD DE COQUIMBO | CODIGO VERIFICACION: ${meta.codigoVerificacion}`, { x: 53, y: 83, size: 7.5, font: fontBold, color: rgb(0.04, 0.14, 0.28) });
+    lastPage.drawText(`Checksum Original SHA-256: ${meta.checksumOriginal}`, { x: 53, y: 70, size: 6.8, font: fontMono, color: rgb(0.2, 0.24, 0.3) });
+    lastPage.drawText('Suscrito con Firma Electrónica Avanzada (Token USB / Ley N° 19.799).', { x: 53, y: 57, size: 6.8, font: fontRegular, color: rgb(0.3, 0.34, 0.42) });
+
+    pdflibAddPlaceholder({
+      pdfDoc,
+      pdfPage: targetPage,
+      reason: 'Firma Electrónica Avanzada con Token USB (Ley N° 19.799)',
+      contactInfo: `RUT ${meta.firmanteRut} | Verificación: ${meta.codigoVerificacion}`,
+      name: nombreMayus,
+      location: 'Coquimbo, Chile',
+      signingTime: valid,
+      signatureLength: meta.signatureLength || 16384,
+      widgetRect: [llx, lly, urx, ury],
+      appName: 'Municipalidad de Coquimbo - Token USB PAdES',
+    });
+
+    return Buffer.from(await pdfDoc.save({ useObjectStreams: false }));
+  }
+
+  /**
    * Incrusta la firma electrónica avanzada en el PDF (soportando el XML <AgileSignerConfig> del Anexo B, Págs. 25-26)
    */
   private async incrustarFirmaEnPdfBuffer(
@@ -2403,82 +2774,144 @@ export class FirmasService {
     const boxWidth = urx - llx;
     const boxHeight = ury - lly;
 
-    // Recuadro de Firma Visible (Anexo B - AgileSignerConfig)
+    // Helpers de ajuste de texto y fecha estilo Adobe Acrobat
+    const wrapTextToWidth = (
+      text: string,
+      maxWidth: number,
+      font: typeof fontRegular,
+      size: number,
+    ): string[] => {
+      const words = text.trim().split(/\s+/).filter(Boolean);
+      if (words.length === 0) return [''];
+      const lines: string[] = [];
+      let current = '';
+      for (const word of words) {
+        const candidate = current ? `${current} ${word}` : word;
+        if (font.widthOfTextAtSize(candidate, size) <= maxWidth) {
+          current = candidate;
+        } else {
+          if (current) lines.push(current);
+          current = word;
+        }
+      }
+      if (current) lines.push(current);
+      return lines;
+    };
+
+    const formatearFechaAdobe = (isoStr: string) => {
+      const d = new Date(isoStr);
+      const valid = isNaN(d.getTime()) ? new Date() : d;
+      const parts = new Intl.DateTimeFormat('en-CA', {
+        timeZone: 'America/Santiago',
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit',
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit',
+        hour12: false,
+        timeZoneName: 'shortOffset',
+      }).formatToParts(valid);
+      const get = (t: string) => parts.find((p) => p.type === t)?.value || '';
+      const yyyy = get('year');
+      const mm = get('month');
+      const dd = get('day');
+      const hh = get('hour') === '24' ? '00' : get('hour');
+      const min = get('minute');
+      const ss = get('second');
+      const tzMatch = get('timeZoneName').match(/GMT([+-])(\d{1,2})(?::(\d{2}))?/);
+      const offsetStr = tzMatch
+        ? `${tzMatch[1]}${tzMatch[2].padStart(2, '0')}'${(tzMatch[3] || '00').padStart(2, '0')}'`
+        : "-03'00'";
+      return {
+        fecha: `${yyyy}.${mm}.${dd}`,
+        hora: `${hh}:${min}:${ss} ${offsetStr}`,
+      };
+    };
+
+    // Recuadro limpio estilo Adobe Acrobat (fondo blanco y borde sutil)
     targetPage.drawRectangle({
       x: llx,
       y: lly,
       width: boxWidth,
       height: boxHeight,
-      color: rgb(0.95, 0.98, 0.96),
-      borderColor: rgb(0.08, 0.48, 0.32),
-      borderWidth: 1.2,
+      color: rgb(1, 1, 1),
+      borderColor: rgb(0.82, 0.85, 0.89),
+      borderWidth: 0.75,
     });
 
-    // Si viene imagen BASE64 en <BASE64VALUE>, intentar incrustarla
-    let textOffsetX = llx + 10;
-    if (base64ImageValue) {
-      try {
-        const cleanImg = base64ImageValue.replace(/^data:image\/[^;]+;base64,/, '').trim();
-        const imgBuf = Buffer.from(cleanImg, 'base64');
-        const embeddedImg =
-          cleanImg.startsWith('/9j/')
-            ? await pdfDoc.embedJpg(imgBuf)
-            : await pdfDoc.embedPng(imgBuf);
-        targetPage.drawImage(embeddedImg, {
-          x: llx + 8,
-          y: lly + 8,
-          width: 48,
-          height: boxHeight - 16,
-        });
-        textOffsetX = llx + 62;
-      } catch {
-        // Si la imagen Base64 de ejemplo no es PNG/JPG real, continuar con el sello textual
-      }
+    const nombreMayus = (meta.firmanteNombre || 'FUNCIONARIO MUNICIPAL').toUpperCase();
+    const padX = Math.max(4, boxWidth * 0.025);
+    const padY = Math.max(4, boxHeight * 0.08);
+    const leftColWidth = boxWidth * 0.45;
+    const rightColX = llx + boxWidth * 0.49;
+    const rightColWidth = boxWidth * 0.48;
+
+    // Columna izquierda: Nombre completo en grande
+    let leftFontSize = Math.min(12.5, Math.max(7.5, boxHeight * 0.19));
+    let leftLines = wrapTextToWidth(nombreMayus, leftColWidth, fontRegular, leftFontSize);
+    while (
+      leftFontSize > 6.5 &&
+      leftLines.length * (leftFontSize * 1.15) > boxHeight - padY * 2
+    ) {
+      leftFontSize -= 0.5;
+      leftLines = wrapTextToWidth(nombreMayus, leftColWidth, fontRegular, leftFontSize);
+    }
+    const leftLineHeight = leftFontSize * 1.15;
+    const leftTotalHeight = leftLines.length * leftLineHeight;
+    let leftStartY =
+      lly + boxHeight / 2 + leftTotalHeight / 2 - leftFontSize * 0.85;
+
+    for (const line of leftLines) {
+      targetPage.drawText(line, {
+        x: llx + padX,
+        y: leftStartY,
+        size: leftFontSize,
+        font: fontRegular,
+        color: rgb(0.05, 0.05, 0.05),
+      });
+      leftStartY -= leftLineHeight;
     }
 
-    const topY = ury - 14;
-    targetPage.drawText('FIRMADO ELECTRONICAMENTE (FIRMAGOB V2 / TOKEN CRIPTOGRAFICO)', {
-      x: textOffsetX,
-      y: topY,
-      size: 7.5,
-      font: fontBold,
-      color: rgb(0.05, 0.38, 0.24),
-    });
+    // Columna derecha: "Firmado digitalmente por" + Nombre + Fecha y hora
+    const { fecha, hora } = formatearFechaAdobe(meta.timestampIso);
+    let rightFontSize = Math.min(8.0, Math.max(5.5, boxHeight * 0.115));
+    let rightNameLines = wrapTextToWidth(nombreMayus, rightColWidth, fontRegular, rightFontSize);
+    let rightAllLines = [
+      'Firmado digitalmente por',
+      ...rightNameLines,
+      `Fecha: ${fecha}`,
+      hora,
+    ];
+    while (
+      rightFontSize > 5.0 &&
+      rightAllLines.length * (rightFontSize * 1.2) > boxHeight - padY * 2
+    ) {
+      rightFontSize -= 0.4;
+      rightNameLines = wrapTextToWidth(nombreMayus, rightColWidth, fontRegular, rightFontSize);
+      rightAllLines = [
+        'Firmado digitalmente por',
+        ...rightNameLines,
+        `Fecha: ${fecha}`,
+        hora,
+      ];
+    }
 
-    targetPage.drawText(`Firmante: ${meta.firmanteNombre} (RUN: ${meta.runGob})`, {
-      x: textOffsetX,
-      y: topY - 12,
-      size: 7.5,
-      font: fontBold,
-      color: rgb(0.08, 0.12, 0.2),
-    });
+    const rightLineHeight = rightFontSize * 1.2;
+    const rightTotalHeight = rightAllLines.length * rightLineHeight;
+    let rightStartY =
+      lly + boxHeight / 2 + rightTotalHeight / 2 - rightFontSize * 0.85;
 
-    targetPage.drawText(`Institución (RA): ${meta.entityGob.substring(0, 52)}`, {
-      x: textOffsetX,
-      y: topY - 23,
-      size: 7,
-      font: fontRegular,
-      color: rgb(0.2, 0.25, 0.32),
-    });
-
-    targetPage.drawText(`Propósito: ${meta.purposeGob} | Dispositivo: ${meta.tokenSerial}`, {
-      x: textOffsetX,
-      y: topY - 34,
-      size: 6.8,
-      font: fontMono,
-      color: rgb(0.15, 0.28, 0.45),
-    });
-
-    targetPage.drawText(
-      `Fecha Firma: ${meta.timestampIso.replace('T', ' ').slice(0, 19)} | Verificación: ${meta.codigoVerificacion}`,
-      {
-        x: textOffsetX,
-        y: topY - 45,
-        size: 6.5,
-        font: fontMono,
-        color: rgb(0.25, 0.3, 0.38),
-      },
-    );
+    for (const line of rightAllLines) {
+      targetPage.drawText(line, {
+        x: rightColX,
+        y: rightStartY,
+        size: rightFontSize,
+        font: fontRegular,
+        color: rgb(0.05, 0.05, 0.05),
+      });
+      rightStartY -= rightLineHeight;
+    }
 
     // Sello inferior de verificación institucional (Pág. 6 del manual: la Institución incorpora el código de verificación)
     const lastPage = pages[pages.length - 1];
@@ -2523,7 +2956,108 @@ export class FirmasService {
       },
     );
 
-    const savedBytes = await pdfDoc.save();
-    return Buffer.from(savedBytes);
+    // Incrustar firma criptográfica PKCS#7 / PAdES real con certificado .p12 de prueba local
+    try {
+      const signingDate = new Date(meta.timestampIso);
+      pdflibAddPlaceholder({
+        pdfDoc,
+        pdfPage: targetPage,
+        reason: `Firma electrónica de prueba local (${meta.purposeGob || 'Propósito General'}) - Sin valor legal`,
+        contactInfo: `RUT ${meta.firmanteRut} | Verificación: ${meta.codigoVerificacion}`,
+        name: nombreMayus,
+        location: 'Coquimbo, Chile (Entorno Pruebas)',
+        signingTime: isNaN(signingDate.getTime()) ? new Date() : signingDate,
+        widgetRect: [llx, lly, urx, ury],
+        appName: 'Municipalidad de Coquimbo - Motor PAdES Pruebas',
+      });
+
+      const pdfWithPlaceholder = await pdfDoc.save({ useObjectStreams: false });
+      const p12Buffer = this.obtenerCertificadoP12Prueba(
+        nombreMayus,
+        meta.firmanteRut,
+        meta.unidad,
+      );
+      const signer = new P12Signer(p12Buffer, {
+        passphrase: 'coquimbo-prueba-local',
+      });
+      const signedPdfBuffer = await signpdf.sign(
+        Buffer.from(pdfWithPlaceholder),
+        signer,
+      );
+      return Buffer.from(signedPdfBuffer);
+    } catch (err: any) {
+      this.logger.warn(
+        `No se pudo incrustar el bloque PKCS#7 de prueba en ${meta.codigoDocumento}: ${err?.message || err}`,
+      );
+      const savedBytes = await pdfDoc.save();
+      return Buffer.from(savedBytes);
+    }
+  }
+
+  private readonly testP12Cache = new Map<string, Buffer>();
+
+  /**
+   * Genera (y cachea en memoria) un certificado X.509 PKCS#12 (.p12) autofirmado
+   * exclusivo para pruebas locales PAdES en Adobe Acrobat (sin envío a SEGPRES).
+   */
+  private obtenerCertificadoP12Prueba(
+    nombreFirmante: string,
+    rutFirmante: string,
+    unidad: string,
+  ): Buffer {
+    const cacheKey = `${nombreFirmante}|${rutFirmante}`;
+    const cached = this.testP12Cache.get(cacheKey);
+    if (cached) return cached;
+
+    const keys = forge.pki.rsa.generateKeyPair(2048);
+    const cert = forge.pki.createCertificate();
+    cert.publicKey = keys.publicKey;
+    cert.serialNumber = crypto.randomBytes(8).toString('hex');
+
+    const ahora = new Date();
+    cert.validity.notBefore = new Date(ahora.getTime() - 24 * 60 * 60 * 1000);
+    cert.validity.notAfter = new Date(ahora.getTime() + 365 * 24 * 60 * 60 * 1000);
+
+    const attrs = [
+      { name: 'commonName', value: nombreFirmante || 'FUNCIONARIO PRUEBA' },
+      { name: 'serialName', value: rutFirmante || '11111111-1' },
+      {
+        name: 'organizationalUnitName',
+        value: `${unidad || 'TIC'} - CERTIFICADO PRUEBA LOCAL (SIN VALOR LEGAL)`,
+      },
+      {
+        name: 'organizationName',
+        value: 'I. Municipalidad de Coquimbo (Entorno Pruebas)',
+      },
+      { name: 'countryName', value: 'CL' },
+    ];
+    cert.setSubject(attrs);
+    cert.setIssuer(attrs);
+    cert.setExtensions([
+      { name: 'basicConstraints', cA: false },
+      {
+        name: 'keyUsage',
+        digitalSignature: true,
+        nonRepudiation: true,
+      },
+      {
+        name: 'extKeyUsage',
+        emailProtection: true,
+        codeSigning: true,
+      },
+    ]);
+
+    cert.sign(keys.privateKey, forge.md.sha256.create());
+
+    const p12Asn1 = forge.pkcs12.toPkcs12Asn1(
+      keys.privateKey,
+      [cert],
+      'coquimbo-prueba-local',
+      { algorithm: '3des' },
+    );
+    const p12Der = forge.asn1.toDer(p12Asn1).getBytes();
+    const p12Buffer = Buffer.from(p12Der, 'binary');
+    this.testP12Cache.set(cacheKey, p12Buffer);
+    return p12Buffer;
   }
 }
