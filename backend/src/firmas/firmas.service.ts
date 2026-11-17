@@ -31,6 +31,7 @@ import signpdf from '@signpdf/signpdf';
 import { pdflibAddPlaceholder } from '@signpdf/placeholder-pdf-lib';
 import { P12Signer } from '@signpdf/signer-p12';
 import * as forge from 'node-forge';
+import * as QRCode from 'qrcode';
 import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -894,9 +895,96 @@ export class FirmasService {
     };
   }
 
+  async validarDocumentoRepositorio(codigo: string) {
+    const doc = await this.prisma.solicitudFirma.findFirst({
+      where: {
+        OR: [
+          { codigoVerificacion: codigo },
+          { codigoDocumento: codigo },
+          { id: codigo },
+        ],
+      },
+      include: {
+        usuarioSolicitante: {
+          select: { nombre: true, rut: true, unidad: true, cargo: true },
+        },
+      },
+    });
+
+    if (!doc) {
+      throw new NotFoundException(`No se encontró ningún documento con el código ${codigo}.`);
+    }
+
+    return {
+      valido: doc.estadoAprobacion === EstadoAprobacion.FIRMADA,
+      codigoVerificacion: doc.codigoVerificacion || doc.codigoDocumento,
+      codigoDocumento: doc.codigoDocumento,
+      titulo: doc.titulo,
+      tipoTramite: doc.tipoTramite,
+      estado: doc.estadoAprobacion,
+      fechaFirma: (doc.tsaTimestamp || doc.updatedAt).toISOString(),
+      firmante: {
+        nombre: doc.usuarioSolicitante?.nombre || 'Funcionario Municipal',
+        unidad: doc.usuarioSolicitante?.unidad || 'I. Municipalidad de Coquimbo',
+        cargo: doc.usuarioSolicitante?.cargo || 'Funcionario',
+      },
+      hashSha256: doc.hashSha256,
+      pdfUrl: `/api/v1/firmas/repositorio/${encodeURIComponent(doc.codigoVerificacion || doc.codigoDocumento)}/pdf`,
+    };
+  }
+
+  async generarPdfDocumentoFirmadoPorTitular(
+    idOrCodigo: string,
+    jwtToken: string,
+  ): Promise<{ buffer: Buffer; filename: string }> {
+    if (!jwtToken) {
+      throw new ForbiddenException(
+        'Acceso restringido por Ley N° 21.719: debe iniciar sesión como titular firmante para ver el documento.',
+      );
+    }
+
+    let userId = '';
+    try {
+      const parts = jwtToken.split('.');
+      if (parts.length !== 3) throw new Error('JWT inválido');
+      const payload = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8'));
+      userId = payload.sub || '';
+    } catch {
+      throw new ForbiddenException('Token de sesión inválido.');
+    }
+
+    const doc = await this.prisma.solicitudFirma.findFirst({
+      where: {
+        OR: [
+          { id: idOrCodigo },
+          { codigoDocumento: idOrCodigo },
+          { codigoVerificacion: idOrCodigo },
+        ],
+      },
+    });
+
+    if (!doc) {
+      throw new NotFoundException(`Documento ${idOrCodigo} no encontrado`);
+    }
+
+    if (doc.usuarioSolicitanteId !== userId) {
+      throw new ForbiddenException(
+        'Acceso denegado (Ley N° 21.719): solo el titular que firmó el documento puede visualizarlo o descargarlo.',
+      );
+    }
+
+    return this.generarPdfDocumentoFirmado(idOrCodigo);
+  }
+
   async generarPdfDocumentoFirmado(idOrCodigo: string): Promise<{ buffer: Buffer; filename: string }> {
     const doc = await this.prisma.solicitudFirma.findFirst({
-      where: { OR: [{ id: idOrCodigo }, { codigoDocumento: idOrCodigo }] },
+      where: {
+        OR: [
+          { id: idOrCodigo },
+          { codigoDocumento: idOrCodigo },
+          { codigoVerificacion: idOrCodigo },
+        ],
+      },
       include: { usuarioSolicitante: true },
     });
 
@@ -1324,7 +1412,13 @@ export class FirmasService {
    */
   async generarPdfOriginalDocumento(idOrCodigo: string): Promise<{ buffer: Buffer; filename: string }> {
     const doc = await this.prisma.solicitudFirma.findFirst({
-      where: { OR: [{ id: idOrCodigo }, { codigoDocumento: idOrCodigo }] },
+      where: {
+        OR: [
+          { id: idOrCodigo },
+          { codigoDocumento: idOrCodigo },
+          { codigoVerificacion: idOrCodigo },
+        ],
+      },
       include: { usuarioSolicitante: true },
     });
 
@@ -1627,6 +1721,181 @@ export class FirmasService {
   }
 
   /**
+   * Etapa A (Pruebas FirmaGob v2) & Producción:
+   * Calcula SHA-256 real en servidor, firma JWT HS256 con credenciales del backend
+   * y despacha a TEST_OFICIAL_GOB_CL (api.firma.cert.digital.gob.cl) o SANDBOX_LOCAL.
+   */
+  async enviarFirmaGobV2DesdeBackend(
+    body: {
+      pdfBase64: string;
+      nombreDocumento?: string;
+      submodalidad?: 'DESATENDIDA' | 'GENERAL';
+      otp?: string;
+      layoutXml?: string;
+      destino?: 'SANDBOX_LOCAL' | 'TEST_OFICIAL_GOB_CL';
+    },
+    userJwt: any,
+  ) {
+    if (!body?.pdfBase64) {
+      throw new BadRequestException('pdfBase64 es requerido.');
+    }
+
+    const usuario = userJwt?.sub
+      ? await this.prisma.usuario.findUnique({ where: { id: userJwt.sub } })
+      : null;
+
+    if (usuario) {
+      const rbac = evaluarPoliticaRbacFirma(usuario);
+      if (!rbac.puedeFirmar) {
+        throw new ForbiddenException(
+          rbac.motivoBloqueo || 'Su grado o calidad contractual no habilita firma electrónica.',
+        );
+      }
+    }
+
+    const cleanB64 = String(body.pdfBase64).replace(/^data:[^;]+;base64,/, '').trim();
+    const pdfBuffer = Buffer.from(cleanB64, 'base64');
+    if (pdfBuffer.length > FIRMAGOB_V2_MAX_BYTES) {
+      throw new BadRequestException('El documento excede el límite de 5 MB exigido por FirmaGob v2.');
+    }
+
+    const codigoDoc = `GOB-${Date.now().toString().slice(-6)}`;
+    const codigoVerificacion = `CQM-${Date.now().toString().slice(-6)}-${crypto.createHash('sha256').update(pdfBuffer).digest('hex').slice(0, 4).toUpperCase()}`;
+    const destino = body.destino === 'TEST_OFICIAL_GOB_CL' ? 'TEST_OFICIAL_GOB_CL' : 'SANDBOX_LOCAL';
+    let pdfParaEnviar: Buffer = pdfBuffer;
+    if (destino === 'TEST_OFICIAL_GOB_CL') {
+      // Estampar visualmente el recuadro limpio antes de enviar a FirmaGob TEST
+      // para que la firma sea visible en el PDF y quede cubierta por la firma criptográfica
+      try {
+        pdfParaEnviar = await this.incrustarFirmaEnPdfBuffer(pdfBuffer, {
+          codigoDocumento: codigoDoc,
+          titulo: body.nombreDocumento || 'Documento.pdf',
+          firmanteNombre: usuario?.nombre || 'Prueba Etapa A',
+          firmanteRut: usuario?.rut || '22.222.222-2',
+          firmanteCargo: usuario?.cargo || 'Funcionario',
+          unidad: usuario?.unidad || 'I. Municipalidad de Coquimbo',
+          runGob: body.submodalidad === 'GENERAL' ? '11111111' : '22222222',
+          entityGob: process.env.FIRMAGOB_ENTITY || FIRMAGOB_V2_TEST_ENTITY,
+          purposeGob: body.submodalidad === 'GENERAL' ? 'Propósito General' : 'Desatendido',
+          codigoVerificacion,
+          checksumOriginal: crypto.createHash('sha256').update(pdfBuffer).digest('hex'),
+          tokenSerial: 'FIRMAGOB-TEST-CLOUD',
+          timestampIso: new Date().toISOString(),
+          layoutXml: body.layoutXml || null,
+          soloEstampaVisual: true,
+        });
+      } catch {
+        pdfParaEnviar = pdfBuffer;
+      }
+    }
+
+    const checksumOriginal = crypto.createHash('sha256').update(pdfParaEnviar).digest('hex');
+    const esDesatendida = body.submodalidad !== 'GENERAL';
+    const purpose = esDesatendida ? 'Desatendido' : 'Propósito General';
+
+    if (!esDesatendida && (!body.otp || !body.otp.trim())) {
+      throw new BadRequestException('Debe ingresar el código OTP de 6 dígitos para firma Propósito General.');
+    }
+
+    const entity = process.env.FIRMAGOB_ENTITY || FIRMAGOB_V2_TEST_ENTITY;
+    const apiTokenKey = process.env.FIRMAGOB_API_TOKEN || FIRMAGOB_V2_TEST_API_TOKEN_KEY;
+    const runUsuario = this.extraerRunSinDv(usuario?.rut || userJwt?.rut || '11111111');
+    const runEtapaA =
+      destino === 'TEST_OFICIAL_GOB_CL'
+        ? esDesatendida
+          ? '22222222'
+          : '11111111'
+        : runUsuario;
+
+    const expiration = this.formatearExpiracionHoraChilena(25);
+    const { token: jwtToken } = this.generarJwtFirmaGobV2({
+      entity,
+      run: runEtapaA,
+      purpose,
+      expiration,
+      secret: process.env.FIRMAGOB_JWT_SECRET || FIRMAGOB_V2_TEST_SECRET,
+    });
+
+    // En FirmaGob externo, omitir <layout> si <BASE64VALUE> está vacío para evitar error 404 de formato
+    const layoutTieneImagen =
+      body.layoutXml && /<BASE64VALUE>\s*[^<\s]+/i.test(body.layoutXml);
+    const filePayload: any = {
+      'content-type': 'application/pdf',
+      content: pdfParaEnviar.toString('base64'),
+      description: body.nombreDocumento || 'Documento.pdf',
+      checksum: checksumOriginal,
+    };
+    if (destino === 'SANDBOX_LOCAL' && body.layoutXml) {
+      filePayload.layout = body.layoutXml;
+    } else if (destino === 'TEST_OFICIAL_GOB_CL' && layoutTieneImagen) {
+      filePayload.layout = body.layoutXml;
+    }
+
+    const respuesta = await this.procesarTicketFirmaGobV2(
+      {
+        token: jwtToken,
+        api_token_key: apiTokenKey,
+        files: [filePayload],
+        modoConexion: destino === 'TEST_OFICIAL_GOB_CL' ? 'CERTIFICACION_GOB_CL' : undefined,
+      } as any,
+      esDesatendida ? undefined : body.otp?.trim(),
+    );
+
+    // Guardar respaldo del documento firmado en el repositorio institucional
+    const signedB64 = respuesta?.files?.[0]?.content;
+    if (signedB64 && (usuario?.id || userJwt?.sub)) {
+      try {
+        const signedBuf = Buffer.from(signedB64, 'base64');
+        const solRepo = await this.prisma.solicitudFirma.create({
+          data: {
+            codigoDocumento: codigoDoc,
+            titulo: body.nombreDocumento || 'Documento Firmado FirmaGob',
+            tipoTramite: 'DOCUMENTO_FIRMAGOB_V2',
+            clasificacion: ClasificacionDocumental.INTERNA,
+            usuarioSolicitanteId: usuario?.id || userJwt?.sub,
+            estadoAprobacion: EstadoAprobacion.FIRMADA,
+            codigoVerificacion,
+            documentoUrl: `/api/v1/firmas/repositorio/${codigoVerificacion}/pdf`,
+            hashSha256: crypto.createHash('sha256').update(signedBuf).digest('hex'),
+            tsaTimestamp: new Date(),
+          },
+        });
+        this.guardarBinarioEnDisco(solRepo.id, 'firmado', signedBuf);
+      } catch {
+        // No bloquear respuesta si falla el respaldo secundario
+      }
+    }
+
+    if (destino === 'TEST_OFICIAL_GOB_CL') {
+      await this.prisma.historialCambio
+        .create({
+          data: {
+            tablaAfectada: 'solicitudes_firma',
+            registroId: String(respuesta?.idSolicitud || body.nombreDocumento || 'GOB-TEST'),
+            accion: 'FIRMAGOB_V2_TEST_OFICIAL',
+            usuarioId: usuario?.id || userJwt?.sub,
+            usuarioEmail: usuario?.email || userJwt?.email || 'test@municoquimbo.cl',
+            diffJsonb: {
+              modalidadFirma: esDesatendida ? 'FIRMAGOB_DESATENDIDA' : 'FIRMAGOB_ATENDIDA',
+              destino: 'api.firma.cert.digital.gob.cl',
+              entity,
+              runEtapaA,
+              purpose,
+              personaNombre: usuario?.nombre || 'Prueba Etapa A',
+              personaRut: usuario?.rut || runEtapaA,
+              checksumOriginal,
+              filesSigned: respuesta?.metadata?.filesSigned ?? 1,
+            },
+            ipOrigen: '127.0.0.1',
+          },
+        })
+        .catch(() => {});
+    }
+
+    return respuesta;
+  }
+
+  /**
    * Implementación completa del Endpoint Oficial FirmaGob v2:
    * POST /firma/v2/files/tickets  &  POST /api/v1/firmas/v2/files/tickets
    * Valida JWT HS256, RA, OTP (con bloqueo HTTP 429 al 5° intento erróneo), tamaño <= 5MB,
@@ -1662,7 +1931,9 @@ export class FirmasService {
               : {
                   timestamp: this.formatearTimestampErrorGob(),
                   status: response.status,
-                  error: `Respuesta desde api.firma.cert.digital.gob.cl (HTTP ${response.status})`,
+                  error:
+                    respData?.files?.[0]?.status ||
+                    `Respuesta desde api.firma.cert.digital.gob.cl (HTTP ${response.status})`,
                   detalleRemoto: respData,
                 },
             response.status,
@@ -2708,6 +2979,7 @@ export class FirmasService {
       tokenSerial: string;
       timestampIso: string;
       layoutXml?: string | null;
+      soloEstampaVisual?: boolean;
     },
   ): Promise<Buffer> {
     let pdfDoc: PDFDocument;
@@ -2913,48 +3185,67 @@ export class FirmasService {
       rightStartY -= rightLineHeight;
     }
 
-    // Sello inferior de verificación institucional (Pág. 6 del manual: la Institución incorpora el código de verificación)
+    // Pie mínimo de verificación con código + QR en la esquina superior derecha
     const lastPage = pages[pages.length - 1];
-    const { width } = lastPage.getSize();
-    lastPage.drawRectangle({
-      x: 45,
-      y: 35,
-      width: width - 90,
-      height: 62,
-      color: rgb(0.95, 0.96, 0.99),
-      borderColor: rgb(0.15, 0.35, 0.65),
-      borderWidth: 0.9,
-    });
-
-    lastPage.drawText(
-      `REPOSITORIO INSTITUCIONAL I. MUNICIPALIDAD DE COQUIMBO | CODIGO VERIFICACION: ${meta.codigoVerificacion}`,
-      {
-        x: 53,
-        y: 83,
-        size: 7.5,
+    const { width: pageW, height: pageH } = lastPage.getSize();
+    let appUrl = process.env.PUBLIC_APP_URL || '';
+    if (!appUrl) {
+      try {
+        const envText = fs.readFileSync(path.join(process.cwd(), '.env'), 'utf8');
+        const m = envText.match(/^PUBLIC_APP_URL=(.+)$/m);
+        if (m) appUrl = m[1].trim();
+      } catch {
+        // Ignorar si no existe .env
+      }
+    }
+    const baseUrl = (appUrl || 'http://localhost').replace(/\/$/, '');
+    const verifUrl = `${baseUrl}/validar?codigo=${encodeURIComponent(meta.codigoVerificacion)}`;
+    try {
+      const qrPng = await QRCode.toBuffer(verifUrl, {
+        width: 320,
+        margin: 2,
+        errorCorrectionLevel: 'M',
+        color: { dark: '#000000', light: '#FFFFFF' },
+      });
+      const qrImage = await pdfDoc.embedPng(qrPng);
+      const qrSize = 76;
+      const qrX = pageW - qrSize - 22;
+      const qrY = pageH - qrSize - 20;
+      lastPage.drawRectangle({
+        x: qrX - 4,
+        y: qrY - 14,
+        width: qrSize + 8,
+        height: qrSize + 18,
+        color: rgb(1, 1, 1),
+        borderColor: rgb(0.84, 0.86, 0.9),
+        borderWidth: 0.6,
+      });
+      lastPage.drawImage(qrImage, {
+        x: qrX,
+        y: qrY,
+        width: qrSize,
+        height: qrSize,
+      });
+      lastPage.drawText(meta.codigoVerificacion, {
+        x: qrX + 2,
+        y: qrY - 10,
+        size: 6.5,
         font: fontBold,
-        color: rgb(0.04, 0.14, 0.28),
-      },
-    );
+        color: rgb(0.15, 0.2, 0.28),
+      });
+    } catch {
+      lastPage.drawText(`Código: ${meta.codigoVerificacion}`, {
+        x: pageW - 140,
+        y: pageH - 28,
+        size: 7,
+        font: fontBold,
+        color: rgb(0.1, 0.14, 0.2),
+      });
+    }
 
-    lastPage.drawText(`Checksum Original SHA-256: ${meta.checksumOriginal}`, {
-      x: 53,
-      y: 70,
-      size: 6.8,
-      font: fontMono,
-      color: rgb(0.2, 0.24, 0.3),
-    });
-
-    lastPage.drawText(
-      `Suscrito conforme al Protocolo de Conexión a Repositorio de Firmas v2 (Ley N° 19.799 / Ley N° 21.180).`,
-      {
-        x: 53,
-        y: 57,
-        size: 6.8,
-        font: fontRegular,
-        color: rgb(0.3, 0.34, 0.42),
-      },
-    );
+    if (meta.soloEstampaVisual) {
+      return Buffer.from(await pdfDoc.save({ useObjectStreams: false }));
+    }
 
     // Incrustar firma criptográfica PKCS#7 / PAdES real con certificado .p12 de prueba local
     try {

@@ -141,6 +141,42 @@ export class FirmasController {
   }
 
   @Public()
+  @Get('repositorio/:codigo/validar')
+  @ApiOperation({
+    summary: 'Validador público de documentos firmados (estilo DocDigital / FirmaGob)',
+  })
+  async validarDesdeRepositorio(@Param('codigo') codigo: string) {
+    return this.firmasService.validarDocumentoRepositorio(codigo);
+  }
+
+  @Public()
+  @Get('repositorio/:codigo/pdf')
+  @ApiOperation({
+    summary: 'Descarga del documento firmado (restringida al titular firmante por Ley N° 21.719)',
+  })
+  async descargarDesdeRepositorio(
+    @Param('codigo') codigo: string,
+    @Query('access_token') accessTokenQuery: string | undefined,
+    @Req() req: any,
+    @Res() res: Response,
+  ) {
+    const authHeader = req.headers?.authorization || '';
+    const token =
+      accessTokenQuery ||
+      (authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '');
+    const { buffer, filename } = await this.firmasService.generarPdfDocumentoFirmadoPorTitular(
+      codigo,
+      token,
+    );
+    res.set({
+      'Content-Type': 'application/pdf',
+      'Content-Disposition': `inline; filename="${filename}"`,
+      'Content-Length': buffer.length,
+    });
+    res.end(buffer);
+  }
+
+  @Public()
   @Get('solicitudes/:id/original-pdf')
   @ApiOperation({
     summary: 'Descargar documento PDF original recibido por API (previo a la firma)',
@@ -158,6 +194,26 @@ export class FirmasController {
   // ============================================================================
   // ENDPOINTS DEL PROTOCOLO FIRMAGOB V2 Y ENTORNO DE PRUEBAS (MANUAL FEB 2026)
   // ============================================================================
+
+  @Post('v2/enviar')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({
+    summary: 'Orquesta firma FirmaGob v2 desde backend (calcula SHA-256, firma JWT HS256 y envía a Etapa A TEST o Sandbox Local)',
+  })
+  async enviarFirmaGobV2(
+    @Body()
+    body: {
+      pdfBase64: string;
+      nombreDocumento?: string;
+      submodalidad?: 'DESATENDIDA' | 'GENERAL';
+      otp?: string;
+      layoutXml?: string;
+      destino?: 'SANDBOX_LOCAL' | 'TEST_OFICIAL_GOB_CL';
+    },
+    @Req() req: any,
+  ) {
+    return this.firmasService.enviarFirmaGobV2DesdeBackend(body, req.user);
+  }
 
   @Get('v2/test-config')
   @ApiOperation({

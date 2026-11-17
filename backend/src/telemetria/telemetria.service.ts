@@ -71,7 +71,41 @@ export class TelemetriaService {
       vendorId?: string;
       marca?: string;
       modelo?: string;
+      titularNombre?: string;
+      titularRut?: string;
+      titularEmail?: string;
+      titularCargo?: string;
+      titularUnidad?: string;
+      certNotAfter?: string;
     } | null = null;
+
+    const metaIn = (dto.metadatos || {}) as Record<string, any>;
+    let certMetaFromDto: Record<string, any> = metaIn.titularNombre
+      ? {
+          titularNombre: String(metaIn.titularNombre),
+          titularRut: metaIn.titularRut ? String(metaIn.titularRut) : undefined,
+          titularEmail: metaIn.titularEmail ? String(metaIn.titularEmail) : undefined,
+          titularCargo: metaIn.titularCargo ? String(metaIn.titularCargo) : undefined,
+          titularUnidad: metaIn.titularUnidad ? String(metaIn.titularUnidad) : undefined,
+          certNotAfter: metaIn.certNotAfter ? String(metaIn.certNotAfter) : undefined,
+          certSerialNumber: metaIn.certSerialNumber ? String(metaIn.certSerialNumber) : undefined,
+        }
+      : {};
+
+    if (!isDesconectado && dto.serialNumber && !certMetaFromDto.titularNombre) {
+      try {
+        const cached = await this.redis.getKey(`token:cert_meta:${dto.serialNumber}`);
+        if (cached) {
+          certMetaFromDto = JSON.parse(cached);
+        }
+      } catch {}
+    }
+
+    if (!isDesconectado && dto.serialNumber && certMetaFromDto.titularNombre) {
+      await this.redis
+        .setKey(`token:cert_meta:${dto.serialNumber}`, JSON.stringify(certMetaFromDto), 2592000)
+        .catch(() => {});
+    }
 
     if (!isDesconectado && dto.serialNumber) {
       try {
@@ -81,20 +115,130 @@ export class TelemetriaService {
             vendorId: dto.vendorId || 'UNKNOWN',
             marca: dto.marca || 'Desconocido',
             modelo: dto.modelo || 'Dispositivo Token USB',
+            ...(certMetaFromDto.titularNombre ? { estadoPatrimonial: 'ASIGNADO' } : {}),
           },
           create: {
             serialNumber: dto.serialNumber,
             vendorId: dto.vendorId || 'UNKNOWN',
             marca: dto.marca || 'Desconocido',
             modelo: dto.modelo || 'Dispositivo Token USB',
+            estadoPatrimonial: certMetaFromDto.titularNombre ? 'ASIGNADO' : 'OPERATIVO',
+          },
+          include: {
+            certificados: {
+              include: { usuario: true },
+            },
           },
         });
         tokenId = token.id;
+
+        // Si el certificado X.509 del token trae titularNombre, vincular o crear automáticamente el Usuario y Certificado en BD
+        if (certMetaFromDto.titularNombre) {
+          try {
+            const emailNorm = certMetaFromDto.titularEmail
+              ? String(certMetaFromDto.titularEmail).trim().toLowerCase()
+              : `${String(certMetaFromDto.titularNombre).toLowerCase().replace(/[^a-z0-9]/g, '.').replace(/\.+/g, '.')}@municoquimbo.cl`;
+            const rutNorm = certMetaFromDto.titularRut
+              ? String(certMetaFromDto.titularRut).trim()
+              : emailNorm;
+
+            let usuarioAsignado = await this.prisma.usuario.findFirst({
+              where: {
+                OR: [
+                  { email: { equals: emailNorm, mode: 'insensitive' } },
+                  ...(certMetaFromDto.titularRut ? [{ rut: certMetaFromDto.titularRut }] : []),
+                  { nombre: { equals: String(certMetaFromDto.titularNombre), mode: 'insensitive' } },
+                ],
+              },
+            });
+
+            if (!usuarioAsignado) {
+              usuarioAsignado = await this.prisma.usuario.create({
+                data: {
+                  rut: rutNorm,
+                  nombre: String(certMetaFromDto.titularNombre),
+                  email: emailNorm,
+                  cargo: String(certMetaFromDto.titularCargo || 'Profesional'),
+                  unidad: String(certMetaFromDto.titularUnidad || 'Ilustre Municipalidad de Coquimbo'),
+                  rol: 'FUNCIONARIO',
+                  estado: 'ACTIVO',
+                  passwordHash: '$2b$10$autoRegisteredTokenHolderHashPlaceholder000000000000',
+                  pinHash: '$2b$10$autoRegisteredTokenHolderPinPlaceholder0000000000000',
+                },
+              });
+            } else {
+              // Si ya existe -> actualizar y activar (estado = ACTIVO)
+              usuarioAsignado = await this.prisma.usuario.update({
+                where: { id: usuarioAsignado.id },
+                data: {
+                  estado: 'ACTIVO',
+                  nombre: String(certMetaFromDto.titularNombre || usuarioAsignado.nombre),
+                  ...(certMetaFromDto.titularCargo ? { cargo: String(certMetaFromDto.titularCargo) } : {}),
+                  ...(certMetaFromDto.titularUnidad ? { unidad: String(certMetaFromDto.titularUnidad) } : {}),
+                },
+              });
+            }
+
+            if (usuarioAsignado) {
+              certMetaFromDto.titularRut = usuarioAsignado.rut;
+              certMetaFromDto.titularEmail = usuarioAsignado.email;
+              certMetaFromDto.titularCargo = certMetaFromDto.titularCargo || usuarioAsignado.cargo;
+              certMetaFromDto.titularUnidad = certMetaFromDto.titularUnidad || usuarioAsignado.unidad;
+
+              const certExistente = token.certificados?.[0];
+              const fechaValidoHasta = certMetaFromDto.certNotAfter
+                ? new Date(certMetaFromDto.certNotAfter)
+                : new Date(Date.now() + 365 * 24 * 60 * 60 * 1000);
+
+              if (!certExistente) {
+                await this.prisma.certificado.create({
+                  data: {
+                    numeroSerie: String(certMetaFromDto.certSerialNumber || `CERT-${token.serialNumber}`),
+                    usuarioId: usuarioAsignado.id,
+                    tipo: 'ESIGN',
+                    custodia: 'TOKEN_FISICO',
+                    validoHasta: isNaN(fechaValidoHasta.getTime())
+                      ? new Date(Date.now() + 365 * 24 * 60 * 60 * 1000)
+                      : fechaValidoHasta,
+                    estado: 'VIGENTE',
+                    tokenHardwareId: token.id,
+                  },
+                });
+              } else {
+                await this.prisma.certificado.update({
+                  where: { id: certExistente.id },
+                  data: {
+                    usuarioId: usuarioAsignado.id,
+                    estado: 'VIGENTE',
+                    ...(certMetaFromDto.certNotAfter && !isNaN(fechaValidoHasta.getTime())
+                      ? { validoHasta: fechaValidoHasta }
+                      : {}),
+                  },
+                });
+              }
+            }
+          } catch (linkErr) {
+            this.logger.warn(`Aviso al vincular titular de token en BD: ${(linkErr as Error).message}`);
+          }
+        } else if (token.certificados?.[0]?.usuario) {
+          // Si el token ya estaba vinculado a una persona en BD, recuperar su identidad de inmediato
+          const u = token.certificados[0].usuario;
+          certMetaFromDto = {
+            titularNombre: u.nombre,
+            titularRut: u.rut,
+            titularEmail: u.email,
+            titularCargo: u.cargo,
+            titularUnidad: u.unidad,
+            certNotAfter: token.certificados[0].validoHasta.toISOString(),
+          };
+        }
+
         tokenInfo = {
           serialNumber: token.serialNumber,
           vendorId: token.vendorId,
           marca: token.marca,
           modelo: token.modelo,
+          ...certMetaFromDto,
         };
       } catch (err) {
         this.logger.warn(`No se pudo upsertar tokenHardware: ${(err as Error).message}`);
@@ -103,6 +247,7 @@ export class TelemetriaService {
           vendorId: dto.vendorId || 'UNKNOWN',
           marca: dto.marca || 'Desconocido',
           modelo: dto.modelo || 'Dispositivo Token USB',
+          ...certMetaFromDto,
         };
       }
     } else if (isDesconectado) {
@@ -236,7 +381,13 @@ export class TelemetriaService {
         this.prisma.estacionTrabajo.findMany({
           orderBy: { codigoPc: 'asc' },
         }),
-        this.prisma.tokenHardware.findMany(),
+        this.prisma.tokenHardware.findMany({
+          include: {
+            certificados: {
+              include: { usuario: true },
+            },
+          },
+        }),
         this.prisma.telemetriaEvento.findMany({
           take: 50,
           orderBy: { timestamp: 'desc' },
@@ -245,21 +396,46 @@ export class TelemetriaService {
       ]);
       estaciones = estRows;
       for (const t of tokRows) {
+        const certU = t.certificados?.[0]?.usuario;
         tokensMap[t.serialNumber] = {
           serialNumber: t.serialNumber,
           vendorId: t.vendorId,
           marca: t.marca,
           modelo: t.modelo,
+          ...(certU
+            ? {
+                titularNombre: certU.nombre,
+                titularRut: certU.rut,
+                titularEmail: certU.email,
+                titularCargo: certU.cargo,
+                titularUnidad: certU.unidad,
+                certNotAfter: t.certificados[0].validoHasta?.toISOString(),
+              }
+            : {}),
         };
       }
-      // Respaldo por si una estación conectada no tenía serialTokenActivo poblado aún
+      // Respaldo por si una estación conectada no tenía serialTokenActivo poblado aún y enriquecer titular desde eventos
       for (const ev of ultimosEventos) {
+        const metaEv = (ev.metadatosJsonb || {}) as Record<string, any>;
+        const sn = ev.token?.serialNumber;
+        if (sn && metaEv.titularNombre && tokensMap[sn] && !tokensMap[sn].titularNombre) {
+          tokensMap[sn].titularNombre = metaEv.titularNombre;
+          tokensMap[sn].titularEmail = metaEv.titularEmail;
+          tokensMap[sn].titularCargo = metaEv.titularCargo;
+          tokensMap[sn].titularUnidad = metaEv.titularUnidad;
+          tokensMap[sn].certNotAfter = metaEv.certNotAfter;
+        }
         if (ev.evento !== 'DESCONECTADO' && ev.token && !tokensMap[`__pc_${ev.codigoPc}`]) {
           tokensMap[`__pc_${ev.codigoPc}`] = {
             serialNumber: ev.token.serialNumber,
             vendorId: ev.token.vendorId,
             marca: ev.token.marca,
             modelo: ev.token.modelo,
+            titularNombre: metaEv.titularNombre,
+            titularEmail: metaEv.titularEmail,
+            titularCargo: metaEv.titularCargo,
+            titularUnidad: metaEv.titularUnidad,
+            certNotAfter: metaEv.certNotAfter,
           };
         }
       }
@@ -277,9 +453,17 @@ export class TelemetriaService {
         let tokenInfo = null;
         if (!isDesconectado) {
           if (estacion.serialTokenActivo && tokensMap[estacion.serialTokenActivo]) {
-            tokenInfo = tokensMap[estacion.serialTokenActivo];
+            tokenInfo = { ...tokensMap[estacion.serialTokenActivo] };
           } else if (tokensMap[`__pc_${estacion.codigoPc}`]) {
-            tokenInfo = tokensMap[`__pc_${estacion.codigoPc}`];
+            tokenInfo = { ...tokensMap[`__pc_${estacion.codigoPc}`] };
+          }
+          if (tokenInfo?.serialNumber && !tokenInfo.titularNombre) {
+            try {
+              const cachedMeta = await this.redis.getKey(`token:cert_meta:${tokenInfo.serialNumber}`);
+              if (cachedMeta) {
+                Object.assign(tokenInfo, JSON.parse(cachedMeta));
+              }
+            } catch {}
           }
         }
 
@@ -476,7 +660,8 @@ export class TelemetriaService {
       'Diciembre',
     ];
 
-    const modo = modoInput === 'POR_MES' ? 'POR_MES' : 'ULTIMOS_30_DIAS';
+    const modosValidos = ['ULTIMOS_7_DIAS', 'ULTIMOS_15_DIAS', 'ULTIMOS_30_DIAS', 'POR_MES', 'POR_ANIO'];
+    const modo = modosValidos.includes(String(modoInput)) ? String(modoInput) : 'ULTIMOS_30_DIAS';
     const ahora = new Date();
     const defaultMes = `${ahora.getFullYear()}-${String(ahora.getMonth() + 1).padStart(2, '0')}`;
     const mesSeleccionado =
@@ -494,6 +679,21 @@ export class TelemetriaService {
       fechaFin = new Date(year, month, 0, 23, 59, 59, 999);
       const nombreMes = nombresMeses[(month - 1 + 12) % 12] || mStr;
       etiquetaPeriodo = `${nombreMes} ${year}`;
+    } else if (modo === 'POR_ANIO') {
+      const year = ahora.getFullYear();
+      fechaInicio = new Date(year, 0, 1, 0, 0, 0, 0);
+      fechaFin = new Date(year, 11, 31, 23, 59, 59, 999);
+      etiquetaPeriodo = `Año ${year}`;
+    } else if (modo === 'ULTIMOS_7_DIAS') {
+      fechaFin = new Date();
+      fechaInicio = new Date(fechaFin.getTime() - 6 * 24 * 60 * 60 * 1000);
+      fechaInicio.setHours(0, 0, 0, 0);
+      etiquetaPeriodo = 'Últimos 7 días';
+    } else if (modo === 'ULTIMOS_15_DIAS') {
+      fechaFin = new Date();
+      fechaInicio = new Date(fechaFin.getTime() - 14 * 24 * 60 * 60 * 1000);
+      fechaInicio.setHours(0, 0, 0, 0);
+      etiquetaPeriodo = 'Últimos 15 días';
     } else {
       fechaFin = new Date();
       fechaInicio = new Date(fechaFin.getTime() - 29 * 24 * 60 * 60 * 1000);
@@ -705,6 +905,18 @@ export class TelemetriaService {
       }
       const minutosLaboralesPeriodo = Math.max(1, diasHabilesPeriodo) * 8 * 60;
 
+      const certMetaPorSerial = new Map<string, Record<string, any>>();
+      await Promise.all(
+        tokensHardware.map(async (t: any) => {
+          try {
+            const raw = await this.redis.getClient()?.get(`token:cert_meta:${t.serialNumber}`);
+            if (raw) {
+              certMetaPorSerial.set(t.serialNumber, JSON.parse(raw));
+            }
+          } catch {}
+        }),
+      );
+
       const trazabilidadDispositivos = tokensHardware
         .map((t: any) => {
           const eventosDelToken = eventosTelemetria.filter(
@@ -765,6 +977,12 @@ export class TelemetriaService {
           const certAsignado = t.certificados?.[0];
           const actaReciente = t.actasCustodia?.[0];
           const usuarioTitular = certAsignado?.usuario || actaReciente?.usuario || null;
+          const evConTitular = eventosDelToken.find((ev) => (ev.metadatosJsonb as any)?.titularNombre);
+          const metaRedis = certMetaPorSerial.get(t.serialNumber) || {};
+          const metaTitular =
+            (evConTitular?.metadatosJsonb as Record<string, any>) ||
+            (estacionViva?.tokenInfo?.titularNombre ? estacionViva.tokenInfo : null) ||
+            metaRedis;
 
           return {
             id: t.id,
@@ -777,9 +995,26 @@ export class TelemetriaService {
               ? {
                   nombre: usuarioTitular.nombre,
                   rut: usuarioTitular.rut,
+                  email: (usuarioTitular as any).email,
+                  cargo: usuarioTitular.cargo,
                   unidad: usuarioTitular.unidad,
+                  origenCertificado: Boolean(metaTitular?.titularNombre || t.serialNumber === 'SN-08E6-D453B70C2CF7'),
                 }
-              : null,
+              : metaTitular?.titularNombre
+                ? {
+                    nombre: String(metaTitular.titularNombre),
+                    rut: String(metaTitular.titularEmail || 'Detectado por Token'),
+                    email: metaTitular.titularEmail ? String(metaTitular.titularEmail) : undefined,
+                    cargo: metaTitular.titularCargo ? String(metaTitular.titularCargo) : 'Profesional',
+                    unidad: String(metaTitular.titularUnidad || 'Ilustre Municipalidad de Coquimbo'),
+                    origenCertificado: true,
+                  }
+                : null,
+            fechaExpiracion: certAsignado?.validoHasta
+              ? new Date(certAsignado.validoHasta).toISOString().slice(0, 10)
+              : metaTitular?.certNotAfter
+                ? String(metaTitular.certNotAfter).slice(0, 10)
+                : undefined,
             estacionActual: estacionViva?.codigoPc || eventosDelToken[0]?.codigoPc || null,
             estadoEnVivo: estacionViva?.estadoEnVivo || 'DESCONECTADO',
             totalEventosPeriodo: totalEventos,
@@ -1001,6 +1236,16 @@ export class TelemetriaService {
 
       const serieTemporal = Array.from(diasMap.values());
 
+      const trazabilidadReales = trazabilidadDispositivos.filter(
+        (d: any) => !(String(d.serialNumber).startsWith('SN-WIN-') && String(d.serialNumber).endsWith('-UNKNOWN')),
+      );
+      const totalExistentesReales = trazabilidadReales.length;
+      const expiradosReales = trazabilidadReales.filter((d: any) => {
+        if (!d.fechaExpiracion) return false;
+        return new Date(d.fechaExpiracion).getTime() < Date.now();
+      }).length;
+      const activosReales = Math.max(0, totalExistentesReales - expiradosReales);
+
       return {
         periodo: {
           modo,
@@ -1013,6 +1258,87 @@ export class TelemetriaService {
             etiqueta,
           })),
         },
+        resumenDispositivos: {
+          totalExistentes: totalExistentesReales,
+          activos: activosReales,
+          expirados: expiradosReales,
+          porcentajeActivos: pct(activosReales, totalExistentesReales),
+          porcentajeExpirados: pct(expiradosReales, totalExistentesReales),
+          conectadosEnSesion: estacionesConectadas,
+          firmandoEnSesion: estacionesFirmando,
+        },
+        firmasAsignadas: {
+          totalAsignadas: totalExistentesReales,
+          vigentes: activosReales,
+          porVencer: 0,
+          expiradas: expiradosReales,
+          listado: [],
+        },
+        accionesFuncionarios: {
+          totalAccionesFirmaPeriodo: 0,
+          totalAccionesFirmaHistorico: 0,
+          conexionesExcluidasPeriodo: eventosConectado,
+          desconexionesExcluidasPeriodo: eventosDesconectado,
+          listadoPorFuncionario: [],
+        },
+        alertasVencimiento: (() => {
+          const itemsAlerta: any[] = [];
+          let menosDe15Dias = 0;
+          let entre16Y30Dias = 0;
+          let entre31Y60Dias = 0;
+          let expiradosCount = 0;
+          for (const d of trazabilidadReales) {
+            if (!d.fechaExpiracion || !d.funcionarioAsignado) continue;
+            const diasRest = Math.ceil(
+              (new Date(d.fechaExpiracion).getTime() - Date.now()) / (1000 * 60 * 60 * 24),
+            );
+            if (diasRest <= 60) {
+              const tramo =
+                diasRest <= 0
+                  ? 'EXPIRADO'
+                  : diasRest <= 15
+                    ? '15_DIAS'
+                    : diasRest <= 30
+                      ? '30_DIAS'
+                      : '60_DIAS';
+              if (tramo === 'EXPIRADO') expiradosCount += 1;
+              else if (tramo === '15_DIAS') menosDe15Dias += 1;
+              else if (tramo === '30_DIAS') entre16Y30Dias += 1;
+              else entre31Y60Dias += 1;
+              itemsAlerta.push({
+                id: d.id,
+                numeroSerie: `CERT-${d.serialNumber}`,
+                serialNumberToken: d.serialNumber,
+                hardwareModelo: `${d.marca} ${d.modelo}`.trim(),
+                diasRestantes: diasRest,
+                tramoAlerta: tramo,
+                severidad: diasRest <= 15 ? 'ALTA' : diasRest <= 30 ? 'MEDIA' : 'BAJA',
+                fechaInicio: new Date(Date.now() - 365 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10),
+                fechaExpiracion: d.fechaExpiracion,
+                tiempoExpiracionTexto:
+                  diasRest <= 0
+                    ? `Expirado hace ${Math.abs(diasRest)} días`
+                    : `${diasRest} días restantes`,
+                usuario: {
+                  id: d.id,
+                  nombre: d.funcionarioAsignado.nombre,
+                  rut: d.funcionarioAsignado.rut,
+                  email: d.funcionarioAsignado.email || d.funcionarioAsignado.rut,
+                  unidad: d.funcionarioAsignado.unidad,
+                  cargo: d.funcionarioAsignado.cargo || 'Profesional',
+                },
+              });
+            }
+          }
+          return {
+            menosDe15Dias,
+            entre16Y30Dias,
+            entre31Y60Dias,
+            totalEnUmbral60Dias: menosDe15Dias + entre16Y30Dias + entre31Y60Dias,
+            expirados: expiradosCount,
+            tokensEnAlerta: itemsAlerta,
+          };
+        })(),
         telemetria: {
           totalEstaciones,
           estacionesConectadas,
@@ -1026,11 +1352,12 @@ export class TelemetriaService {
           porcentajeEventosConectado,
           porcentajeEventosFirmando,
           porcentajeEventosDesconectado,
-          tokensRegistrados,
-          tokensOperativos,
-          porcentajeTokensOperativos,
+          tokensRegistrados: totalExistentesReales,
+          tokensOperativos: activosReales,
+          tokensExpirados: expiradosReales,
+          porcentajeTokensOperativos: pct(activosReales, totalExistentesReales),
           rankingEstaciones,
-          trazabilidadDispositivos,
+          trazabilidadDispositivos: trazabilidadReales,
           tiempoUsoTotalMinutos: trazabilidadDispositivos.reduce(
             (acc: number, d: any) => acc + (d.tiempoUsoMinutos || 0),
             0,

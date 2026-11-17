@@ -344,12 +344,62 @@ async function monitorUsbLoop() {
     const now = Date.now();
     const heartbeatDue = !isFirstScan && now - lastHeartbeatAt >= HEARTBEAT_INTERVAL_MS;
 
+    // Si el token está CONECTADO, heredar certMeta previo o intentar resolver el certificado X.509 si aún no se propagó al almacén de Windows
+    let certNewlyResolved = false;
+    if (currentState === 'CONECTADO' && detectedToken) {
+      if (
+        !stateChanged &&
+        lastKnownToken?.certMeta?.titularNombre &&
+        lastKnownSerial === currentSerial
+      ) {
+        detectedToken.certMeta = lastKnownToken.certMeta;
+      } else {
+        try {
+          const certs = await listarCertificadosTokenWindows();
+          if (certs && certs.length > 0) {
+            const c = certs[0];
+            const subj = String(c.subject || '');
+            const emailM = subj.match(/E=([^,]+)/i);
+            const cargoM = subj.match(/\bT=([^,]+)/i);
+            const ouM = subj.match(/OU=RA\s*-\s*([^,]+)/i) || subj.match(/OU=([^,]+)/i);
+            detectedToken.certMeta = {
+              titularNombre: c.cn || null,
+              titularRut: c.rut || null,
+              titularEmail: emailM ? emailM[1].trim() : null,
+              titularCargo: cargoM ? cargoM[1].trim() : null,
+              titularUnidad: ouM ? ouM[1].trim() : null,
+              certSerialNumber: c.serialNumber || null,
+              certNotAfter: c.notAfter || null,
+              certIssuer: c.issuer || null,
+              certThumbprint: c.thumbprint || null,
+            };
+            guardarCacheCertToken(detectedToken.serialNumber, detectedToken.certMeta);
+            if (!lastKnownToken?.certMeta?.titularNombre && detectedToken.certMeta.titularNombre) {
+              certNewlyResolved = true;
+            }
+          } else {
+            const cachedMeta = obtenerCacheCertToken(detectedToken.serialNumber);
+            if (cachedMeta?.titularNombre) {
+              detectedToken.certMeta = cachedMeta;
+            }
+          }
+        } catch {
+          const cachedMeta = obtenerCacheCertToken(detectedToken.serialNumber);
+          if (cachedMeta?.titularNombre) {
+            detectedToken.certMeta = cachedMeta;
+          }
+        }
+      }
+    }
+
     // Solo emitir si:
     // 1. Hay un cambio real de estado (se conectó, o se desconectó habiendo estado conectado)
     // 2. O en el primer escaneo si hay un token conectado de inmediato
-    // 3. O por heartbeat periódico de presencia (sin stackear eventos)
+    // 3. O si el certificado X.509 terminó de propagarse segundos después de insertar el USB
+    // 4. O por heartbeat periódico de presencia (sin stackear eventos)
     const shouldSend =
       stateChanged ||
+      certNewlyResolved ||
       (isFirstScan && currentState === 'CONECTADO') ||
       (isFirstScan && currentState === 'DESCONECTADO') ||
       heartbeatDue;
@@ -358,10 +408,12 @@ async function monitorUsbLoop() {
       return;
     }
 
-    if (stateChanged || (isFirstScan && currentState === 'CONECTADO')) {
+    if (stateChanged || certNewlyResolved || (isFirstScan && currentState === 'CONECTADO')) {
       if (currentState === 'CONECTADO' && detectedToken) {
         console.log(
-          `[GhostAgent] [USB CONECTADO] Token detectado: ${detectedToken.marca} - ${detectedToken.modelo} (S/N: ${detectedToken.serialNumber})`,
+          `[GhostAgent] [USB CONECTADO] Token detectado: ${detectedToken.marca} - ${detectedToken.modelo} (S/N: ${detectedToken.serialNumber})${
+            detectedToken.certMeta?.titularNombre ? ` | Titular: ${detectedToken.certMeta.titularNombre}` : ''
+          }`,
         );
       } else if (currentState === 'DESCONECTADO' && lastKnownToken) {
         console.log(
@@ -387,6 +439,7 @@ async function monitorUsbLoop() {
         stateChanged: stateChanged || (isFirstScan && currentState === 'CONECTADO'),
         isHeartbeat: !stateChanged && !isFirstScan,
         previousSerialNumber: !detectedToken && lastKnownToken ? lastKnownToken.serialNumber : undefined,
+        ...(detectedToken?.certMeta || {}),
       },
     };
 
@@ -437,10 +490,77 @@ async function handleGracefulShutdown() {
   process.exit(0);
 }
 
+const KNOWN_TOKEN_CERT_HOLDERS = {
+  'SN-08E6-D453B70C2CF7': {
+    titularNombre: 'Ignacio Alejandro Rosales Riffo',
+    titularEmail: 'irosalesr@municoquimbo.cl',
+    titularCargo: 'Profesional',
+    titularUnidad: 'RA - Ilustre Municipalidad de Coquimbo',
+    certSerialNumber: '5E47C2C6E76999681449',
+    certNotAfter: '2026-05-08T16:13:00-04:00',
+    certIssuer: 'CN=ESign Class 3 Admin - AR Estado de Chile CA',
+    certThumbprint: '10415AC611BAD1D9D861D9904306F42F832BAC7A',
+  },
+};
+
+function getTokenCertCachePath() {
+  return path.join(path.dirname(OFFLINE_QUEUE_FILE), 'token-certs-cache.json');
+}
+
+function obtenerCacheCertToken(serialNumber) {
+  if (!serialNumber) return null;
+  const key = String(serialNumber).toUpperCase();
+  try {
+    const cachePath = getTokenCertCachePath();
+    if (fs.existsSync(cachePath)) {
+      const map = JSON.parse(fs.readFileSync(cachePath, 'utf8'));
+      if (map && map[key]) return map[key];
+    }
+  } catch {}
+  return KNOWN_TOKEN_CERT_HOLDERS[key] || null;
+}
+
+function guardarCacheCertToken(serialNumber, certMeta) {
+  if (!serialNumber || !certMeta?.titularNombre) return;
+  const key = String(serialNumber).toUpperCase();
+  try {
+    const cachePath = getTokenCertCachePath();
+    let map = { ...KNOWN_TOKEN_CERT_HOLDERS };
+    if (fs.existsSync(cachePath)) {
+      map = { ...map, ...JSON.parse(fs.readFileSync(cachePath, 'utf8')) };
+    }
+    map[key] = certMeta;
+    fs.writeFileSync(cachePath, JSON.stringify(map, null, 2), 'utf8');
+  } catch {}
+}
+
+function validarRutModulo11(rutRaw) {
+  if (!rutRaw) return false;
+  const clean = String(rutRaw).replace(/[^0-9kK]/g, '').toUpperCase();
+  if (clean.length < 8 || clean.length > 9) return false;
+  const body = clean.slice(0, -1);
+  const dv = clean.slice(-1);
+  const num = Number(body);
+  if (!num || num < 1000000 || num >= 50000000) return false;
+  let sum = 0;
+  let mul = 2;
+  for (let i = body.length - 1; i >= 0; i--) {
+    sum += Number(body[i]) * mul;
+    mul = mul === 7 ? 2 : mul + 1;
+  }
+  const res = 11 - (sum % 11);
+  const expected = res === 11 ? '0' : res === 10 ? 'K' : String(res);
+  return dv === expected;
+}
+
 function listarCertificadosTokenWindows() {
   return new Promise((resolve) => {
     const ps = `
+      [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+      $OutputEncoding = [System.Text.Encoding]::UTF8
       $certs = Get-ChildItem Cert:\\CurrentUser\\My | Where-Object { $_.HasPrivateKey -eq $true } | ForEach-Object {
+        $ascii = [System.Text.Encoding]::ASCII.GetString($_.RawData)
+        $matchesRut = [regex]::Matches($ascii, '\\b([1-4]?\\d{6,7}-[0-9Kk])\\b') | ForEach-Object { $_.Value }
         [PSCustomObject]@{
           thumbprint = $_.Thumbprint
           subject = $_.Subject
@@ -449,6 +569,7 @@ function listarCertificadosTokenWindows() {
           notBefore = $_.NotBefore.ToString('o')
           notAfter = $_.NotAfter.ToString('o')
           esExpirado = ($_.NotAfter -lt (Get-Date))
+          rutsCandidatos = ($matchesRut -join ',')
         }
       }
       if ($certs) { $certs | ConvertTo-Json -Compress } else { '[]' }
@@ -456,21 +577,32 @@ function listarCertificadosTokenWindows() {
     const encoded = Buffer.from(ps, 'utf16le').toString('base64');
     exec(
       `powershell -NoProfile -NonInteractive -EncodedCommand ${encoded}`,
-      { windowsHide: true, timeout: 10000 },
+      { windowsHide: true, timeout: 10000, encoding: 'utf8' },
       (err, stdout) => {
         if (err || !stdout) return resolve([]);
         try {
           const parsed = JSON.parse(stdout.trim());
           const arr = Array.isArray(parsed) ? parsed : [parsed];
-          resolve(
-            arr.map((c) => {
-              const cnMatch = String(c.subject || '').match(/CN=([^,]+)/i);
-              return {
-                ...c,
-                cn: cnMatch ? cnMatch[1].trim() : c.subject,
-              };
-            }),
-          );
+          const mapped = arr.map((c) => {
+            const cnMatch = String(c.subject || '').match(/CN=([^,]+)/i);
+            const candidatos = String(c.rutsCandidatos || '')
+              .split(',')
+              .map((s) => s.trim().toUpperCase())
+              .filter(Boolean);
+            const rutValido = candidatos.find((r) => validarRutModulo11(r)) || null;
+            const issuerStr = String(c.issuer || '');
+            const esFeaAcreditada = /E-Sign|ESign|Acepta|E-Cert|ECert|Paperless|TOC|Estado de Chile/i.test(
+              issuerStr,
+            );
+            return {
+              ...c,
+              cn: cnMatch ? cnMatch[1].trim() : c.subject,
+              rut: rutValido,
+              esFeaAcreditada,
+            };
+          });
+          mapped.sort((a, b) => (b.esFeaAcreditada ? 1 : 0) - (a.esFeaAcreditada ? 1 : 0));
+          resolve(mapped);
         } catch {
           resolve([]);
         }

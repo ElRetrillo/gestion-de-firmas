@@ -113,7 +113,7 @@ export class SeedService implements OnModuleInit {
       const rutAdmin = formatRut(rutAdminRaw.trim()) || rutAdminRaw.trim();
 
       const cargoAdmin = process.env.ADMIN_INICIAL_CARGO || 'Administrador de Sistemas';
-      const unidadAdmin = process.env.ADMIN_INICIAL_UNIDAD || 'Dirección de TICs';
+      const unidadAdmin = process.env.ADMIN_INICIAL_UNIDAD || 'Departamento de Gestión de Sistemas y TICS';
 
       const passwordProvista = process.env.ADMIN_INICIAL_PASSWORD;
       const passwordTemporal = passwordProvista || generarPasswordTemporal();

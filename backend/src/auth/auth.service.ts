@@ -246,7 +246,10 @@ export class AuthService {
 
     const rut = formatRut(rutLimpio) || rutLimpio;
     const nombreCompleto = `${dto.nombre.trim()} ${dto.apellido.trim()}`;
-    const emailFinal = (dto.email || `${rut.replace(/[^0-9]/g, '').slice(0, 8)}@municoquimbo.cl`).trim().toLowerCase();
+    const emailFinal = (dto.email || '').trim().toLowerCase();
+    if (!emailFinal || !emailFinal.endsWith('@municoquimbo.cl')) {
+      throw new BadRequestException('Debe ingresar un correo institucional válido con dominio @municoquimbo.cl.');
+    }
 
     const existente = await this.prisma.usuario.findFirst({
       where: { OR: [{ rut }, { rut: rutLimpio }, { email: emailFinal }] },
@@ -266,7 +269,7 @@ export class AuthService {
         cargo: (dto.cargo || 'Profesionales').trim(),
         unidad: (dto.unidad || 'I. Municipalidad de Coquimbo').trim(),
         condicionContractual: (dto.condicionContractual || 'CONTRATA').trim().toUpperCase(),
-        rol: 'PENDIENTE',
+        rol: 'FUNCIONARIO',
         estado: 'ACTIVO',
         passwordHash: hashSecret(dto.password),
         pinHash: hashSecret('1234'), // PIN estándar inicial
@@ -276,13 +279,13 @@ export class AuthService {
 
     await this.auditar('REGISTRO_AUTONOMO', rut, nuevo.id, nuevo.email, ipOrigen, {
       nombreCompleto,
-      rolInicial: 'PENDIENTE',
+      rolInicial: 'FUNCIONARIO',
     });
 
     return {
       status: 'success',
-      mensaje: 'Registro completado con éxito. El Administrador asignará tu rol en el panel para habilitar tu acceso.',
-      usuario: this.perfilPublico(nuevo),
+      mensaje: 'Registro completado con éxito. Sesión iniciada.',
+      ...this.emitirSesion(nuevo),
     };
   }
 

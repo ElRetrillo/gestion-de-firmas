@@ -94,7 +94,7 @@ async function cleanDatabase() {
     const nombreAdmin = process.env.ADMIN_INICIAL_NOMBRE || 'Daniel Alejandro Trigo Tabilo';
     const emailAdmin = (process.env.ADMIN_INICIAL_EMAIL || 'daniel.trigo@alumnos.ucn.cl').toLowerCase();
     const cargoAdmin = process.env.ADMIN_INICIAL_CARGO || 'Administrador General de Sistemas';
-    const unidadAdmin = process.env.ADMIN_INICIAL_UNIDAD || 'Dirección de TICs';
+    const unidadAdmin = process.env.ADMIN_INICIAL_UNIDAD || 'Departamento de Gestión de Sistemas y TICS';
 
     const passAdmin = process.env.ADMIN_INICIAL_PASSWORD || generarPasswordTemporal();
     const pinAdmin = process.env.ADMIN_INICIAL_PIN || generarPin();

@@ -24,6 +24,7 @@ export class TelemetriaController {
     return this.telemetriaService.registrarEventoUsb(dto);
   }
 
+  @Public()
   @Get('estaciones')
   @ApiOperation({
     summary: 'Listado de estaciones de trabajo con estado de hardware en tiempo real',
@@ -33,6 +34,7 @@ export class TelemetriaController {
     return this.telemetriaService.obtenerEstadosEstaciones();
   }
 
+  @Public()
   @Get('eventos-recientes')
   @ApiOperation({
     summary: 'Auditoría forense de eventos de telemetría recientes',
@@ -41,7 +43,7 @@ export class TelemetriaController {
     return this.telemetriaService.obtenerUltimosEventos();
   }
 
-  @Roles('ADMIN', 'SUPERVISOR')
+  @Public()
   @Get('metricas')
   @ApiOperation({
     summary: 'Métricas de trazabilidad, estadísticas operacionales y porcentajes (Por Mes o Últimos 30 días)',
