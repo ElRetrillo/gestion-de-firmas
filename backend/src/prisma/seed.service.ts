@@ -16,6 +16,7 @@ export class SeedService implements OnModuleInit {
     await this.asegurarIndicesGin();
     await this.asegurarCatalogoClasificacionEIntegraciones();
     await this.asegurarAdminInicial();
+    await this.asegurarSegundoSuperadmin();
     await this.sincronizarRedisInicial();
   }
 
@@ -153,6 +154,34 @@ export class SeedService implements OnModuleInit {
       this.logger.warn('========================================================================');
     } catch (err) {
       this.logger.warn(`No se pudo verificar o crear administrador inicial: ${(err as Error).message}`);
+    }
+  }
+
+  async asegurarSegundoSuperadmin() {
+    try {
+      const rutCamila = '20.406.484-9';
+      const existe = await this.prisma.usuario.findFirst({
+        where: { OR: [{ rut: rutCamila }, { email: 'camila.herrera@municoquimbo.cl' }] },
+      });
+      if (existe) return;
+
+      await this.prisma.usuario.create({
+        data: {
+          rut: rutCamila,
+          nombre: 'Camila Constanza Herrera Pastén',
+          email: 'camila.herrera@municoquimbo.cl',
+          passwordHash: hashSecret('123456'),
+          pinHash: hashSecret('123456'),
+          cargo: 'Oficial de Registro',
+          unidad: 'Ilustre Municipalidad de Coquimbo',
+          rol: 'ADMIN',
+          estado: 'ACTIVO',
+          debeCambiarPassword: true,
+        },
+      });
+      this.logger.log('[SUPERADMIN] Segundo superadmin (20.406.484-9) creado con PIN inicial 123456.');
+    } catch (err) {
+      this.logger.warn(`No se pudo verificar segundo superadmin: ${(err as Error).message}`);
     }
   }
 
