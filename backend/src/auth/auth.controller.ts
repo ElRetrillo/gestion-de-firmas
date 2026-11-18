@@ -107,6 +107,7 @@ export class AuthController {
     return this.authService.loginActiveDirectory(dto, ipDe(req));
   }
 
+  @AllowPasswordChange()
   @Get('totp/setup')
   @ApiOperation({
     summary: 'Configuración 2FA / TOTP oficial (Google Authenticator, Microsoft Authenticator, 2FAS)',
@@ -116,6 +117,7 @@ export class AuthController {
     return this.authService.obtenerSetupTotp(req.user.sub || req.user.rut);
   }
 
+  @AllowPasswordChange()
   @Post('totp/verificar')
   @HttpCode(HttpStatus.OK)
   @ApiOperation({ summary: 'Verificar código OTP TOTP dinámico de 6 dígitos' })

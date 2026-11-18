@@ -139,7 +139,7 @@ export function generarOtpauthUrl(params: {
   emisor?: string;
   secretBase32: string;
 }): string {
-  const emisor = params.emisor || 'Ilustre Municipalidad de Coquimbo';
+  const emisor = params.emisor || 'Gestion de tokens - I.Municipalidad de Coquimbo';
   const emisorEncoded = encodeURIComponent(emisor);
   const cuentaEncoded = encodeURIComponent(params.cuenta);
   return `otpauth://totp/${emisorEncoded}:${cuentaEncoded}?secret=${params.secretBase32}&issuer=${emisorEncoded}&algorithm=SHA1&digits=6&period=30`;

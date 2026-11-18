@@ -32,8 +32,9 @@ export function generarPin(): string {
 }
 
 export function validarFortalezaPassword(pw: string): string | null {
-  if (!pw || pw.length < 10) return 'La contraseña debe tener al menos 10 caracteres.';
-  if (!/[a-z]/.test(pw) || !/[A-Z]/.test(pw) || !/\d/.test(pw))
-    return 'La contraseña debe incluir mayúsculas, minúsculas y números.';
+  const clean = (pw || '').trim();
+  if (clean.length === 6) return null; // PIN de 6 caracteres a elección del usuario
+  if (clean.length < 6) return 'El PIN debe tener exactamente 6 caracteres.';
+  if (clean.length < 10) return 'Use un PIN de 6 caracteres o una contraseña de al menos 10 caracteres.';
   return null;
 }

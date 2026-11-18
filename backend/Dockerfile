@@ -38,6 +38,7 @@ COPY --from=builder /app/node_modules/.prisma ./node_modules/.prisma
 COPY --from=builder /app/node_modules/@prisma ./node_modules/@prisma
 COPY --from=builder /app/prisma ./prisma
 COPY --from=builder /app/dist ./dist
+COPY backend/assets ./assets
 COPY backend/docker-entrypoint.sh ./docker-entrypoint.sh
 
 # Copiar el agente ghost-app dentro de la imagen

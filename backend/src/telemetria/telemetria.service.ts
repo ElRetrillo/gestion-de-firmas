@@ -186,33 +186,50 @@ export class TelemetriaService {
               certMetaFromDto.titularUnidad = certMetaFromDto.titularUnidad || usuarioAsignado.unidad;
 
               const certExistente = token.certificados?.[0];
-              const fechaValidoHasta = certMetaFromDto.certNotAfter
+              const fechaValidoHastaRaw = certMetaFromDto.certNotAfter
                 ? new Date(certMetaFromDto.certNotAfter)
                 : new Date(Date.now() + 365 * 24 * 60 * 60 * 1000);
+              const fechaValidoHasta = isNaN(fechaValidoHastaRaw.getTime())
+                ? new Date(Date.now() + 365 * 24 * 60 * 60 * 1000)
+                : fechaValidoHastaRaw;
+
+              const diasHastaVenc = Math.ceil(
+                (fechaValidoHasta.getTime() - Date.now()) / (1000 * 60 * 60 * 24),
+              );
+              const estadoCalculado =
+                diasHastaVenc <= 0
+                  ? 'VENCIDO'
+                  : diasHastaVenc <= 60
+                    ? 'POR_VENCER'
+                    : 'VIGENTE';
+
+              const nuevoNumeroSerie = String(
+                certMetaFromDto.certSerialNumber || `CERT-${token.serialNumber}`,
+              );
 
               if (!certExistente) {
                 await this.prisma.certificado.create({
                   data: {
-                    numeroSerie: String(certMetaFromDto.certSerialNumber || `CERT-${token.serialNumber}`),
+                    numeroSerie: nuevoNumeroSerie,
                     usuarioId: usuarioAsignado.id,
                     tipo: 'ESIGN',
                     custodia: 'TOKEN_FISICO',
-                    validoHasta: isNaN(fechaValidoHasta.getTime())
-                      ? new Date(Date.now() + 365 * 24 * 60 * 60 * 1000)
-                      : fechaValidoHasta,
-                    estado: 'VIGENTE',
+                    validoHasta: fechaValidoHasta,
+                    estado: estadoCalculado as any,
                     tokenHardwareId: token.id,
                   },
                 });
-              } else {
+              } else if (
+                certMetaFromDto.certNotAfter &&
+                fechaValidoHasta.getTime() !== certExistente.validoHasta.getTime()
+              ) {
+                // Sincronizar automáticamente la fecha y estado reales del certificado detectado en el token USB físico
                 await this.prisma.certificado.update({
                   where: { id: certExistente.id },
                   data: {
-                    usuarioId: usuarioAsignado.id,
-                    estado: 'VIGENTE',
-                    ...(certMetaFromDto.certNotAfter && !isNaN(fechaValidoHasta.getTime())
-                      ? { validoHasta: fechaValidoHasta }
-                      : {}),
+                    numeroSerie: nuevoNumeroSerie,
+                    validoHasta: fechaValidoHasta,
+                    estado: estadoCalculado as any,
                   },
                 });
               }
@@ -660,7 +677,14 @@ export class TelemetriaService {
       'Diciembre',
     ];
 
-    const modosValidos = ['ULTIMOS_7_DIAS', 'ULTIMOS_15_DIAS', 'ULTIMOS_30_DIAS', 'POR_MES', 'POR_ANIO'];
+    const modosValidos = [
+      'ULTIMOS_7_DIAS',
+      'ULTIMOS_15_DIAS',
+      'ULTIMOS_30_DIAS',
+      'ULTIMOS_60_DIAS',
+      'POR_MES',
+      'POR_ANIO',
+    ];
     const modo = modosValidos.includes(String(modoInput)) ? String(modoInput) : 'ULTIMOS_30_DIAS';
     const ahora = new Date();
     const defaultMes = `${ahora.getFullYear()}-${String(ahora.getMonth() + 1).padStart(2, '0')}`;
@@ -694,6 +718,11 @@ export class TelemetriaService {
       fechaInicio = new Date(fechaFin.getTime() - 14 * 24 * 60 * 60 * 1000);
       fechaInicio.setHours(0, 0, 0, 0);
       etiquetaPeriodo = 'Últimos 15 días';
+    } else if (modo === 'ULTIMOS_60_DIAS') {
+      fechaFin = new Date();
+      fechaInicio = new Date(fechaFin.getTime() - 59 * 24 * 60 * 60 * 1000);
+      fechaInicio.setHours(0, 0, 0, 0);
+      etiquetaPeriodo = 'Últimos 60 días';
     } else {
       fechaFin = new Date();
       fechaInicio = new Date(fechaFin.getTime() - 29 * 24 * 60 * 60 * 1000);
@@ -984,6 +1013,22 @@ export class TelemetriaService {
             (estacionViva?.tokenInfo?.titularNombre ? estacionViva.tokenInfo : null) ||
             metaRedis;
 
+          const estacionCodigoFinal = estacionViva?.codigoPc || eventosDelToken[0]?.codigoPc || null;
+          const estacionPorCodigo = estacionCodigoFinal
+            ? (estacionesVivo as any[]).find((est) => est.codigoPc === estacionCodigoFinal)
+            : null;
+          const evConIp = eventosDelToken.find((ev) => (ev.metadatosJsonb as any)?.ipAsignada);
+          const ultimaIp =
+            estacionViva?.ipAsignada ||
+            estacionPorCodigo?.ipAsignada ||
+            (evConIp?.metadatosJsonb as any)?.ipAsignada ||
+            null;
+          const dependenciaFisicaEst =
+            estacionViva?.dependenciaFisica ||
+            estacionPorCodigo?.dependenciaFisica ||
+            (evConIp?.metadatosJsonb as any)?.dependenciaFisica ||
+            null;
+
           return {
             id: t.id,
             serialNumber: t.serialNumber,
@@ -1010,12 +1055,17 @@ export class TelemetriaService {
                     origenCertificado: true,
                   }
                 : null,
+            fechaAsignacion: (certAsignado?.createdAt || t.createdAt)
+              ? new Date(certAsignado?.createdAt || t.createdAt).toISOString().slice(0, 10)
+              : undefined,
             fechaExpiracion: certAsignado?.validoHasta
               ? new Date(certAsignado.validoHasta).toISOString().slice(0, 10)
               : metaTitular?.certNotAfter
                 ? String(metaTitular.certNotAfter).slice(0, 10)
                 : undefined,
-            estacionActual: estacionViva?.codigoPc || eventosDelToken[0]?.codigoPc || null,
+            estacionActual: estacionCodigoFinal,
+            ultimaIp,
+            dependenciaFisica: dependenciaFisicaEst,
             estadoEnVivo: estacionViva?.estadoEnVivo || 'DESCONECTADO',
             totalEventosPeriodo: totalEventos,
             conexionesPeriodo: conexiones,
@@ -1236,6 +1286,7 @@ export class TelemetriaService {
 
       const serieTemporal = Array.from(diasMap.values());
 
+      const totalEventosHistorico = await this.prisma.telemetriaEvento.count().catch(() => totalEventosPeriodo);
       const trazabilidadReales = trazabilidadDispositivos.filter(
         (d: any) => !(String(d.serialNumber).startsWith('SN-WIN-') && String(d.serialNumber).endsWith('-UNKNOWN')),
       );
@@ -1244,7 +1295,100 @@ export class TelemetriaService {
         if (!d.fechaExpiracion) return false;
         return new Date(d.fechaExpiracion).getTime() < Date.now();
       }).length;
+      const porVencerReales = trazabilidadReales.filter((d: any) => {
+        if (!d.fechaExpiracion) return false;
+        const dias = Math.ceil((new Date(d.fechaExpiracion).getTime() - Date.now()) / (1000 * 60 * 60 * 24));
+        return dias > 0 && dias <= 60;
+      }).length;
+      const vigentesReales = Math.max(0, totalExistentesReales - expiradosReales - porVencerReales);
       const activosReales = Math.max(0, totalExistentesReales - expiradosReales);
+
+      const listadoFirmasReales = trazabilidadReales.map((d: any, idx: number) => {
+        const diasRest = d.fechaExpiracion
+          ? Math.ceil((new Date(d.fechaExpiracion).getTime() - Date.now()) / (1000 * 60 * 60 * 24))
+          : 365;
+        const estadoVig = diasRest <= 0 ? 'EXPIRADO' : diasRest <= 60 ? 'POR_VENCER' : 'ACTIVO';
+        const fechaAsig = d.fechaAsignacion || new Date().toISOString().slice(0, 10);
+        const fechaExp = d.fechaExpiracion || new Date(Date.now() + 365 * 86400000).toISOString().slice(0, 10);
+        return {
+          id: d.id,
+          numeroSerieCertificado: `CERT-${d.serialNumber}`,
+          serialNumberToken: d.serialNumber,
+          marca: d.marca,
+          modelo: d.modelo,
+          funcionario: {
+            id: d.id,
+            rut: d.funcionarioAsignado?.rut || '-',
+            nombre: d.funcionarioAsignado?.nombre || 'Sin Titular',
+            email: d.funcionarioAsignado?.email || d.funcionarioAsignado?.rut || '-',
+            cargo: d.funcionarioAsignado?.cargo || 'Profesional',
+            unidad: d.funcionarioAsignado?.unidad || 'Ilustre Municipalidad de Coquimbo',
+          },
+          fechaAsignacion: fechaAsig,
+          fechaExpiracion: fechaExp,
+          diasRestantes: diasRest,
+          tiempoExpiracionTexto:
+            diasRest <= 0 ? `Expirado hace ${Math.abs(diasRest)} días` : `${diasRest} días restantes`,
+          estado: estadoVig,
+          accionesFirmaPeriodo: d.totalEventosPeriodo || 0,
+          accionesFirmaTotal: (d.conexionesPeriodo || 0) + (d.desconexionesPeriodo || 0),
+          promedioUsoDiarioMinutos: d.promedioUsoDiarioMinutos || 0,
+          tiempoUsoMinutos: d.tiempoUsoMinutos || 0,
+          estacionActual: d.estacionActual || null,
+          estadoConexion: d.estadoEnVivo || 'DESCONECTADO',
+          codigoContrato: `CT-CQM-${String(idx + 1).padStart(3, '0')}`,
+        };
+      });
+
+      const listadoAccionesReales = listadoFirmasReales.map((f: any) => ({
+        usuarioId: f.id,
+        rut: f.funcionario.rut,
+        nombre: f.funcionario.nombre,
+        email: f.funcionario.email,
+        cargo: f.funcionario.cargo,
+        unidad: f.funcionario.unidad,
+        serialNumberToken: f.serialNumberToken,
+        modeloToken: `${f.marca} ${f.modelo}`.trim(),
+        estadoToken: f.estado,
+        diasRestantesToken: f.diasRestantes,
+        accionesFirmaPeriodo: f.accionesFirmaPeriodo,
+        accionesFirmaHistorico: f.accionesFirmaTotal,
+        conexionesIgnoradasPeriodo: 0,
+        desconexionesIgnoradasPeriodo: 0,
+        porcentajeParticipacionFirmas: pct(f.accionesFirmaPeriodo, totalEventosPeriodo),
+        ultimaAccionFirma: null,
+        codigoPcUltimaSesion: f.estacionActual,
+      }));
+
+      const contratosListadoReales = listadoFirmasReales.map((f: any) => {
+        const inicioMs = new Date(f.fechaAsignacion).getTime();
+        const finMs = new Date(f.fechaExpiracion).getTime();
+        const totalMs = Math.max(1, finMs - inicioMs);
+        const transcurridoMs = Math.max(0, Math.min(totalMs, Date.now() - inicioMs));
+        const pctTranscurrido = Math.round((transcurridoMs / totalMs) * 100);
+        const estadoContrato =
+          f.diasRestantes <= 0 ? 'CADUCADO' : f.diasRestantes <= 60 ? 'POR_CADUCAR' : 'VIGENTE';
+        return {
+          id: f.id,
+          codigoContrato: f.codigoContrato,
+          titulo: `Custodia y Vigencia Token ${f.serialNumberToken}`,
+          proveedor: 'E-Sign / Thales',
+          funcionarioNombre: f.funcionario.nombre,
+          funcionarioRut: f.funcionario.rut,
+          funcionarioCargo: f.funcionario.cargo,
+          funcionarioUnidad: f.funcionario.unidad,
+          serialNumberToken: f.serialNumberToken,
+          marcaModeloToken: `${f.marca} ${f.modelo}`.trim(),
+          fechaInicio: f.fechaAsignacion,
+          fechaTermino: f.fechaExpiracion,
+          diasRestantes: f.diasRestantes,
+          tiempoCaducidadTexto: f.tiempoExpiracionTexto,
+          porcentajeVigenciaTranscurrida: pctTranscurrido,
+          estadoContrato,
+          cantidadTokensContratados: 1,
+          cantidadTokensActivos: f.estado === 'EXPIRADO' ? 0 : 1,
+        };
+      });
 
       return {
         periodo: {
@@ -1269,17 +1413,25 @@ export class TelemetriaService {
         },
         firmasAsignadas: {
           totalAsignadas: totalExistentesReales,
-          vigentes: activosReales,
-          porVencer: 0,
+          vigentes: vigentesReales,
+          porVencer: porVencerReales,
           expiradas: expiradosReales,
-          listado: [],
+          listado: listadoFirmasReales,
         },
         accionesFuncionarios: {
-          totalAccionesFirmaPeriodo: 0,
-          totalAccionesFirmaHistorico: 0,
+          totalAccionesFirmaPeriodo: totalEventosPeriodo,
+          totalAccionesFirmaHistorico: Math.max(totalEventosHistorico, totalEventosPeriodo),
           conexionesExcluidasPeriodo: eventosConectado,
           desconexionesExcluidasPeriodo: eventosDesconectado,
-          listadoPorFuncionario: [],
+          listadoPorFuncionario: listadoAccionesReales,
+        },
+        contratosResumen: {
+          totalContratos: contratosListadoReales.length,
+          contratosVigentes: contratosListadoReales.filter((c: any) => c.estadoContrato === 'VIGENTE').length,
+          contratosPorCaducar: contratosListadoReales.filter((c: any) => c.estadoContrato === 'POR_CADUCAR').length,
+          contratosCaducados: contratosListadoReales.filter((c: any) => c.estadoContrato === 'CADUCADO').length,
+          totalTokensContratados: contratosListadoReales.length,
+          listado: contratosListadoReales,
         },
         alertasVencimiento: (() => {
           const itemsAlerta: any[] = [];
@@ -1358,27 +1510,27 @@ export class TelemetriaService {
           porcentajeTokensOperativos: pct(activosReales, totalExistentesReales),
           rankingEstaciones,
           trazabilidadDispositivos: trazabilidadReales,
-          tiempoUsoTotalMinutos: trazabilidadDispositivos.reduce(
+          tiempoUsoTotalMinutos: trazabilidadReales.reduce(
             (acc: number, d: any) => acc + (d.tiempoUsoMinutos || 0),
             0,
           ),
           promedioUsoDiarioGeneralMinutos:
-            trazabilidadDispositivos.length > 0
+            trazabilidadReales.length > 0
               ? Math.round(
-                  trazabilidadDispositivos.reduce(
+                  trazabilidadReales.reduce(
                     (acc: number, d: any) => acc + (d.promedioUsoDiarioMinutos || 0),
                     0,
-                  ) / trazabilidadDispositivos.length,
+                  ) / trazabilidadReales.length,
                 )
               : 0,
           porcentajeUsoMedioMensual:
-            trazabilidadDispositivos.length > 0
+            trazabilidadReales.length > 0
               ? Number(
                   (
-                    trazabilidadDispositivos.reduce(
+                    trazabilidadReales.reduce(
                       (acc: number, d: any) => acc + (d.porcentajeUsoMensual || 0),
                       0,
-                    ) / trazabilidadDispositivos.length
+                    ) / trazabilidadReales.length
                   ).toFixed(1),
                 )
               : 0,

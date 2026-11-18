@@ -2,6 +2,10 @@ import { Injectable, Logger, NotFoundException, BadRequestException, ConflictExc
 import { PrismaService } from '../prisma/prisma.service';
 import { hashSecret, generarPasswordTemporal, generarPin, validarFortalezaPassword } from '../common/crypto.util';
 import { formatRut, getRutVariants } from '../common/rut.util';
+import { generarPlantillaCorreoCaducidad } from './correo-aviso.template';
+import * as nodemailer from 'nodemailer';
+import * as fs from 'fs';
+import * as path from 'path';
 
 const ROLES_VALIDOS = ['ADMIN', 'SUPERVISOR', 'FUNCIONARIO', 'MINISTRO_DE_FE', 'PENDIENTE'];
 
@@ -448,30 +452,139 @@ export class UsuariosService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
-  async despacharNotificacionVencimiento(certificadoId?: string, emailDestino?: string) {
-    try {
-      await this.prisma.historialCambio.create({
-        data: {
-          tablaAfectada: 'certificados',
-          registroId: certificadoId || 'MASIVO_CRON_60_30_15',
-          accion: 'NOTIFICACION_VENCIMIENTO',
-          usuarioEmail: emailDestino || 'cron-alertas@municoquimbo.cl',
-          diffJsonb: {
-            certificadoId: certificadoId || 'TODOS_EN_UMBRAL',
-            destinatario: emailDestino || 'TODOS_LOS_FUNCIONARIOS_POR_VENCER',
-            escalasMonitoreadas: ['15_DIAS_CRITICO', '30_DIAS_MEDIA', '60_DIAS_PREVENTIVO'],
-            timestamp: new Date().toISOString(),
+  async despacharNotificacionVencimiento(payload: {
+    certificadoId?: string;
+    email?: string;
+    nombre?: string;
+    rut?: string;
+    fechaExpiracion?: string;
+    diasRestantes?: number;
+    serialNumber?: string;
+    masivo?: boolean;
+    soloPreview?: boolean;
+  }) {
+    const emailDestino = payload.email?.trim() || undefined;
+    let nombreTitular = payload.nombre?.trim() || '';
+    let rutTitular = payload.rut?.trim() || '';
+    let fechaVencimiento = payload.fechaExpiracion?.trim() || '';
+    let diasRestantes = payload.diasRestantes;
+
+    if ((!nombreTitular || !fechaVencimiento || !emailDestino) && payload.certificadoId) {
+      try {
+        const cert = await this.prisma.certificado.findUnique({
+          where: { id: payload.certificadoId },
+          include: { usuario: true, tokenHardware: true },
+        });
+        if (cert) {
+          nombreTitular = nombreTitular || cert.usuario?.nombre || 'Funcionario(a)';
+          rutTitular = rutTitular || cert.usuario?.rut || '-';
+          fechaVencimiento = fechaVencimiento || cert.validoHasta.toISOString().slice(0, 10);
+          if (diasRestantes === undefined) {
+            diasRestantes = Math.ceil((cert.validoHasta.getTime() - Date.now()) / 86400000);
+          }
+        }
+      } catch {}
+    }
+
+    const plantilla = generarPlantillaCorreoCaducidad({
+      nombre: nombreTitular || 'Funcionario(a) Municipal',
+      rut: rutTitular || '-',
+      fechaVencimiento: fechaVencimiento || '-',
+      diasRestantes: diasRestantes ?? 0,
+      serialNumber: payload.serialNumber,
+    });
+
+    let enviadoSmtp = false;
+    let motivoSmtp = payload.soloPreview
+      ? 'Vista previa lista para enviar por SMTP'
+      : 'Plantilla generada (SMTP no configurado en .env)';
+
+    const smtpHost = process.env.SMTP_HOST;
+    const smtpUser = process.env.SMTP_USER;
+    const smtpPass = process.env.SMTP_PASS;
+    const smtpPort = Number(process.env.SMTP_PORT || 587);
+    const smtpSecure = process.env.SMTP_SECURE === 'true' || smtpPort === 465;
+    const smtpFrom =
+      process.env.SMTP_FROM ||
+      `"Oficina de Transformación Digital - Departamento de Gestión de Sistemas y TICS" <${smtpUser || 'datrigob@gmail.com'}>`;
+
+    const smtpPassPendiente = !smtpPass || smtpPass.includes('REEMPLAZAR_CON_APP_PASSWORD');
+
+    if (!payload.soloPreview) {
+      if (smtpHost && smtpUser && !smtpPassPendiente && emailDestino) {
+        try {
+          const transporter = nodemailer.createTransport({
+            host: smtpHost,
+            port: smtpPort,
+            secure: smtpSecure,
+            auth: { user: smtpUser, pass: smtpPass },
+          });
+
+          const escudoPath = path.resolve(process.cwd(), 'assets/escudo-municoquimbo.png');
+          const attachments = fs.existsSync(escudoPath)
+            ? [
+                {
+                  filename: 'escudo-municoquimbo.png',
+                  path: escudoPath,
+                  cid: 'escudo_municoquimbo',
+                },
+              ]
+            : [];
+
+          await transporter.sendMail({
+            from: smtpFrom,
+            to: emailDestino,
+            subject: plantilla.subject,
+            text: plantilla.text,
+            html: plantilla.html,
+            attachments,
+          });
+
+          enviadoSmtp = true;
+          motivoSmtp = `Enviado vía SMTP (${smtpUser}) a ${emailDestino}`;
+          this.logger.log(`[SMTP] Aviso de caducidad enviado desde ${smtpUser} a ${emailDestino}`);
+        } catch (smtpErr) {
+          enviadoSmtp = false;
+          motivoSmtp = `Error SMTP: ${(smtpErr as Error).message}`;
+          this.logger.warn(`[SMTP] Error enviando a ${emailDestino}: ${(smtpErr as Error).message}`);
+        }
+      } else if (smtpPassPendiente && smtpUser) {
+        motivoSmtp = `Falta configurar la Contraseña de Aplicación de Gmail (SMTP_PASS) para ${smtpUser}`;
+      }
+
+      try {
+        await this.prisma.historialCambio.create({
+          data: {
+            tablaAfectada: 'certificados',
+            registroId: payload.certificadoId || 'MASIVO_CRON_60_30_15',
+            accion: 'NOTIFICACION_VENCIMIENTO',
+            usuarioEmail: emailDestino || 'cron-alertas@municoquimbo.cl',
+            diffJsonb: {
+              certificadoId: payload.certificadoId || 'TODOS_EN_UMBRAL',
+              destinatario: emailDestino || 'TODOS_LOS_FUNCIONARIOS_POR_VENCER',
+              remitente: smtpUser || 'datrigob@gmail.com',
+              titular: nombreTitular || undefined,
+              enviadoSmtp,
+              motivoSmtp,
+              timestamp: new Date().toISOString(),
+            },
           },
-        },
-      });
-    } catch {
-      // Ignorar si BD no disponible
+        });
+      } catch {
+        // Ignorar si BD no disponible
+      }
     }
 
     return {
-      status: 'dispatched',
-      certificadoId: certificadoId || 'ALL',
+      status: payload.soloPreview ? 'preview' : 'dispatched',
+      enviadoSmtp,
+      motivoSmtp,
+      remitenteSmtp: smtpUser || 'datrigob@gmail.com',
+      certificadoId: payload.certificadoId || 'ALL',
       emailDestino: emailDestino || 'multiple',
+      asunto: plantilla.subject,
+      cuerpoCorreo: plantilla.text,
+      htmlCorreo: plantilla.html,
       timestamp: new Date().toISOString(),
     };
   }

@@ -48,6 +48,10 @@ export class LoginDto {
   @IsString()
   @IsOptional()
   rolSimulado?: string;
+
+  @IsString()
+  @IsOptional()
+  codigoTotp?: string;
 }
 
 export class VerificarPinDto {
@@ -78,6 +82,10 @@ export class CambiarPasswordDto {
   @IsString()
   @IsNotEmpty()
   passwordNueva!: string;
+
+  @IsString()
+  @IsOptional()
+  codigoTotp?: string;
 }
 
 export class RegistroFuncionarioDto {
@@ -151,7 +159,7 @@ export class AuthService {
       JSON.stringify({
         ...payload,
         iat: Math.floor(Date.now() / 1000),
-        exp: Math.floor(Date.now() / 1000) + 8 * 3600, // 8 horas
+        exp: Math.floor(Date.now() / 1000) + 3 * 3600, // 3 horas
         iss: JWT_ISSUER,
       }),
     ).toString('base64url');
@@ -174,7 +182,7 @@ export class AuthService {
     return {
       accessToken: token,
       tokenType: 'Bearer',
-      expiresIn: 8 * 3600,
+      expiresIn: 3 * 3600,
       debeCambiarPassword: !!u.debeCambiarPassword,
       usuario: this.perfilPublico(u),
     };
@@ -319,6 +327,35 @@ export class AuthService {
       );
     }
 
+    if (u.debeCambiarPassword) {
+      const totpSetup = await this.obtenerSetupTotp(u.id);
+      return {
+        ...this.emitirSesion(u),
+        requiereMfa: true,
+        totpSetup,
+      };
+    }
+
+    if (u.rol === 'ADMIN') {
+      if (!dto.codigoTotp || !dto.codigoTotp.trim()) {
+        const yaEnrolado = await this.redis.getKey(`user:totp-enrolled:${u.rut}`);
+        const totpSetup = yaEnrolado ? undefined : await this.obtenerSetupTotp(u.id);
+        return {
+          requiereMfa: true,
+          rut: u.rut,
+          nombre: u.nombre,
+          email: u.email,
+          totpSetup,
+          mensaje: 'Ingrese el código de 6 dígitos de su aplicación Authenticator.',
+        };
+      }
+      const okTotp = await this.verificarCodigoTotpUsuario(u.id, dto.codigoTotp.trim());
+      if (!okTotp) {
+        throw new UnauthorizedException('Código de Authenticator inválido o expirado.');
+      }
+      await this.redis.setKey(`user:totp-enrolled:${u.rut}`, '1', 365 * 86400);
+    }
+
     this.intentos.delete(rut);
     await this.auditar('LOGIN_EXITOSO', rut, u.id, u.email, ipOrigen, { rol: u.rol, unidad: u.unidad });
     return this.emitirSesion(u);
@@ -337,16 +374,25 @@ export class AuthService {
     const u = await this.prisma.usuario.findUnique({ where: { id: userId } });
     if (!u) throw new UnauthorizedException('Usuario no encontrado.');
     if (!verifySecret(dto.passwordActual, u.passwordHash)) {
-      throw new UnauthorizedException('La contraseña actual es incorrecta.');
+      throw new UnauthorizedException('El PIN o contraseña actual es incorrecto.');
     }
-    const err = validarFortalezaPassword(dto.passwordNueva);
+    const nuevaClean = (dto.passwordNueva || '').trim();
+    const err = validarFortalezaPassword(nuevaClean);
     if (err) throw new BadRequestException(err);
-    if (dto.passwordNueva === dto.passwordActual) {
-      throw new BadRequestException('La nueva contraseña debe ser distinta de la actual.');
+    if (nuevaClean === dto.passwordActual.trim()) {
+      throw new BadRequestException('El nuevo PIN debe ser distinto al PIN temporal actual.');
     }
+    if (dto.codigoTotp !== undefined) {
+      const okTotp = await this.verificarCodigoTotpUsuario(u.id, String(dto.codigoTotp || '').trim());
+      if (!okTotp) {
+        throw new BadRequestException('Código de Authenticator inválido o expirado. Verifique la hora de su dispositivo.');
+      }
+      await this.redis.setKey(`user:totp-enrolled:${u.rut}`, '1', 365 * 86400);
+    }
+    const hashed = hashSecret(nuevaClean);
     const actualizado = await this.prisma.usuario.update({
       where: { id: u.id },
-      data: { passwordHash: hashSecret(dto.passwordNueva), debeCambiarPassword: false },
+      data: { passwordHash: hashed, pinHash: hashed, debeCambiarPassword: false },
       include: { certificados: true },
     });
     await this.auditar('CAMBIO_PASSWORD', u.rut, u.id, u.email, ip, {});
@@ -548,12 +594,15 @@ export class AuthService {
     const adLdapUrl = this.configService.get<string>('AD_LDAP_URL', '');
     const modo = adLdapUrl ? 'PRODUCCION_OFICIAL' : 'SANDBOX_LOCAL';
 
-    const sesion = await this.login(dto, ipOrigen);
+    const sesion: any = await this.login(dto, ipOrigen);
+    const rutAud = sesion.usuario?.rut || sesion.rut || dto.rut;
+    const idAud = sesion.usuario?.id;
+    const emailAud = sesion.usuario?.email || sesion.email || 'desconocido';
     await this.auditar(
       'LOGIN_ACTIVE_DIRECTORY',
-      sesion.usuario.rut,
-      sesion.usuario.id,
-      sesion.usuario.email,
+      rutAud,
+      idAud,
+      emailAud,
       ipOrigen,
       {
         modoIntegracion: modo,
@@ -586,7 +635,7 @@ export class AuthService {
     const otpauthUrl = generarOtpauthUrl({
       cuenta: `${usuario.rut} (${usuario.email})`,
       secretBase32: secret,
-      emisor: 'Ilustre Municipalidad de Coquimbo',
+      emisor: 'Gestion de tokens - I.Municipalidad de Coquimbo',
     });
 
     const codigoActual = calcularTotp(secret);
@@ -598,7 +647,7 @@ export class AuthService {
       secretBase32: secret,
       otpauthUrl,
       codigoActual,
-      emisor: 'Ilustre Municipalidad de Coquimbo',
+      emisor: 'Gestion de tokens - I.Municipalidad de Coquimbo',
       instrucciones: [
         '1. Descargue Google Authenticator, Microsoft Authenticator o 2FAS en su teléfono.',
         '2. En la app móvil, seleccione "Agregar cuenta" o "+" y luego "Ingresar clave de configuración".',
