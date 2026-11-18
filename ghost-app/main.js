@@ -507,6 +507,17 @@ function getTokenCertCachePath() {
   return path.join(path.dirname(OFFLINE_QUEUE_FILE), 'token-certs-cache.json');
 }
 
+function esNombreIdentificadorInvalido(nombre) {
+  if (!nombre) return true;
+  const s = String(nombre).trim();
+  if (!s) return true;
+  // Descartar UUID/GUID (ej: xxxx-xxxx-xxxx-xxxx o xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx)
+  if (/^\{?[0-9a-f]{4,8}(-[0-9a-f]{4,12}){2,4}\}?$/i.test(s)) return true;
+  // Descartar certificados internos de sistema/MDM/Windows
+  if (/^(MS-Organization-Access|MS-Organization-P2P-Access|localhost|DESKTOP-|WIN-)/i.test(s)) return true;
+  return false;
+}
+
 function obtenerCacheCertToken(serialNumber) {
   if (!serialNumber) return null;
   const key = String(serialNumber).toUpperCase();
@@ -514,14 +525,16 @@ function obtenerCacheCertToken(serialNumber) {
     const cachePath = getTokenCertCachePath();
     if (fs.existsSync(cachePath)) {
       const map = JSON.parse(fs.readFileSync(cachePath, 'utf8'));
-      if (map && map[key]) return map[key];
+      if (map && map[key] && !esNombreIdentificadorInvalido(map[key].titularNombre)) {
+        return map[key];
+      }
     }
   } catch {}
   return KNOWN_TOKEN_CERT_HOLDERS[key] || null;
 }
 
 function guardarCacheCertToken(serialNumber, certMeta) {
-  if (!serialNumber || !certMeta?.titularNombre) return;
+  if (!serialNumber || !certMeta?.titularNombre || esNombreIdentificadorInvalido(certMeta.titularNombre)) return;
   const key = String(serialNumber).toUpperCase();
   try {
     const cachePath = getTokenCertCachePath();
@@ -561,6 +574,12 @@ function listarCertificadosTokenWindows() {
       $certs = Get-ChildItem Cert:\\CurrentUser\\My | Where-Object { $_.HasPrivateKey -eq $true } | ForEach-Object {
         $ascii = [System.Text.Encoding]::ASCII.GetString($_.RawData)
         $matchesRut = [regex]::Matches($ascii, '\\b([1-4]?\\d{6,7}-[0-9Kk])\\b') | ForEach-Object { $_.Value }
+        $provider = ''
+        try {
+          if ($_.PrivateKey -and $_.PrivateKey.CspKeyContainerInfo) {
+            $provider = [string]$_.PrivateKey.CspKeyContainerInfo.ProviderName
+          }
+        } catch {}
         [PSCustomObject]@{
           thumbprint = $_.Thumbprint
           subject = $_.Subject
@@ -570,6 +589,7 @@ function listarCertificadosTokenWindows() {
           notAfter = $_.NotAfter.ToString('o')
           esExpirado = ($_.NotAfter -lt (Get-Date))
           rutsCandidatos = ($matchesRut -join ',')
+          provider = $provider
         }
       }
       if ($certs) { $certs | ConvertTo-Json -Compress } else { '[]' }
@@ -583,24 +603,36 @@ function listarCertificadosTokenWindows() {
         try {
           const parsed = JSON.parse(stdout.trim());
           const arr = Array.isArray(parsed) ? parsed : [parsed];
-          const mapped = arr.map((c) => {
-            const cnMatch = String(c.subject || '').match(/CN=([^,]+)/i);
-            const candidatos = String(c.rutsCandidatos || '')
-              .split(',')
-              .map((s) => s.trim().toUpperCase())
-              .filter(Boolean);
-            const rutValido = candidatos.find((r) => validarRutModulo11(r)) || null;
-            const issuerStr = String(c.issuer || '');
-            const esFeaAcreditada = /E-Sign|ESign|Acepta|E-Cert|ECert|Paperless|TOC|Estado de Chile/i.test(
-              issuerStr,
+          const mapped = arr
+            .map((c) => {
+              const cnMatch = String(c.subject || '').match(/CN=([^,]+)/i);
+              const cnClean = cnMatch ? cnMatch[1].trim() : c.subject;
+              const candidatos = String(c.rutsCandidatos || '')
+                .split(',')
+                .map((s) => s.trim().toUpperCase())
+                .filter(Boolean);
+              const rutValido = candidatos.find((r) => validarRutModulo11(r)) || null;
+              const issuerStr = String(c.issuer || '');
+              const providerStr = String(c.provider || '');
+              const esFeaAcreditada = /E-Sign|ESign|Acepta|E-Cert|ECert|Paperless|TOC|Estado de Chile/i.test(
+                issuerStr,
+              );
+              const esHardwareProvider = /eToken|SafeNet|Smart Card|SmartCard|Gemalto|Thales|Feitian|Athena|PKCS11/i.test(
+                `${providerStr} ${issuerStr}`,
+              );
+              return {
+                ...c,
+                cn: cnClean,
+                rut: rutValido,
+                esFeaAcreditada,
+                esHardwareProvider,
+              };
+            })
+            .filter(
+              (c) =>
+                !esNombreIdentificadorInvalido(c.cn) &&
+                (c.esFeaAcreditada || c.esHardwareProvider || Boolean(c.rut)),
             );
-            return {
-              ...c,
-              cn: cnMatch ? cnMatch[1].trim() : c.subject,
-              rut: rutValido,
-              esFeaAcreditada,
-            };
-          });
           mapped.sort((a, b) => (b.esFeaAcreditada ? 1 : 0) - (a.esFeaAcreditada ? 1 : 0));
           resolve(mapped);
         } catch {

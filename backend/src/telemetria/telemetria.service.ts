@@ -80,9 +80,14 @@ export class TelemetriaService {
     } | null = null;
 
     const metaIn = (dto.metadatos || {}) as Record<string, any>;
-    let certMetaFromDto: Record<string, any> = metaIn.titularNombre
+    const titularRaw = metaIn.titularNombre ? String(metaIn.titularNombre).trim() : '';
+    const esTitularGuid =
+      !titularRaw ||
+      /^\{?[0-9a-f]{4,8}(-[0-9a-f]{4,12}){2,4}\}?$/i.test(titularRaw) ||
+      /^(MS-Organization-Access|MS-Organization-P2P-Access|localhost|DESKTOP-|WIN-)/i.test(titularRaw);
+    let certMetaFromDto: Record<string, any> = !esTitularGuid
       ? {
-          titularNombre: String(metaIn.titularNombre),
+          titularNombre: titularRaw,
           titularRut: metaIn.titularRut ? String(metaIn.titularRut) : undefined,
           titularEmail: metaIn.titularEmail ? String(metaIn.titularEmail) : undefined,
           titularCargo: metaIn.titularCargo ? String(metaIn.titularCargo) : undefined,
@@ -984,7 +989,7 @@ export class TelemetriaService {
           }
           if (inicioSesionMs !== null) {
             const cierreMs =
-              estacionViva?.estadoEnVivo === 'CONECTADO'
+              estacionViva?.estadoEnVivo === 'CONECTADO' || estacionViva?.estadoEnVivo === 'FIRMANDO'
                 ? Math.min(Date.now(), fechaFin.getTime())
                 : estacionViva?.ultimoPing
                   ? Math.min(new Date(estacionViva.ultimoPing).getTime(), fechaFin.getTime())
