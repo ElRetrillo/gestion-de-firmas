@@ -1,5 +1,4 @@
 services:
-  # Base de Datos Relacional Principal (PostgreSQL 16)
   postgres:
     image: postgres:16-alpine
     container_name: gestion-firmas-postgres
@@ -26,7 +25,6 @@ services:
     networks:
       - gestion-firmas-net
 
-  # Caché Efímera y Colas BullMQ (Redis 7)
   redis:
     image: redis:7-alpine
     container_name: gestion-firmas-redis
@@ -50,30 +48,6 @@ services:
     networks:
       - gestion-firmas-net
 
-  # Object Storage de Evidencias y Documentos Firmados (MinIO S3)
-  minio:
-    image: cgr.dev/chainguard/minio:latest
-    container_name: gestion-firmas-minio
-    restart: unless-stopped
-    command: server /data --console-address ":9001"
-    environment:
-      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
-      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
-    ports:
-      - "${MINIO_PORT:-9000}:9000"
-      - "${MINIO_CONSOLE_PORT:-9001}:9001"
-    volumes:
-      - minio_data:/data
-    deploy:
-      resources:
-        limits:
-          memory: 256M
-        reservations:
-          memory: 96M
-    networks:
-      - gestion-firmas-net
-
-  # Backend Core (NestJS + TypeScript + Prisma + Socket.io + BullMQ)
   backend:
     build:
       context: .
@@ -86,23 +60,15 @@ services:
       DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres123}@postgres:5432/${POSTGRES_DB:-gestion_firmas}?schema=public
       REDIS_HOST: redis
       REDIS_PORT: 6379
-      REDIS_PRESENCE_TTL: 3600
-      S3_ENDPOINT: minio
-      S3_PORT: 9000
-      S3_ACCESS_KEY: ${MINIO_ROOT_USER:-minioadmin}
-      S3_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
-      JWT_SECRET: ${JWT_SECRET:-coquimbo_secret_key_2026}
-      TELEMETRIA_API_KEY: ${TELEMETRIA_API_KEY:-ghost_app_key_2026}
-      HMAC_SECRET: ${HMAC_SECRET:-}
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+      REDIS_PRESENCE_TTL: ${REDIS_PRESENCE_TTL:-3600}
+      JWT_SECRET: ${JWT_SECRET:-CHANGE_ME_JWT_SECRET}
+      TELEMETRIA_API_KEY: ${TELEMETRIA_API_KEY:-CHANGE_ME_TELEMETRIA_API_KEY}
+      TOTP_ISSUER: ${TOTP_ISSUER:-Gestion de tokens - I.Municipalidad de Coquimbo}
       CORS_ORIGINS: ${CORS_ORIGINS:-*}
-      SEED_DEMO_DATA: ${SEED_DEMO_DATA:-false}
       PUBLIC_APP_URL: ${PUBLIC_APP_URL:-}
-      SMTP_HOST: ${SMTP_HOST:-smtp.gmail.com}
-      SMTP_PORT: ${SMTP_PORT:-587}
-      SMTP_SECURE: ${SMTP_SECURE:-false}
-      SMTP_USER: ${SMTP_USER:-}
-      SMTP_PASS: ${SMTP_PASS:-}
-      SMTP_FROM: ${SMTP_FROM:-}
+      DEFAULT_ORG_NAME: ${DEFAULT_ORG_NAME:-Ilustre Municipalidad de Coquimbo}
+      DEFAULT_DEPENDENCIA_FISICA: ${DEFAULT_DEPENDENCIA_FISICA:-Red Interna Municipal - Coquimbo}
       ADMIN_INICIAL_RUT: ${ADMIN_INICIAL_RUT:-}
       ADMIN_INICIAL_NOMBRE: ${ADMIN_INICIAL_NOMBRE:-}
       ADMIN_INICIAL_EMAIL: ${ADMIN_INICIAL_EMAIL:-}
@@ -110,13 +76,19 @@ services:
       ADMIN_INICIAL_UNIDAD: ${ADMIN_INICIAL_UNIDAD:-}
       ADMIN_INICIAL_PASSWORD: ${ADMIN_INICIAL_PASSWORD:-}
       ADMIN_INICIAL_PIN: ${ADMIN_INICIAL_PIN:-}
-      FIRMAGOB_API_URL: ${FIRMAGOB_API_URL:-}
-      FIRMAGOB_API_TOKEN: ${FIRMAGOB_API_TOKEN:-}
-      ESIGN_API_URL: ${ESIGN_API_URL:-}
-      ESIGN_API_KEY: ${ESIGN_API_KEY:-}
-      CLAVEUNICA_CLIENT_ID: ${CLAVEUNICA_CLIENT_ID:-}
-      CLAVEUNICA_CLIENT_SECRET: ${CLAVEUNICA_CLIENT_SECRET:-}
-      AD_LDAP_URL: ${AD_LDAP_URL:-}
+      EXTRA_SUPERADMINS_JSON: ${EXTRA_SUPERADMINS_JSON:-}
+      SUPERADMINS_FIJOS_JSON: ${SUPERADMINS_FIJOS_JSON:-}
+      SMTP_HOST: ${SMTP_HOST:-smtp.gmail.com}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_SECURE: ${SMTP_SECURE:-false}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASS: ${SMTP_PASS:-}
+      SMTP_FROM: ${SMTP_FROM:-}
+      MAIL_OFFICE_NAME: ${MAIL_OFFICE_NAME:-Oficina de Transformación Digital}
+      MAIL_DEPT_NAME: ${MAIL_DEPT_NAME:-Departamento de Gestión de Sistemas y TICS}
+      MAIL_CONTACT_PHONE: ${MAIL_CONTACT_PHONE:-+569 91682880}
+      MAIL_CONTACT_EMAIL: ${MAIL_CONTACT_EMAIL:-transformaciondigital@municoquimbo.cl}
+      MAIL_WEB_URL: ${MAIL_WEB_URL:-municoquimbo.cl}
     ports:
       - "3001:3001"
     depends_on:
@@ -133,7 +105,6 @@ services:
     networks:
       - gestion-firmas-net
 
-  # Portal Web React + Tailwind CSS (SPA Frontend)
   frontend:
     build:
       context: ../gestion-de-firmas-frontend
@@ -151,7 +122,6 @@ services:
     networks:
       - gestion-firmas-net
 
-  # Reverse Proxy & Gateway de Seguridad SSL/TLS (Nginx Gateway)
   gateway:
     image: nginx:alpine
     container_name: gestion-firmas-gateway
@@ -182,5 +152,4 @@ networks:
 volumes:
   postgres_data:
   redis_data:
-  minio_data:
   certbot_challenge:

@@ -15,39 +15,29 @@ export class TelemetriaController {
   @Public()
   @Post('usb')
   @HttpCode(HttpStatus.OK)
-  @ApiOperation({
-    summary: 'Ingesta de telemetría de tokens USB',
-    description: 'Endpoint consumido por la Ghost App (Electron en estaciones Windows) para reportar conexión/desconexión de tokens criptográficos.',
-  })
-  @ApiResponse({ status: 200, description: 'Evento registrado y difundido por WebSocket exitosamente.' })
+  @ApiOperation({ summary: 'Ingesta de telemetría de tokens USB desde Ghost App' })
+  @ApiResponse({ status: 200, description: 'Evento registrado y difundido por WebSocket.' })
   async registrarEvento(@Body() dto: TelemetriaUsbDto) {
     return this.telemetriaService.registrarEventoUsb(dto);
   }
 
   @Public()
   @Get('estaciones')
-  @ApiOperation({
-    summary: 'Listado de estaciones de trabajo con estado de hardware en tiempo real',
-    description: 'Combina persistencia relacional con el estado efímero y TTL de Redis para el Dashboard de Supervisores.',
-  })
+  @ApiOperation({ summary: 'Listado de estaciones de trabajo con estado de hardware en tiempo real' })
   async listarEstaciones() {
     return this.telemetriaService.obtenerEstadosEstaciones();
   }
 
   @Public()
   @Get('eventos-recientes')
-  @ApiOperation({
-    summary: 'Auditoría forense de eventos de telemetría recientes',
-  })
+  @ApiOperation({ summary: 'Últimos eventos de telemetría registrados' })
   async listarEventosRecientes() {
     return this.telemetriaService.obtenerUltimosEventos();
   }
 
   @Public()
   @Get('metricas')
-  @ApiOperation({
-    summary: 'Métricas de trazabilidad, estadísticas operacionales y porcentajes (Por Mes o Últimos 30 días)',
-  })
+  @ApiOperation({ summary: 'Métricas de trazabilidad y uso por período (7d, 15d, 30d, 60d, POR_MES, POR_ANIO)' })
   async obtenerMetricas(
     @Query('modo') modo?: string,
     @Query('mes') mes?: string,
@@ -58,18 +48,14 @@ export class TelemetriaController {
   @Roles('ADMIN')
   @Post('limpiar')
   @HttpCode(HttpStatus.OK)
-  @ApiOperation({
-    summary: 'Limpia la malla de telemetría en vivo (Redis y registros de estaciones de prueba)',
-  })
+  @ApiOperation({ summary: 'Limpia la malla de telemetría en vivo (solo ADMIN)' })
   async limpiarMalla() {
     return this.telemetriaService.limpiarTelemetria();
   }
 
   @Public()
   @Get('agente/info')
-  @ApiOperation({
-    summary: 'Información del instalador en 1 clic del Agente Silencioso USB (Opción 1: Descarga Asistida sin Active Directory)',
-  })
+  @ApiOperation({ summary: 'Información del instalador del Agente Silencioso USB (Ghost App)' })
   infoInstalador(@Req() req: Request) {
     const proto = (req.headers['x-forwarded-proto'] as string) || req.protocol || 'http';
     const host = req.get('host') || 'localhost:3001';
@@ -78,9 +64,7 @@ export class TelemetriaController {
 
   @Public()
   @Get('descargar-agente')
-  @ApiOperation({
-    summary: 'Descarga en 1 clic el instalador del Agente Silencioso de Telemetría USB preconfigurado para la estación del funcionario',
-  })
+  @ApiOperation({ summary: 'Descarga instalador del Agente Silencioso USB preconfigurado' })
   descargarInstaladorAgente(
     @Req() req: Request,
     @Res() res: Response,
@@ -89,10 +73,11 @@ export class TelemetriaController {
   ) {
     const proto = (req.headers['x-forwarded-proto'] as string) || req.protocol || 'http';
     const host = req.get('host') || 'localhost:3001';
+    const defaultDep = process.env.DEFAULT_DEPENDENCIA_FISICA || 'Red Interna Municipal - Coquimbo';
     const paquete = this.telemetriaService.generarPaqueteInstaladorAgente(
       `${proto}://${host}`,
       formato,
-      unidad || 'Red Interna Municipal - Coquimbo',
+      unidad || defaultDep,
     );
 
     if (paquete.tipo === 'exe' && paquete.filePath && fs.existsSync(paquete.filePath)) {
@@ -100,8 +85,7 @@ export class TelemetriaController {
         'Content-Type': paquete.contentType,
         'Content-Disposition': `attachment; filename="${paquete.filename}"`,
       });
-      const stream = fs.createReadStream(paquete.filePath);
-      stream.pipe(res);
+      fs.createReadStream(paquete.filePath).pipe(res);
       return;
     }
 

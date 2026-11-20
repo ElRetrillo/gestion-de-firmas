@@ -1,23 +1,10 @@
-/**
- * AGENTE LOCAL SILENCIOSO (ELECTRON GHOST APP)
- * Ilustre Municipalidad de Coquimbo - Arquitectura v2.0
- *
- * Responsabilidades:
- * 1. Ejecución Headless (sin ventana visible en el escritorio del funcionario).
- * 2. Identificación automática de la estación de trabajo vía os.hostname().
- * 3. Detección de eventos físicos USB / WebHID / SmartCard de Tokens Criptográficos
- *    (SafeNet eToken 5110 CC, Athena IDProtect, Feitian ePass2003, Gemalto IDPrime).
- * 4. Despacho de telemetría hacia POST /api/v1/telemetria/usb con cola de resiliencia
- *    local y política de reintento Exponential Backoff ante cortes de red.
- */
+// Agente local silencioso de telemetría USB (Ghost App) - Headless Node.js / Electron
 
 const os = require('os');
 const fs = require('fs');
 const path = require('path');
-const http = require('http');
 const { exec } = require('child_process');
 
-// En Node.js v18+ nativo (global fetch), permitir certificados autofirmados si NODE_TLS_REJECT_UNAUTHORIZED=0
 process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
 
 let electronApp = null;
@@ -29,10 +16,9 @@ try {
   BrowserWindow = electron.BrowserWindow;
   ipcMain = electron.ipcMain;
 } catch {
-  // Permite ejecución en modo servicio Node.js puro si Electron no está presente en el host
+  // Ejecución en modo Node.js puro cuando Electron no está presente
 }
 
-// Carga de configuración portable (archivo local config.json o variables de entorno)
 function loadConfig() {
   const configPath = path.join(__dirname, 'config.json');
   let fileConfig = {};
@@ -41,7 +27,7 @@ function loadConfig() {
       fileConfig = JSON.parse(fs.readFileSync(configPath, 'utf8'));
     }
   } catch (err) {
-    console.warn('[GhostAgent] Advertencia al leer config.json local:', err.message);
+    console.warn('[GhostAgent] Advertencia al leer config.json:', err.message);
   }
 
   const apiUrl =
@@ -52,7 +38,7 @@ function loadConfig() {
   const apiKey =
     process.env.TELEMETRIA_API_KEY ||
     fileConfig.apiKey ||
-    'muni-coquimbo-ghost-app-sec-key-2026';
+    'CHANGE_ME_TELEMETRIA_API_KEY';
 
   const hostname =
     process.env.CODIGO_PC_OVERRIDE ||
@@ -65,27 +51,21 @@ function loadConfig() {
     'Red Interna Municipal - Coquimbo';
 
   const pollInterval = Number(
-    process.env.USB_POLL_INTERVAL_MS ||
-    fileConfig.pollIntervalMs ||
-    2000,
+    process.env.USB_POLL_INTERVAL_MS || fileConfig.pollIntervalMs || 2000,
   );
 
   const heartbeatInterval = Number(
-    process.env.USB_HEARTBEAT_INTERVAL_MS ||
-    fileConfig.heartbeatIntervalMs ||
-    45000,
+    process.env.USB_HEARTBEAT_INTERVAL_MS || fileConfig.heartbeatIntervalMs || 45000,
   );
 
-  // Directorio portable y resiliente para la cola offline en cualquier usuario de Windows
   const appDataRoot = process.env.LOCALAPPDATA || process.env.APPDATA || os.tmpdir();
   const queueDir = path.join(appDataRoot, 'CoquimboGhostApp');
   try {
     if (!fs.existsSync(queueDir)) {
       fs.mkdirSync(queueDir, { recursive: true });
     }
-  } catch {
-    // Si falla crear en AppData, utilizar directorio temporal del sistema
-  }
+  } catch {}
+
   const queueFile = fs.existsSync(queueDir)
     ? path.join(queueDir, 'telemetry-queue.json')
     : path.join(os.tmpdir(), 'coquimbo-ghost-telemetry-queue.json');
@@ -110,7 +90,6 @@ const POLL_INTERVAL_MS = CONFIG.pollInterval;
 const HEARTBEAT_INTERVAL_MS = CONFIG.heartbeatInterval;
 const OFFLINE_QUEUE_FILE = CONFIG.queueFile;
 
-// Catálogo de Vendor IDs oficiales de Tokens Criptográficos Acreditados (Ley N° 19.799)
 const KNOWN_CRYPTO_VENDORS = {
   '0529': { marca: 'Thales / SafeNet', modelo: 'eToken 5110 CC (FIPS 140-2 L3)' },
   '04B9': { marca: 'SafeNet / Rainbow', modelo: 'iKey / eToken Pro USB' },
@@ -124,7 +103,6 @@ const KNOWN_CRYPTO_VENDORS = {
   '20A0': { marca: 'Nitrokey', modelo: 'Nitrokey HSM / Pro USB' },
 };
 
-// Cola en memoria y disco para resiliencia con Exponential Backoff
 let pendingQueue = [];
 let retryAttempt = 0;
 let retryTimer = null;
@@ -137,11 +115,11 @@ let isScanning = false;
 function loadOfflineQueue() {
   try {
     if (fs.existsSync(OFFLINE_QUEUE_FILE)) {
-      const raw = fs.readFileSync(OFFLINE_QUEUE_FILE, 'utf8');
-      const parsed = JSON.parse(raw);
-      // Conservar solo eventos de cambio real de estado recientes para evitar re-emitir estados obsoletos
+      const parsed = JSON.parse(fs.readFileSync(OFFLINE_QUEUE_FILE, 'utf8'));
       if (Array.isArray(parsed)) {
-        pendingQueue = parsed.filter((item) => item && item.metadatos && item.metadatos.stateChanged === true).slice(-10);
+        pendingQueue = parsed
+          .filter((item) => item && item.metadatos && item.metadatos.stateChanged === true)
+          .slice(-10);
       }
     }
   } catch {
@@ -152,9 +130,7 @@ function loadOfflineQueue() {
 function saveOfflineQueue() {
   try {
     fs.writeFileSync(OFFLINE_QUEUE_FILE, JSON.stringify(pendingQueue.slice(-50), null, 2), 'utf8');
-  } catch {
-    // Ignorar errores de escritura en tmp
-  }
+  } catch {}
 }
 
 function getLocalIpAddress() {
@@ -169,14 +145,11 @@ function getLocalIpAddress() {
   return '10.10.12.100';
 }
 
-/**
- * Envía el payload al Backend NestJS con política de Exponential Backoff
- * Base delay: 2s -> 4s -> 8s -> 16s -> 32s -> max 60s
- */
 async function sendTelemetryWithBackoff(payload) {
-  // Si hay un cambio de estado real, descartar heartbeats antiguos en cola de la misma estación
   if (payload.metadatos && payload.metadatos.stateChanged) {
-    pendingQueue = pendingQueue.filter((item) => item.codigoPc !== payload.codigoPc || item.metadatos?.stateChanged);
+    pendingQueue = pendingQueue.filter(
+      (item) => item.codigoPc !== payload.codigoPc || item.metadatos?.stateChanged,
+    );
   }
   pendingQueue.push(payload);
   saveOfflineQueue();
@@ -200,11 +173,8 @@ async function flushQueue() {
         body: JSON.stringify(item),
       });
 
-      if (!response.ok) {
-        throw new Error(`HTTP ${response.status}`);
-      }
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
 
-      // Éxito: remover de la cola y reiniciar contador de backoff
       pendingQueue.shift();
       saveOfflineQueue();
       retryAttempt = 0;
@@ -214,7 +184,7 @@ async function flushQueue() {
       }
       const tag = item.metadatos?.isHeartbeat ? 'HEARTBEAT' : 'EVENTO';
       console.log(
-        `[GhostAgent] [${tag}] Telemetría sincronizada -> PC=${item.codigoPc} Estado=${item.estadoHardware}${
+        `[GhostAgent] [${tag}] PC=${item.codigoPc} Estado=${item.estadoHardware}${
           item.serialNumber ? ` S/N=${item.serialNumber}` : ''
         }`,
       );
@@ -222,9 +192,8 @@ async function flushQueue() {
       retryAttempt += 1;
       const delayMs = Math.min(60000, Math.pow(2, retryAttempt) * 1000 + Math.floor(Math.random() * 500));
       console.warn(
-        `[GhostAgent] Servidor central no disponible (${error.message}). Eventos en cola local: ${pendingQueue.length}. Reintento #${retryAttempt} en ${Math.round(delayMs / 1000)}s (Exponential Backoff)...`,
+        `[GhostAgent] Servidor no disponible (${error.message}). Cola: ${pendingQueue.length}. Reintento #${retryAttempt} en ${Math.round(delayMs / 1000)}s.`,
       );
-
       if (!retryTimer) {
         retryTimer = setTimeout(() => {
           retryTimer = null;
@@ -236,10 +205,6 @@ async function flushQueue() {
   }
 }
 
-/**
- * Inspecciona el bus USB / SmartCard en Windows mediante WMI/PnP para detectar Tokens PKCS#11 físicos reales.
- * Excluye explícitamente buses virtuales de software como SWD\SCDEVICEENUMBUS\0 ("Smart Card Device Enumeration Bus").
- */
 function scanWindowsUsbTokens() {
   return new Promise((resolve) => {
     if (process.platform !== 'win32') {
@@ -258,18 +223,13 @@ function scanWindowsUsbTokens() {
         const parsed = JSON.parse(stdout.trim());
         const devices = Array.isArray(parsed) ? parsed : [parsed];
 
-        // Filtrar cualquier bus de software o enumerador virtual
         const validDevices = devices.filter((d) => {
           if (!d || !d.InstanceId) return false;
           const id = String(d.InstanceId).toUpperCase();
           const cls = String(d.Class || '').toUpperCase();
           const name = String(d.FriendlyName || '').toUpperCase();
-          if (cls === 'SOFTWAREDEVICE' || id.startsWith('SWD\\') || id.startsWith('ROOT\\')) {
-            return false;
-          }
-          if (name.includes('ENUMERATION BUS') || name.includes('VIRTUAL')) {
-            return false;
-          }
+          if (cls === 'SOFTWAREDEVICE' || id.startsWith('SWD\\') || id.startsWith('ROOT\\')) return false;
+          if (name.includes('ENUMERATION BUS') || name.includes('VIRTUAL')) return false;
           return String(d.Status || '').toUpperCase() === 'OK';
         });
 
@@ -278,7 +238,6 @@ function scanWindowsUsbTokens() {
           return;
         }
 
-        // Priorizar el dispositivo que exponga explícitamente el bus USB con VID_XXXX sobre filtros SCFILTER
         validDevices.sort((a, b) => {
           const aHasVid = /VID_[0-9A-F]{4}/i.test(String(a.InstanceId)) ? 0 : 1;
           const bHasVid = /VID_[0-9A-F]{4}/i.test(String(b.InstanceId)) ? 0 : 1;
@@ -290,7 +249,6 @@ function scanWindowsUsbTokens() {
         const vidMatch = instanceIdStr.match(/VID_([0-9A-F]{4})/i);
         const vid = vidMatch ? vidMatch[1].toUpperCase() : 'UNKNOWN';
 
-        // Extraer número de serie real de la instancia USB si está disponible (ej: USB\VID_08E6&PID_34CF\D453B70C2CF7)
         const parts = instanceIdStr.split('\\');
         const rawInstanceSerial = parts.length >= 3 ? parts[2] : '';
         const cleanSerial =
@@ -298,17 +256,15 @@ function scanWindowsUsbTokens() {
             ? `SN-${vid}-${rawInstanceSerial.replace(/[^A-Z0-9-]/gi, '').toUpperCase()}`
             : `SN-WIN-${HOSTNAME}-${vid}`;
 
-        // Obtener el nombre registrado en el OS exactamente como lo reporta el sistema operativo
         const osDeviceName = String(chosen.FriendlyName || chosen.Caption || chosen.Description || '').trim();
         const osManufacturer = String(chosen.Manufacturer || '').trim();
-
         const vendorMeta = KNOWN_CRYPTO_VENDORS[vid];
+
         const marcaFinal =
           osManufacturer && !osManufacturer.startsWith('(') && osManufacturer.toLowerCase() !== 'microsoft'
             ? osManufacturer
             : vendorMeta?.marca || 'Dispositivo Criptográfico PKCS#11';
 
-        // El modelo/nombre visual debe ser el nombre del token que tiene registrado en el OS
         const modeloFinal = osDeviceName || vendorMeta?.modelo || 'Token Criptográfico USB';
 
         resolve({
@@ -325,184 +281,6 @@ function scanWindowsUsbTokens() {
   });
 }
 
-async function monitorUsbLoop() {
-  if (isScanning) return;
-  isScanning = true;
-
-  try {
-    const detectedToken = await scanWindowsUsbTokens();
-    const currentState = detectedToken ? 'CONECTADO' : 'DESCONECTADO';
-    const currentSerial = detectedToken ? detectedToken.serialNumber : null;
-
-    const stateChanged =
-      lastKnownState !== null &&
-      (currentState !== lastKnownState ||
-        (currentState === 'CONECTADO' && currentSerial !== lastKnownSerial));
-
-    // Si es el primer escaneo al encender el agente:
-    const isFirstScan = lastKnownState === null;
-    const now = Date.now();
-    const heartbeatDue = !isFirstScan && now - lastHeartbeatAt >= HEARTBEAT_INTERVAL_MS;
-
-    // Si el token está CONECTADO, heredar certMeta previo o intentar resolver el certificado X.509 si aún no se propagó al almacén de Windows
-    let certNewlyResolved = false;
-    if (currentState === 'CONECTADO' && detectedToken) {
-      if (
-        !stateChanged &&
-        lastKnownToken?.certMeta?.titularNombre &&
-        lastKnownSerial === currentSerial
-      ) {
-        detectedToken.certMeta = lastKnownToken.certMeta;
-      } else {
-        try {
-          const certs = await listarCertificadosTokenWindows();
-          if (certs && certs.length > 0) {
-            const c = certs[0];
-            const subj = String(c.subject || '');
-            const emailM = subj.match(/E=([^,]+)/i);
-            const cargoM = subj.match(/\bT=([^,]+)/i);
-            const ouM = subj.match(/OU=RA\s*-\s*([^,]+)/i) || subj.match(/OU=([^,]+)/i);
-            detectedToken.certMeta = {
-              titularNombre: c.cn || null,
-              titularRut: c.rut || null,
-              titularEmail: emailM ? emailM[1].trim() : null,
-              titularCargo: cargoM ? cargoM[1].trim() : null,
-              titularUnidad: ouM ? ouM[1].trim() : null,
-              certSerialNumber: c.serialNumber || null,
-              certNotAfter: c.notAfter || null,
-              certIssuer: c.issuer || null,
-              certThumbprint: c.thumbprint || null,
-            };
-            guardarCacheCertToken(detectedToken.serialNumber, detectedToken.certMeta);
-            if (!lastKnownToken?.certMeta?.titularNombre && detectedToken.certMeta.titularNombre) {
-              certNewlyResolved = true;
-            }
-          } else {
-            const cachedMeta = obtenerCacheCertToken(detectedToken.serialNumber);
-            if (cachedMeta?.titularNombre) {
-              detectedToken.certMeta = cachedMeta;
-            }
-          }
-        } catch {
-          const cachedMeta = obtenerCacheCertToken(detectedToken.serialNumber);
-          if (cachedMeta?.titularNombre) {
-            detectedToken.certMeta = cachedMeta;
-          }
-        }
-      }
-    }
-
-    // Solo emitir si:
-    // 1. Hay un cambio real de estado (se conectó, o se desconectó habiendo estado conectado)
-    // 2. O en el primer escaneo si hay un token conectado de inmediato
-    // 3. O si el certificado X.509 terminó de propagarse segundos después de insertar el USB
-    // 4. O por heartbeat periódico de presencia (sin stackear eventos)
-    const shouldSend =
-      stateChanged ||
-      certNewlyResolved ||
-      (isFirstScan && currentState === 'CONECTADO') ||
-      (isFirstScan && currentState === 'DESCONECTADO') ||
-      heartbeatDue;
-
-    if (!shouldSend) {
-      return;
-    }
-
-    if (stateChanged || certNewlyResolved || (isFirstScan && currentState === 'CONECTADO')) {
-      if (currentState === 'CONECTADO' && detectedToken) {
-        console.log(
-          `[GhostAgent] [USB CONECTADO] Token detectado: ${detectedToken.marca} - ${detectedToken.modelo} (S/N: ${detectedToken.serialNumber})${
-            detectedToken.certMeta?.titularNombre ? ` | Titular: ${detectedToken.certMeta.titularNombre}` : ''
-          }`,
-        );
-      } else if (currentState === 'DESCONECTADO' && lastKnownToken) {
-        console.log(
-          `[GhostAgent] [USB DESCONECTADO] Token removido de la estación ${HOSTNAME} (S/N: ${lastKnownToken.serialNumber}). Esperando conexión...`,
-        );
-      }
-    }
-
-    const payload = {
-      codigoPc: HOSTNAME,
-      estadoHardware: currentState,
-      serialNumber: detectedToken ? detectedToken.serialNumber : undefined,
-      vendorId: detectedToken ? detectedToken.vendorId : undefined,
-      marca: detectedToken ? detectedToken.marca : undefined,
-      modelo: detectedToken ? detectedToken.modelo : undefined,
-      ipAsignada: getLocalIpAddress(),
-      dependenciaFisica: DEPENDENCIA_FISICA,
-      timestamp: new Date().toISOString(),
-      metadatos: {
-        osPlatform: `${os.type()} ${os.release()}`,
-        hostname: os.hostname(),
-        agentVersion: '2.1.0-headless',
-        stateChanged: stateChanged || (isFirstScan && currentState === 'CONECTADO'),
-        isHeartbeat: !stateChanged && !isFirstScan,
-        previousSerialNumber: !detectedToken && lastKnownToken ? lastKnownToken.serialNumber : undefined,
-        ...(detectedToken?.certMeta || {}),
-      },
-    };
-
-    lastKnownState = currentState;
-    lastKnownSerial = currentSerial;
-    if (detectedToken) {
-      lastKnownToken = detectedToken;
-    }
-    lastHeartbeatAt = now;
-
-    await sendTelemetryWithBackoff(payload);
-  } finally {
-    isScanning = false;
-  }
-}
-
-async function handleGracefulShutdown() {
-  console.log(`\n[GhostAgent] Cerrando agente en ${HOSTNAME}. Notificando estado DESCONECTADO...`);
-  try {
-    await fetch(API_BASE_URL, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-Api-Key': API_KEY,
-        'X-Ghost-Agent-Version': '2.1.0-headless',
-        'X-Workstation-Hostname': HOSTNAME,
-      },
-      body: JSON.stringify({
-        codigoPc: HOSTNAME,
-        estadoHardware: 'DESCONECTADO',
-        ipAsignada: getLocalIpAddress(),
-        dependenciaFisica: DEPENDENCIA_FISICA,
-        timestamp: new Date().toISOString(),
-        metadatos: {
-          osPlatform: `${os.type()} ${os.release()}`,
-          hostname: os.hostname(),
-          agentVersion: '2.1.0-headless',
-          stateChanged: true,
-          isHeartbeat: false,
-          reason: 'AGENT_SHUTDOWN',
-          previousSerialNumber: lastKnownToken ? lastKnownToken.serialNumber : undefined,
-        },
-      }),
-    });
-  } catch {
-    // Ignorar error al cerrar
-  }
-  process.exit(0);
-}
-
-const KNOWN_TOKEN_CERT_HOLDERS = {
-  'SN-08E6-D453B70C2CF7': {
-    titularNombre: 'Ignacio Alejandro Rosales Riffo',
-    titularEmail: 'irosalesr@municoquimbo.cl',
-    titularCargo: 'Profesional',
-    titularUnidad: 'RA - Ilustre Municipalidad de Coquimbo',
-    certSerialNumber: '5E47C2C6E76999681449',
-    certNotAfter: '2026-05-08T16:13:00-04:00',
-    certIssuer: 'CN=ESign Class 3 Admin - AR Estado de Chile CA',
-    certThumbprint: '10415AC611BAD1D9D861D9904306F42F832BAC7A',
-  },
-};
-
 function getTokenCertCachePath() {
   return path.join(path.dirname(OFFLINE_QUEUE_FILE), 'token-certs-cache.json');
 }
@@ -511,9 +289,7 @@ function esNombreIdentificadorInvalido(nombre) {
   if (!nombre) return true;
   const s = String(nombre).trim();
   if (!s) return true;
-  // Descartar UUID/GUID (ej: xxxx-xxxx-xxxx-xxxx o xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx)
   if (/^\{?[0-9a-f]{4,8}(-[0-9a-f]{4,12}){2,4}\}?$/i.test(s)) return true;
-  // Descartar certificados internos de sistema/MDM/Windows
   if (/^(MS-Organization-Access|MS-Organization-P2P-Access|localhost|DESKTOP-|WIN-)/i.test(s)) return true;
   return false;
 }
@@ -530,7 +306,7 @@ function obtenerCacheCertToken(serialNumber) {
       }
     }
   } catch {}
-  return KNOWN_TOKEN_CERT_HOLDERS[key] || null;
+  return null;
 }
 
 function guardarCacheCertToken(serialNumber, certMeta) {
@@ -538,9 +314,9 @@ function guardarCacheCertToken(serialNumber, certMeta) {
   const key = String(serialNumber).toUpperCase();
   try {
     const cachePath = getTokenCertCachePath();
-    let map = { ...KNOWN_TOKEN_CERT_HOLDERS };
+    let map = {};
     if (fs.existsSync(cachePath)) {
-      map = { ...map, ...JSON.parse(fs.readFileSync(cachePath, 'utf8')) };
+      map = JSON.parse(fs.readFileSync(cachePath, 'utf8'));
     }
     map[key] = certMeta;
     fs.writeFileSync(cachePath, JSON.stringify(map, null, 2), 'utf8');
@@ -643,132 +419,151 @@ function listarCertificadosTokenWindows() {
   });
 }
 
-function firmarPkcs7ConTokenWindows(payloadBase64, thumbprint) {
-  return new Promise((resolve, reject) => {
-    const tmpId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-    const tmpIn = path.join(os.tmpdir(), `cqm-sign-in-${tmpId}.bin`);
-    const tmpOut = path.join(os.tmpdir(), `cqm-sign-out-${tmpId}.json`);
-    try {
-      fs.writeFileSync(tmpIn, Buffer.from(payloadBase64, 'base64'));
-    } catch (e) {
-      return reject(new Error(`No se pudo preparar archivo temporal de firma: ${e.message}`));
+async function monitorUsbLoop() {
+  if (isScanning) return;
+  isScanning = true;
+
+  try {
+    const detectedToken = await scanWindowsUsbTokens();
+    const currentState = detectedToken ? 'CONECTADO' : 'DESCONECTADO';
+    const currentSerial = detectedToken ? detectedToken.serialNumber : null;
+
+    const stateChanged =
+      lastKnownState !== null &&
+      (currentState !== lastKnownState ||
+        (currentState === 'CONECTADO' && currentSerial !== lastKnownSerial));
+
+    const isFirstScan = lastKnownState === null;
+    const now = Date.now();
+    const heartbeatDue = !isFirstScan && now - lastHeartbeatAt >= HEARTBEAT_INTERVAL_MS;
+
+    let certNewlyResolved = false;
+    if (currentState === 'CONECTADO' && detectedToken) {
+      if (
+        !stateChanged &&
+        lastKnownToken?.certMeta?.titularNombre &&
+        lastKnownSerial === currentSerial
+      ) {
+        detectedToken.certMeta = lastKnownToken.certMeta;
+      } else {
+        try {
+          const certs = await listarCertificadosTokenWindows();
+          if (certs && certs.length > 0) {
+            const c = certs[0];
+            const subj = String(c.subject || '');
+            const emailM = subj.match(/E=([^,]+)/i);
+            const cargoM = subj.match(/\bT=([^,]+)/i);
+            const ouM = subj.match(/OU=RA\s*-\s*([^,]+)/i) || subj.match(/OU=([^,]+)/i);
+            detectedToken.certMeta = {
+              titularNombre: c.cn || null,
+              titularRut: c.rut || null,
+              titularEmail: emailM ? emailM[1].trim() : null,
+              titularCargo: cargoM ? cargoM[1].trim() : null,
+              titularUnidad: ouM ? ouM[1].trim() : null,
+              certSerialNumber: c.serialNumber || null,
+              certNotAfter: c.notAfter || null,
+              certIssuer: c.issuer || null,
+              certThumbprint: c.thumbprint || null,
+            };
+            guardarCacheCertToken(detectedToken.serialNumber, detectedToken.certMeta);
+            if (!lastKnownToken?.certMeta?.titularNombre && detectedToken.certMeta.titularNombre) {
+              certNewlyResolved = true;
+            }
+          } else {
+            const cachedMeta = obtenerCacheCertToken(detectedToken.serialNumber);
+            if (cachedMeta?.titularNombre) detectedToken.certMeta = cachedMeta;
+          }
+        } catch {
+          const cachedMeta = obtenerCacheCertToken(detectedToken.serialNumber);
+          if (cachedMeta?.titularNombre) detectedToken.certMeta = cachedMeta;
+        }
+      }
     }
 
-    const thumbFilter = thumbprint
-      ? `$cert = Get-ChildItem Cert:\\CurrentUser\\My | Where-Object { $_.HasPrivateKey -and $_.Thumbprint -eq '${String(thumbprint).replace(/[^A-Fa-f0-9]/g, '')}' } | Select-Object -First 1`
-      : `$cert = Get-ChildItem Cert:\\CurrentUser\\My | Where-Object { $_.HasPrivateKey } | Select-Object -First 1`;
+    const shouldSend =
+      stateChanged ||
+      certNewlyResolved ||
+      isFirstScan ||
+      heartbeatDue;
 
-    const ps = `
-      $ErrorActionPreference = 'Stop'
-      Add-Type -AssemblyName System.Security
-      ${thumbFilter}
-      if (-not $cert) { throw 'No se encontró certificado con clave privada en el token USB.' }
-      $bytes = [System.IO.File]::ReadAllBytes('${tmpIn.replace(/'/g, "''")}')
-      $contentInfo = New-Object System.Security.Cryptography.Pkcs.ContentInfo(,$bytes)
-      $signedCms = New-Object System.Security.Cryptography.Pkcs.SignedCms($contentInfo, $true)
-      $signer = New-Object System.Security.Cryptography.Pkcs.CmsSigner([System.Security.Cryptography.Pkcs.SubjectIdentifierType]::IssuerAndSerialNumber, $cert)
-      $signer.DigestAlgorithm = New-Object System.Security.Cryptography.Oid('2.16.840.1.101.3.4.2.1')
-      $signer.IncludeOption = [System.Security.Cryptography.X509Certificates.X509IncludeOption]::ExcludeRoot
-      $signedCms.ComputeSignature($signer, $false)
-      $pkcs7Bytes = $signedCms.Encode()
-      $res = [PSCustomObject]@{
-        pkcs7Base64 = [Convert]::ToBase64String($pkcs7Bytes)
-        thumbprint = $cert.Thumbprint
-        subject = $cert.Subject
-        issuer = $cert.Issuer
+    if (!shouldSend) return;
+
+    if (stateChanged || certNewlyResolved || (isFirstScan && currentState === 'CONECTADO')) {
+      if (currentState === 'CONECTADO' && detectedToken) {
+        console.log(
+          `[GhostAgent] [USB CONECTADO] ${detectedToken.marca} - ${detectedToken.modelo} (S/N: ${detectedToken.serialNumber})${
+            detectedToken.certMeta?.titularNombre ? ` | Titular: ${detectedToken.certMeta.titularNombre}` : ''
+          }`,
+        );
+      } else if (currentState === 'DESCONECTADO' && lastKnownToken) {
+        console.log(
+          `[GhostAgent] [USB DESCONECTADO] Token removido de ${HOSTNAME} (S/N: ${lastKnownToken.serialNumber}).`,
+        );
       }
-      $res | ConvertTo-Json -Compress | Set-Content -Path '${tmpOut.replace(/'/g, "''")}' -Encoding UTF8
-    `;
-    const encoded = Buffer.from(ps, 'utf16le').toString('base64');
-    exec(
-      `powershell -NoProfile -EncodedCommand ${encoded}`,
-      { windowsHide: false, timeout: 60000 },
-      (err, _stdout, stderr) => {
-        try {
-          if (err) {
-            return reject(new Error(stderr || err.message || 'Error al firmar con el token USB.'));
-          }
-          const jsonText = fs.readFileSync(tmpOut, 'utf8').replace(/^\uFEFF/, '').trim();
-          const parsed = JSON.parse(jsonText);
-          resolve(parsed);
-        } catch (parseErr) {
-          reject(new Error(`Error leyendo respuesta criptográfica: ${parseErr.message}`));
-        } finally {
-          try { fs.unlinkSync(tmpIn); } catch {}
-          try { fs.unlinkSync(tmpOut); } catch {}
-        }
+    }
+
+    const payload = {
+      codigoPc: HOSTNAME,
+      estadoHardware: currentState,
+      serialNumber: detectedToken ? detectedToken.serialNumber : undefined,
+      vendorId: detectedToken ? detectedToken.vendorId : undefined,
+      marca: detectedToken ? detectedToken.marca : undefined,
+      modelo: detectedToken ? detectedToken.modelo : undefined,
+      ipAsignada: getLocalIpAddress(),
+      dependenciaFisica: DEPENDENCIA_FISICA,
+      timestamp: new Date().toISOString(),
+      metadatos: {
+        osPlatform: `${os.type()} ${os.release()}`,
+        hostname: os.hostname(),
+        agentVersion: '2.1.0-headless',
+        stateChanged: stateChanged || (isFirstScan && currentState === 'CONECTADO'),
+        isHeartbeat: !stateChanged && !isFirstScan,
+        previousSerialNumber: !detectedToken && lastKnownToken ? lastKnownToken.serialNumber : undefined,
+        ...(detectedToken?.certMeta || {}),
       },
-    );
-  });
+    };
+
+    lastKnownState = currentState;
+    lastKnownSerial = currentSerial;
+    if (detectedToken) lastKnownToken = detectedToken;
+    lastHeartbeatAt = now;
+
+    await sendTelemetryWithBackoff(payload);
+  } finally {
+    isScanning = false;
+  }
 }
 
-function startLocalTokenSigningBridge() {
-  const PORT = Number(process.env.GHOST_SIGN_PORT || 48921);
-  const server = http.createServer(async (req, res) => {
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-
-    if (req.method === 'OPTIONS') {
-      res.writeHead(204);
-      res.end();
-      return;
-    }
-
-    if (req.method === 'GET' && req.url === '/api/token/certificado') {
-      const certificados = await listarCertificadosTokenWindows();
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(
-        JSON.stringify({
-          disponible: certificados.length > 0,
-          estacion: HOSTNAME,
-          certificados,
-        }),
-      );
-      return;
-    }
-
-    if (req.method === 'POST' && req.url === '/api/token/firmar-pkcs7') {
-      let body = '';
-      req.on('data', (chunk) => {
-        body += chunk;
-        if (body.length > 25 * 1024 * 1024) {
-          req.destroy();
-        }
-      });
-      req.on('end', async () => {
-        try {
-          const parsed = JSON.parse(body || '{}');
-          if (!parsed.payloadBase64) {
-            res.writeHead(400, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ error: 'payloadBase64 es requerido' }));
-            return;
-          }
-          const resultado = await firmarPkcs7ConTokenWindows(
-            parsed.payloadBase64,
-            parsed.thumbprint,
-          );
-          res.writeHead(200, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify(resultado));
-        } catch (err) {
-          res.writeHead(500, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: err.message || 'Error firmando con token' }));
-        }
-      });
-      return;
-    }
-
-    res.writeHead(404, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: 'Ruta no encontrada' }));
-  });
-
-  server.on('error', (err) => {
-    console.warn(`[GhostAgent] Puente de firma local en puerto ${PORT} no disponible:`, err.message);
-  });
-
-  server.listen(PORT, '127.0.0.1', () => {
-    console.log(`[GhostAgent] Puente criptográfico de token activo en http://127.0.0.1:${PORT}`);
-  });
+async function handleGracefulShutdown() {
+  console.log(`\n[GhostAgent] Cerrando agente en ${HOSTNAME}. Notificando DESCONECTADO...`);
+  try {
+    await fetch(API_BASE_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Api-Key': API_KEY,
+        'X-Ghost-Agent-Version': '2.1.0-headless',
+        'X-Workstation-Hostname': HOSTNAME,
+      },
+      body: JSON.stringify({
+        codigoPc: HOSTNAME,
+        estadoHardware: 'DESCONECTADO',
+        ipAsignada: getLocalIpAddress(),
+        dependenciaFisica: DEPENDENCIA_FISICA,
+        timestamp: new Date().toISOString(),
+        metadatos: {
+          osPlatform: `${os.type()} ${os.release()}`,
+          hostname: os.hostname(),
+          agentVersion: '2.1.0-headless',
+          stateChanged: true,
+          isHeartbeat: false,
+          reason: 'AGENT_SHUTDOWN',
+          previousSerialNumber: lastKnownToken ? lastKnownToken.serialNumber : undefined,
+        },
+      }),
+    });
+  } catch {}
+  process.exit(0);
 }
 
 function startHeadlessAgent() {
@@ -776,7 +571,6 @@ function startHeadlessAgent() {
   console.log(`[GhostAgent] Destino de Telemetría: ${API_BASE_URL}`);
   console.log(`[GhostAgent] Escaneo PnP/USB activo cada ${POLL_INTERVAL_MS}ms...`);
   loadOfflineQueue();
-  startLocalTokenSigningBridge();
   monitorUsbLoop();
   setInterval(monitorUsbLoop, POLL_INTERVAL_MS);
 
@@ -785,27 +579,18 @@ function startHeadlessAgent() {
 }
 
 if (electronApp) {
-  // Ocultar icono en Dock / Barra de tareas para operación Headless transparente
-  if (electronApp.dock) {
-    electronApp.dock.hide();
-  }
+  if (electronApp.dock) electronApp.dock.hide();
 
-  // Configurar inicio automático en el arranque del sistema operativo (Arquitectura Capa 1)
   try {
-    electronApp.setLoginItemSettings({
-      openAtLogin: true,
-      path: process.execPath,
-    });
+    electronApp.setLoginItemSettings({ openAtLogin: true, path: process.execPath });
     electronApp.setAsDefaultProtocolClient('coquimbo-agent');
-  } catch {
-    // Ignorar si el entorno restringe el registro de inicio
-  }
+  } catch {}
 
   if (ipcMain) {
     ipcMain.handle('get-workstation-hostname', () => HOSTNAME);
     ipcMain.on('webhid-usb-event', (_event, hidPayload) => {
       console.log(
-        `[GhostAgent] [WebHID IPC] Interrupción física detectada en ${hidPayload?.codigoPc || HOSTNAME}: ${hidPayload?.tipo} (vendorId=${hidPayload?.vendorId})`,
+        `[GhostAgent] [WebHID] ${hidPayload?.codigoPc || HOSTNAME}: ${hidPayload?.tipo} (vendorId=${hidPayload?.vendorId})`,
       );
       monitorUsbLoop();
     });
@@ -823,7 +608,6 @@ if (electronApp) {
       },
     });
 
-    // Habilitar permisos automáticos para WebHID en el contexto oculto
     hiddenWin.webContents.session.setDevicePermissionHandler(() => true);
     hiddenWin.webContents.session.on('select-hid-device', (event, details, callback) => {
       event.preventDefault();
@@ -834,7 +618,6 @@ if (electronApp) {
       }
     });
 
-    // Cargar proceso de renderizado oculto con escuchas nativas WebHID (navigator.hid) y canal IPC (ipcRenderer)
     const rendererHtml = `
       <!DOCTYPE html>
       <html>
@@ -880,7 +663,7 @@ if (electronApp) {
   });
 
   electronApp.on('window-all-closed', (e) => {
-    e.preventDefault(); // Mantener residente en segundo plano
+    e.preventDefault();
   });
 } else {
   startHeadlessAgent();

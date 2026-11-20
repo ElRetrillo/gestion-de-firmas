@@ -1,15 +1,11 @@
 import * as crypto from 'crypto';
 
-/**
- * Utilidades para autenticación OTP / TOTP conforme al estándar RFC 6238
- * Compatible con Google Authenticator, Microsoft Authenticator, FreeOTP, Aegis, 2FAS.
- */
-
 const BASE32_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
 
-/**
- * Decodifica una cadena Base32 a Buffer
- */
+export function getTotpIssuer(): string {
+  return process.env.TOTP_ISSUER || 'Gestion de tokens - I.Municipalidad de Coquimbo';
+}
+
 export function base32Decode(base32: string): Buffer {
   const clean = base32.toUpperCase().replace(/=+$/, '').replace(/\s+/g, '');
   let bits = 0;
@@ -30,9 +26,6 @@ export function base32Decode(base32: string): Buffer {
   return Buffer.from(output);
 }
 
-/**
- * Codifica un Buffer a cadena Base32
- */
 export function base32Encode(buffer: Buffer): string {
   let bits = 0;
   let value = 0;
@@ -54,30 +47,18 @@ export function base32Encode(buffer: Buffer): string {
   return output;
 }
 
-/**
- * Genera un secreto Base32 criptográficamente seguro de 20 bytes (160 bits)
- */
 export function generarSecretoBase32(longitudBytes = 20): string {
-  const bytes = crypto.randomBytes(longitudBytes);
-  return base32Encode(bytes);
+  return base32Encode(crypto.randomBytes(longitudBytes));
 }
 
-/**
- * Deriva un secreto TOTP determinístico para un usuario a partir de su RUT y una sal de servidor.
- * Permite que cada usuario tenga un secreto OTP único y reproducible sin necesidad de migraciones de BD.
- */
 export function derivarSecretoUsuario(rut: string, serverKey: string): string {
   const hmac = crypto
     .createHmac('sha256', serverKey)
     .update(`COQUIMBO_TOTP_SEED_V2:${rut.trim().toUpperCase()}`)
     .digest();
-  // Tomar los primeros 20 bytes para la semilla TOTP (estándar SHA-1)
   return base32Encode(hmac.subarray(0, 20));
 }
 
-/**
- * Calcula el código TOTP de 6 dígitos para un instante de tiempo dado (RFC 6238)
- */
 export function calcularTotp(
   secretBase32: string,
   timestampMs = Date.now(),
@@ -85,8 +66,7 @@ export function calcularTotp(
   digits = 6,
 ): string {
   const key = base32Decode(secretBase32);
-  const epoch = Math.floor(timestampMs / 1000);
-  const counter = Math.floor(epoch / stepSeconds);
+  const counter = Math.floor(Math.floor(timestampMs / 1000) / stepSeconds);
 
   const counterBuffer = Buffer.alloc(8);
   counterBuffer.writeBigInt64BE(BigInt(counter));
@@ -104,9 +84,6 @@ export function calcularTotp(
   return String(code).padStart(digits, '0');
 }
 
-/**
- * Verifica un código OTP ingresado por el usuario con tolerancia de deriva de reloj (+/- 1 ventana)
- */
 export function verificarTotp(
   secretBase32: string,
   codigoIngresado: string,
@@ -131,15 +108,12 @@ export function verificarTotp(
   return false;
 }
 
-/**
- * Construye la URL estándar otpauth:// para escanear en Google / Microsoft Authenticator
- */
 export function generarOtpauthUrl(params: {
   cuenta: string;
   emisor?: string;
   secretBase32: string;
 }): string {
-  const emisor = params.emisor || 'Gestion de tokens - I.Municipalidad de Coquimbo';
+  const emisor = params.emisor || getTotpIssuer();
   const emisorEncoded = encodeURIComponent(emisor);
   const cuentaEncoded = encodeURIComponent(params.cuenta);
   return `otpauth://totp/${emisorEncoded}:${cuentaEncoded}?secret=${params.secretBase32}&issuer=${emisorEncoded}&algorithm=SHA1&digits=6&period=30`;

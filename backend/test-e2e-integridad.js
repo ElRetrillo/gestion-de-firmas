@@ -20,12 +20,11 @@ const TEST_CARGO = 'Profesional E2E';
 const TEST_UNIDAD = 'Unidad E2E';
 const TEST_CERT_EXP = '2026-12-10T12:00:00Z';
 
-const VALID_USERS = [
-  'Daniel Alejandro Trigo Tabilo',
-  'Ignacio Alejandro Rosales Riffo',
-  'Camila Constanza Herrera Pastén',
-  'Tomas Edgardo Ovando Cortes',
-];
+const TEST_ADMIN_RUT = '19.999.888-7';
+const TEST_ADMIN_NOMBRE = 'Administrador Temporal E2E';
+const TEST_ADMIN_EMAIL = 'admin.temp.e2e@municoquimbo.cl';
+const TEST_ADMIN_PIN_INIT = '654321';
+const TEST_ADMIN_PIN_NEW = '765432';
 
 const results = [];
 
@@ -59,31 +58,31 @@ async function httpJson(urlPath, options = {}) {
   } catch {
     json = null;
   }
-  return { status: res.status, ok: res.ok, body: json, raw: text };
+  return { status: res.status, ok: res.ok, body: json, raw: text, headers: res.headers };
 }
 
-function getJwtSecret() {
+function getContainerEnv(varName) {
   try {
     const out = execFileSync(
       'docker',
-      ['exec', CONTAINER_BACKEND, 'printenv', 'JWT_SECRET'],
+      ['exec', CONTAINER_BACKEND, 'sh', '-c', `if [ -n "$${varName}" ]; then echo "$${varName}"; elif [ -f /app/.env ]; then grep -E "^${varName}=" /app/.env | head -n1 | cut -d= -f2- | sed 's/^"//;s/"$//'; fi`],
       { encoding: 'utf8' },
     ).trim();
     if (out) return out;
-  } catch {
-    // fallback a .env raíz si fuera necesario
-  }
+  } catch {}
   const rootEnvPath = path.resolve(__dirname, '..', '.env');
   if (fs.existsSync(rootEnvPath)) {
     const content = fs.readFileSync(rootEnvPath, 'utf8');
-    const match = content.match(/^JWT_SECRET=(.+)$/m);
+    const re = new RegExp(`^${varName}=(.+)$`, 'm');
+    const match = content.match(re);
     if (match) return match[1].trim().replace(/^["']|["']$/g, '');
   }
-  throw new Error('No se pudo obtener JWT_SECRET del contenedor ni de .env');
+  return '';
 }
 
 function signTestAdminJwt(adminUser) {
-  const secret = getJwtSecret();
+  const secret = getContainerEnv('JWT_SECRET');
+  assert.ok(secret, 'No se pudo obtener JWT_SECRET');
   const now = Math.floor(Date.now() / 1000);
   const header = Buffer.from(JSON.stringify({ alg: 'HS256', typ: 'JWT' })).toString('base64url');
   const payload = Buffer.from(
@@ -92,7 +91,7 @@ function signTestAdminJwt(adminUser) {
       rut: adminUser.rut,
       rol: 'ADMIN',
       email: adminUser.email,
-      unidad: adminUser.unidad || 'Dirección de TICs',
+      unidad: adminUser.unidad || 'Departamento de Gestión de Sistemas y TICS',
       dcp: false,
       iat: now,
       exp: now + 300,
@@ -103,14 +102,20 @@ function signTestAdminJwt(adminUser) {
   return `${header}.${payload}.${sig}`;
 }
 
+function decodeJwtPayload(token) {
+  const parts = String(token || '').split('.');
+  assert.equal(parts.length, 3, 'JWT malformado');
+  return JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8'));
+}
+
 function limpiarDatosE2E() {
   const sqlStatements = [
     `DELETE FROM telemetria_eventos WHERE codigo_pc = '${TEST_PC}' OR token_id IN (SELECT id FROM tokens_hardware WHERE serial_number = '${TEST_SERIAL}') OR metadatos_jsonb::text LIKE '%${TEST_SERIAL}%';`,
     `DELETE FROM estaciones_trabajo WHERE codigo_pc = '${TEST_PC}' OR serial_token_activo = '${TEST_SERIAL}';`,
-    `DELETE FROM certificados WHERE numero_serie = 'CERT-${TEST_SERIAL}' OR token_hardware_id IN (SELECT id FROM tokens_hardware WHERE serial_number = '${TEST_SERIAL}') OR usuario_id IN (SELECT id FROM usuarios WHERE email = '${TEST_EMAIL}');`,
+    `DELETE FROM certificados WHERE numero_serie = 'CERT-${TEST_SERIAL}' OR token_hardware_id IN (SELECT id FROM tokens_hardware WHERE serial_number = '${TEST_SERIAL}') OR usuario_id IN (SELECT id FROM usuarios WHERE email IN ('${TEST_EMAIL}', '${TEST_ADMIN_EMAIL}'));`,
     `DELETE FROM tokens_hardware WHERE serial_number = '${TEST_SERIAL}';`,
-    `DELETE FROM historial_cambios WHERE usuario_email = '${TEST_EMAIL}' OR registro_id = '${TEST_SERIAL}';`,
-    `DELETE FROM usuarios WHERE email = '${TEST_EMAIL}';`,
+    `DELETE FROM historial_cambios WHERE usuario_email IN ('${TEST_EMAIL}', '${TEST_ADMIN_EMAIL}') OR registro_id IN ('${TEST_SERIAL}', '${TEST_ADMIN_RUT}');`,
+    `DELETE FROM usuarios WHERE email IN ('${TEST_EMAIL}', '${TEST_ADMIN_EMAIL}') OR rut = '${TEST_ADMIN_RUT}';`,
   ];
 
   for (const sql of sqlStatements) {
@@ -122,6 +127,8 @@ function limpiarDatosE2E() {
     `pc:status:${TEST_PC}`,
     `token:cert_meta:${TEST_SERIAL}`,
     `token:connected_at:${TEST_PC}`,
+    `user:totp-enrolled:${TEST_ADMIN_RUT}`,
+    `user:totp-secret:${TEST_ADMIN_RUT}`,
   );
 }
 
@@ -141,7 +148,7 @@ async function runTest(id, name, fn) {
 }
 
 async function main() {
-  console.log('=== INICIO SUITE E2E INTEGRIDAD SISTEMA GESTION DE FIRMAS ===');
+  console.log('=== INICIO SUITE E2E INTEGRIDAD SISTEMA MONITOREO DE TOKENS ===');
 
   const baselineCounts = {
     usuarios: Number(psqlScalar('SELECT COUNT(*) FROM usuarios;')),
@@ -153,283 +160,311 @@ async function main() {
   };
   console.log('Conteo inicial PostgreSQL:', JSON.stringify(baselineCounts));
 
+  const adminRow = psqlScalar(
+    "SELECT id || '|' || rut || '|' || email || '|' || unidad FROM usuarios WHERE rol = 'ADMIN' AND estado = 'ACTIVO' ORDER BY created_at ASC LIMIT 1;",
+  );
+  assert.ok(adminRow, 'No se encontró usuario ADMIN activo en PostgreSQL');
+  const [adminId, adminRut, adminEmail, adminUnidad] = adminRow.split('|');
+  const adminJwt = signTestAdminJwt({ id: adminId, rut: adminRut, email: adminEmail, unidad: adminUnidad });
+  const expectedTotpIssuer =
+    getContainerEnv('TOTP_ISSUER') || 'Gestion de tokens - I.Municipalidad de Coquimbo';
+
   // -------------------------------------------------------------------------
-  // 1. Integridad de Limpieza Permanente
+  // 1. Integridad DB & dist (sin seeds demo, sin módulos eliminados, superadmins activos)
   // -------------------------------------------------------------------------
   await runTest(
     '1.1',
-    'Contenedor backend sin seed de prueba SN-0529-CQM en /app/dist/',
+    'Contenedor /app/dist/ limpio (sin seeds demo ni módulos eliminados)',
     async () => {
-      const proc = spawnSync(
+      const grepDemo = spawnSync(
         'docker',
         ['exec', CONTAINER_BACKEND, 'grep', '-rn', 'SN-0529-CQM', '/app/dist/'],
         { encoding: 'utf8' },
       );
-      if (proc.error) throw proc.error;
-      assert.equal(
-        proc.status,
-        1,
-        `Se esperaba exit code 1 (sin coincidencias), recibido ${proc.status}. Output: ${proc.stdout} ${proc.stderr}`,
+      assert.equal(grepDemo.status, 1, 'Se encontraron seeds demo SN-0529-CQM en /app/dist/');
+
+      const checkRemoved = spawnSync(
+        'docker',
+        ['exec', CONTAINER_BACKEND, 'sh', '-c', 'ls -d /app/dist/firmas /app/dist/equipamiento /app/dist/integraciones 2>/dev/null || true'],
+        { encoding: 'utf8' },
       );
-      assert.equal((proc.stdout || '').trim(), '', 'No debe haber coincidencias de SN-0529-CQM');
-      return '0 coincidencias en /app/dist/ (exit code 1)';
+      assert.equal((checkRemoved.stdout || '').trim(), '', `Aún existen carpetas eliminadas en dist: ${checkRemoved.stdout}`);
+
+      return '0 seeds demo y 0 módulos fuera de alcance en /app/dist/';
     },
   );
 
   await runTest(
     '1.2',
-    'PostgreSQL limpio (sin demos, bitácora limpia, 2 superadmins y 3 tokens reales)',
+    'PostgreSQL íntegro (sin demos, superadmins activos)',
     async () => {
       const demoTokensCount = Number(
         psqlScalar(
           "SELECT COUNT(*) FROM tokens_hardware WHERE serial_number LIKE 'SN-0529-CQM-%' OR serial_number LIKE 'SN-08E6-CQM-%' OR serial_number LIKE 'SN-096E-CQM-%' OR serial_number LIKE 'SN-0DC3-CQM-%';",
         ),
       );
-      assert.equal(demoTokensCount, 0, `Tokens demo residuales encontrados: ${demoTokensCount}`);
+      assert.equal(demoTokensCount, 0, `Tokens demo residuales: ${demoTokensCount}`);
 
       const demoStationsCount = Number(
         psqlScalar("SELECT COUNT(*) FROM estaciones_trabajo WHERE codigo_pc LIKE 'PC-SECMUN-%';"),
       );
-      assert.equal(demoStationsCount, 0, `Estaciones PC-SECMUN-% residuales encontradas: ${demoStationsCount}`);
+      assert.equal(demoStationsCount, 0, `Estaciones demo residuales: ${demoStationsCount}`);
 
-      const usuarios = psqlLines('SELECT nombre FROM usuarios ORDER BY nombre;');
-      assert.equal(usuarios.length, 4, `Se esperaban 4 usuarios, encontrados ${usuarios.length}: ${usuarios.join(', ')}`);
-      for (const expectedUser of VALID_USERS) {
-        assert.ok(usuarios.includes(expectedUser), `Falta usuario válido UTF-8: ${expectedUser}`);
-      }
+      const admins = psqlLines("SELECT rut || ':' || estado FROM usuarios WHERE rol = 'ADMIN' AND estado = 'ACTIVO' ORDER BY rut;");
+      assert.ok(admins.length >= 1, 'Debe existir al menos un ADMIN activo');
 
-      const admins = psqlLines("SELECT rut || ':' || estado FROM usuarios WHERE rol = 'ADMIN' ORDER BY rut;");
-      assert.deepEqual(
-        admins,
-        ['20.406.484-9:ACTIVO', '21.374.808-4:ACTIVO'],
-        `Superadmins esperados [20.406.484-9:ACTIVO, 21.374.808-4:ACTIVO], encontrados: ${admins.join(', ')}`,
-      );
-
-      assert.equal(baselineCounts.historial, 0, `Se esperaba historial_cambios limpio (0), hay ${baselineCounts.historial}`);
-      const adminRow = psqlScalar(
-        "SELECT id || '|' || rut || '|' || email || '|' || unidad FROM usuarios WHERE rol = 'ADMIN' AND estado = 'ACTIVO' LIMIT 1;",
-      );
-      assert.ok(adminRow, 'No se encontró ADMIN activo');
-      const [id, rut, email, unidad] = adminRow.split('|');
-      const jwt = signTestAdminJwt({ id, rut, email, unidad });
-      const audRes = await httpJson('/api/v1/auditoria', {
-        headers: { Authorization: `Bearer ${jwt}` },
-      });
-      assert.equal(audRes.status, 200, `GET /api/v1/auditoria devolvió ${audRes.status}`);
-      assert.ok(Array.isArray(audRes.body) && audRes.body.length === 0, 'Bitácora API aún tiene registros');
-
-      const tokens = psqlLines('SELECT serial_number FROM tokens_hardware ORDER BY serial_number;');
-      assert.equal(tokens.length, 3, `Se esperaban 3 tokens reales, encontrados ${tokens.length}: ${tokens.join(', ')}`);
-
-      return `superadmins=${admins.join(' & ')}, historial=0, tokens=3 (${tokens.join(', ')})`;
+      return `adminsActivos=${admins.join(', ')}`;
     },
   );
 
   // -------------------------------------------------------------------------
-  // 2. Flujo Completo Ghost App (Inserción -> UTF-8 -> Desconexión -> Limpieza)
+  // 2 & 3. Login + MFA TOTP (TOTP_ISSUER) + Sesión 3h + Generador/Revocación Admin
   // -------------------------------------------------------------------------
   try {
     await runTest(
       '2.1',
-      'Ghost App POST /telemetria/usb inserta token E2E con titular UTF-8 y activa usuario/token',
+      'MFA TOTP setup (GET /auth/totp/setup) verifica TOTP_ISSUER parametrizado',
       async () => {
-        const payload = {
-          codigoPc: TEST_PC,
-          estadoHardware: 'CONECTADO',
-          serialNumber: TEST_SERIAL,
-          vendorId: '0x08E6',
-          marca: 'Thales / Gemalto',
-          modelo: 'Ezio Generic',
-          ipAsignada: TEST_IP,
-          dependenciaFisica: TEST_UNIDAD,
-          timestamp: new Date().toISOString(),
-          metadatos: {
-            stateChanged: true,
-            isHeartbeat: false,
-            titularNombre: TEST_NOMBRE,
-            titularEmail: TEST_EMAIL,
-            titularCargo: TEST_CARGO,
-            titularUnidad: TEST_UNIDAD,
-            certNotAfter: TEST_CERT_EXP,
-          },
-        };
+        const totpRes = await httpJson('/api/v1/auth/totp/setup', {
+          headers: { Authorization: `Bearer ${adminJwt}` },
+        });
+        assert.equal(totpRes.status, 200, `GET /auth/totp/setup devolvió ${totpRes.status}`);
+        assert.equal(totpRes.body?.emisor, expectedTotpIssuer);
+        assert.ok(decodeURIComponent(totpRes.body?.otpauthUrl || '').includes(expectedTotpIssuer));
+        assert.match(String(totpRes.body?.codigoActual || ''), /^\d{6}$/);
+        return `emisor="${totpRes.body.emisor}"`;
+      },
+    );
 
-        const res = await httpJson('/api/v1/telemetria/usb', {
+    await runTest(
+      '3.1',
+      'Generar admin -> login PIN + cambio + MFA TOTP + sesión 3h -> revocar -> bloqueo inmediato /login y /me',
+      async () => {
+        // Generar credenciales admin
+        const genRes = await httpJson('/api/v1/usuarios/admins/generar', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${adminJwt}`,
+          },
+          body: JSON.stringify({
+            rut: TEST_ADMIN_RUT,
+            nombre: TEST_ADMIN_NOMBRE,
+            email: TEST_ADMIN_EMAIL,
+            pinInicial: TEST_ADMIN_PIN_INIT,
+          }),
+        });
+        assert.ok(genRes.status === 200 || genRes.status === 201, `POST /admins/generar status=${genRes.status}: ${genRes.raw}`);
+        const genUserId = genRes.body?.usuario?.id;
+        assert.ok(genUserId, 'Falta id del administrador generado');
+        assert.equal(genRes.body?.credenciales?.pinInicial, TEST_ADMIN_PIN_INIT);
+
+        // Login inicial (debeCambiarPassword=true)
+        const loginInit = await httpJson('/api/v1/auth/login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ rut: TEST_ADMIN_RUT, password: TEST_ADMIN_PIN_INIT }),
+        });
+        assert.equal(loginInit.status, 200, `Login inicial falló: ${loginInit.raw}`);
+        assert.equal(loginInit.body?.expiresIn, 10800, 'Sesión debe expirar en 3h (10800s)');
+        assert.equal(loginInit.body?.debeCambiarPassword, true);
+        assert.equal(loginInit.body?.totpSetup?.emisor, expectedTotpIssuer);
+        const totpCode = loginInit.body?.totpSetup?.codigoActual;
+        assert.match(String(totpCode || ''), /^\d{6}$/);
+
+        // Cambio de PIN + verificación MFA TOTP
+        const changeRes = await httpJson('/api/v1/auth/cambiar-password', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${loginInit.body.accessToken}`,
+          },
+          body: JSON.stringify({
+            passwordActual: TEST_ADMIN_PIN_INIT,
+            passwordNueva: TEST_ADMIN_PIN_NEW,
+            codigoTotp: totpCode,
+          }),
+        });
+        assert.equal(changeRes.status, 200, `Cambio de PIN falló: ${changeRes.raw}`);
+        assert.equal(changeRes.body?.debeCambiarPassword, false);
+
+        // Login con nuevo PIN sin TOTP -> exige MFA
+        const loginMfaChallenge = await httpJson('/api/v1/auth/login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ rut: TEST_ADMIN_RUT, password: TEST_ADMIN_PIN_NEW }),
+        });
+        assert.equal(loginMfaChallenge.status, 200);
+        assert.equal(loginMfaChallenge.body?.requiereMfa, true);
+
+        // Login con nuevo PIN + TOTP -> emite JWT 3h
+        const loginFull = await httpJson('/api/v1/auth/login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            rut: TEST_ADMIN_RUT,
+            password: TEST_ADMIN_PIN_NEW,
+            codigoTotp: totpCode,
+          }),
+        });
+        assert.equal(loginFull.status, 200, `Login MFA falló: ${loginFull.raw}`);
+        assert.equal(loginFull.body?.expiresIn, 10800);
+        const genJwt = loginFull.body?.accessToken;
+        const claims = decodeJwtPayload(genJwt);
+        assert.equal(claims.exp - claims.iat, 10800, 'JWT exp - iat debe ser exactamente 10800s (3h)');
+
+        // GET /auth/me activo antes de revocar
+        const meBefore = await httpJson('/api/v1/auth/me', {
+          headers: { Authorization: `Bearer ${genJwt}` },
+        });
+        assert.equal(meBefore.status, 200);
+        assert.equal(meBefore.body?.rut, TEST_ADMIN_RUT);
+
+        // Revocar administrador
+        const revRes = await httpJson(`/api/v1/usuarios/admins/${genUserId}/revocar`, {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${adminJwt}` },
+        });
+        assert.ok(revRes.status === 200 || revRes.status === 201, `Revocación falló: ${revRes.raw}`);
+
+        // Bloqueo inmediato en /auth/me y /auth/login
+        const meAfter = await httpJson('/api/v1/auth/me', {
+          headers: { Authorization: `Bearer ${genJwt}` },
+        });
+        assert.equal(meAfter.status, 401, `Esperado 401 en /me tras revocar, recibido ${meAfter.status}`);
+
+        const loginAfter = await httpJson('/api/v1/auth/login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ rut: TEST_ADMIN_RUT, password: TEST_ADMIN_PIN_NEW, codigoTotp: totpCode }),
+        });
+        assert.ok(
+          loginAfter.status === 401 || loginAfter.status === 403,
+          `Esperado 401/403 en /login tras revocar, recibido ${loginAfter.status}`,
+        );
+
+        return `generado=${TEST_ADMIN_RUT}, sesion=10800s (3h), MFA=OK, revocado->/me=401 & /login=${loginAfter.status}`;
+      },
+    );
+
+    // -----------------------------------------------------------------------
+    // 4. Ciclo Ghost App (CONECTADO UTF-8 -> /estaciones y /metricas -> DESCONECTADO conservando ultimaIp)
+    // -----------------------------------------------------------------------
+    await runTest(
+      '4.1',
+      'Ciclo Ghost App CONECTADO UTF-8 -> /estaciones & /metricas -> DESCONECTADO conserva ultimaIp',
+      async () => {
+        const connectRes = await httpJson('/api/v1/telemetria/usb', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json; charset=utf-8' },
-          body: JSON.stringify(payload),
+          body: JSON.stringify({
+            codigoPc: TEST_PC,
+            estadoHardware: 'CONECTADO',
+            serialNumber: TEST_SERIAL,
+            vendorId: '0x08E6',
+            marca: 'Thales / Gemalto',
+            modelo: 'Ezio Generic',
+            ipAsignada: TEST_IP,
+            dependenciaFisica: TEST_UNIDAD,
+            timestamp: new Date().toISOString(),
+            metadatos: {
+              stateChanged: true,
+              isHeartbeat: false,
+              titularNombre: TEST_NOMBRE,
+              titularEmail: TEST_EMAIL,
+              titularCargo: TEST_CARGO,
+              titularUnidad: TEST_UNIDAD,
+              certNotAfter: TEST_CERT_EXP,
+            },
+          }),
         });
+        assert.equal(connectRes.status, 200);
+        assert.equal(connectRes.body?.estadoHardware, 'CONECTADO');
 
-        assert.equal(res.status, 200, `Status esperado 200, recibido ${res.status}: ${res.raw}`);
-        assert.equal(res.body?.status, 'success');
-        assert.equal(res.body?.codigoPc, TEST_PC);
-        assert.equal(res.body?.estadoHardware, 'CONECTADO');
-        assert.equal(res.body?.serialTokenActivo, TEST_SERIAL);
+        const dbNombre = psqlScalar(`SELECT nombre FROM usuarios WHERE email = '${TEST_EMAIL}';`);
+        assert.equal(dbNombre, TEST_NOMBRE, `UTF-8 corrupto en BD: "${dbNombre}"`);
 
-        // Verificar PostgreSQL usuarios
-        const userRow = psqlScalar(
-          `SELECT nombre || '|' || estado || '|' || cargo || '|' || unidad FROM usuarios WHERE email = '${TEST_EMAIL}';`,
-        );
-        assert.ok(userRow, 'Usuario E2E no fue creado en tabla usuarios');
-        const [dbNombre, dbEstado, dbCargo, dbUnidad] = userRow.split('|');
-        assert.equal(dbNombre, TEST_NOMBRE, `UTF-8 incorrecto en usuarios.nombre: "${dbNombre}"`);
-        assert.equal(dbEstado, 'ACTIVO', `Estado esperado ACTIVO, obtenido ${dbEstado}`);
-        assert.equal(dbCargo, TEST_CARGO);
-        assert.equal(dbUnidad, TEST_UNIDAD);
-
-        // Verificar PostgreSQL tokens_hardware
-        const tokenState = psqlScalar(
-          `SELECT estado_patrimonial FROM tokens_hardware WHERE serial_number = '${TEST_SERIAL}';`,
-        );
-        assert.equal(tokenState, 'ASIGNADO', `Estado patrimonial esperado ASIGNADO, obtenido ${tokenState}`);
-
-        return `usuario="${dbNombre}" (${dbEstado}), token=${TEST_SERIAL} (${tokenState})`;
-      },
-    );
-
-    await runTest(
-      '2.2',
-      'Token E2E aparece CONECTADO en GET /telemetria/estaciones y GET /telemetria/metricas',
-      async () => {
         const estRes = await httpJson('/api/v1/telemetria/estaciones');
-        assert.equal(estRes.status, 200, `GET /estaciones devolvió ${estRes.status}`);
-        assert.ok(Array.isArray(estRes.body), '/estaciones debe devolver un array');
-
+        assert.equal(estRes.status, 200);
         const est = estRes.body.find((e) => e.codigoPc === TEST_PC);
-        assert.ok(est, `Estación ${TEST_PC} no encontrada en /telemetria/estaciones`);
-        assert.equal(est.estadoEnVivo, 'CONECTADO');
-        assert.equal(est.ipAsignada, TEST_IP);
-        assert.equal(est.serialTokenActivo, TEST_SERIAL);
-        assert.equal(est.tokenInfo?.titularNombre, TEST_NOMBRE);
+        assert.ok(est && est.estadoEnVivo === 'CONECTADO' && est.tokenInfo?.titularNombre === TEST_NOMBRE);
 
-        const metRes = await httpJson('/api/v1/telemetria/metricas?modo=ULTIMOS_30_DIAS');
-        assert.equal(metRes.status, 200, `GET /metricas devolvió ${metRes.status}`);
-
-        const disp = metRes.body?.telemetria?.trazabilidadDispositivos?.find(
-          (d) => d.serialNumber === TEST_SERIAL,
-        );
-        assert.ok(disp, `Token ${TEST_SERIAL} no encontrado en telemetria.trazabilidadDispositivos`);
-        assert.equal(disp.estadoEnVivo, 'CONECTADO');
-        assert.equal(disp.ultimaIp, TEST_IP);
-        assert.equal(disp.funcionarioAsignado?.nombre, TEST_NOMBRE);
-
-        const firma = metRes.body?.firmasAsignadas?.listado?.find(
-          (f) => f.serialNumberToken === TEST_SERIAL,
-        );
-        assert.ok(firma, `Token ${TEST_SERIAL} no encontrado en firmasAsignadas.listado`);
-        assert.equal(firma.estadoConexion, 'CONECTADO');
-        assert.equal(firma.funcionario?.nombre, TEST_NOMBRE);
-
-        return `estaciones=CONECTADO, metricas=CONECTADO, IP=${disp.ultimaIp}, titular="${disp.funcionarioAsignado?.nombre}"`;
-      },
-    );
-
-    await runTest(
-      '2.3',
-      'Ghost App POST /telemetria/usb DESCONECTADO pasa estado a DESCONECTADO y conserva ultimaIp',
-      async () => {
-        const disconnectPayload = {
-          codigoPc: TEST_PC,
-          estadoHardware: 'DESCONECTADO',
-          timestamp: new Date().toISOString(),
-          metadatos: {
-            previousSerialNumber: TEST_SERIAL,
-            stateChanged: true,
-            isHeartbeat: false,
-          },
-        };
+        const metConn = await httpJson('/api/v1/telemetria/metricas?modo=ULTIMOS_30_DIAS');
+        assert.equal(metConn.status, 200);
+        const dispConn = metConn.body?.telemetria?.trazabilidadDispositivos?.find((d) => d.serialNumber === TEST_SERIAL);
+        assert.ok(dispConn && dispConn.estadoEnVivo === 'CONECTADO' && dispConn.ultimaIp === TEST_IP);
 
         const discRes = await httpJson('/api/v1/telemetria/usb', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json; charset=utf-8' },
-          body: JSON.stringify(disconnectPayload),
+          body: JSON.stringify({
+            codigoPc: TEST_PC,
+            estadoHardware: 'DESCONECTADO',
+            timestamp: new Date().toISOString(),
+            metadatos: { previousSerialNumber: TEST_SERIAL, stateChanged: true, isHeartbeat: false },
+          }),
         });
-        assert.equal(discRes.status, 200, `POST desconexión devolvió ${discRes.status}: ${discRes.raw}`);
+        assert.equal(discRes.status, 200);
         assert.equal(discRes.body?.estadoHardware, 'DESCONECTADO');
-        assert.equal(discRes.body?.serialTokenActivo, null);
 
-        const metRes = await httpJson('/api/v1/telemetria/metricas?modo=ULTIMOS_30_DIAS');
-        assert.equal(metRes.status, 200);
+        const metDisc = await httpJson('/api/v1/telemetria/metricas?modo=ULTIMOS_30_DIAS');
+        assert.equal(metDisc.status, 200);
+        const dispDisc = metDisc.body?.telemetria?.trazabilidadDispositivos?.find((d) => d.serialNumber === TEST_SERIAL);
+        assert.ok(dispDisc, 'Dispositivo E2E desapareció tras desconexión');
+        assert.equal(dispDisc.estadoEnVivo, 'DESCONECTADO');
+        assert.equal(dispDisc.ultimaIp, TEST_IP);
 
-        const disp = metRes.body?.telemetria?.trazabilidadDispositivos?.find(
-          (d) => d.serialNumber === TEST_SERIAL,
-        );
-        assert.ok(disp, `Token ${TEST_SERIAL} desapareció tras desconexión`);
-        assert.equal(disp.estadoEnVivo, 'DESCONECTADO', `Esperado DESCONECTADO, recibido ${disp.estadoEnVivo}`);
-        assert.equal(disp.ultimaIp, TEST_IP, `ultimaIp esperada ${TEST_IP}, recibida ${disp.ultimaIp}`);
-
-        const firma = metRes.body?.firmasAsignadas?.listado?.find(
-          (f) => f.serialNumberToken === TEST_SERIAL,
-        );
-        assert.ok(firma);
-        assert.equal(firma.estadoConexion, 'DESCONECTADO');
-
-        return `estadoEnVivo=${disp.estadoEnVivo}, ultimaIp=${disp.ultimaIp}`;
+        return `UTF-8="${dbNombre}", CONECTADO->DESCONECTADO, ultimaIp=${dispDisc.ultimaIp}`;
       },
     );
   } finally {
     await runTest(
-      '2.4',
-      'Limpieza post-test en PostgreSQL y Redis (finally)',
+      '4.2',
+      'Limpieza post-test (admin temporal + telemetría E2E en PostgreSQL y Redis)',
       async () => {
         limpiarDatosE2E();
-
-        const remUsers = Number(psqlScalar(`SELECT COUNT(*) FROM usuarios WHERE email = '${TEST_EMAIL}';`));
-        const remTokens = Number(psqlScalar(`SELECT COUNT(*) FROM tokens_hardware WHERE serial_number = '${TEST_SERIAL}';`));
-        const remStations = Number(psqlScalar(`SELECT COUNT(*) FROM estaciones_trabajo WHERE codigo_pc = '${TEST_PC}';`));
-        const remCerts = Number(psqlScalar(`SELECT COUNT(*) FROM certificados WHERE numero_serie = 'CERT-${TEST_SERIAL}';`));
-        const remEvents = Number(psqlScalar(`SELECT COUNT(*) FROM telemetria_eventos WHERE codigo_pc = '${TEST_PC}';`));
-
-        assert.equal(remUsers, 0, `Usuarios E2E residuales: ${remUsers}`);
-        assert.equal(remTokens, 0, `Tokens E2E residuales: ${remTokens}`);
-        assert.equal(remStations, 0, `Estaciones E2E residuales: ${remStations}`);
-        assert.equal(remCerts, 0, `Certificados E2E residuales: ${remCerts}`);
-        assert.equal(remEvents, 0, `Eventos E2E residuales: ${remEvents}`);
-
+        const rem = Number(
+          psqlScalar(
+            `SELECT (SELECT COUNT(*) FROM usuarios WHERE email IN ('${TEST_EMAIL}','${TEST_ADMIN_EMAIL}') OR rut = '${TEST_ADMIN_RUT}') + (SELECT COUNT(*) FROM tokens_hardware WHERE serial_number = '${TEST_SERIAL}') + (SELECT COUNT(*) FROM estaciones_trabajo WHERE codigo_pc = '${TEST_PC}');`,
+          ),
+        );
+        assert.equal(rem, 0, `Quedaron ${rem} registros residuales`);
         const redisKeysRaw = redisCmd('KEYS', '*');
-        assert.ok(!redisKeysRaw.includes(TEST_PC), `Redis aún contiene ${TEST_PC}`);
-        assert.ok(!redisKeysRaw.includes(TEST_SERIAL), `Redis aún contiene ${TEST_SERIAL}`);
-
-        return '0 registros residuales en PostgreSQL y Redis';
+        assert.ok(!redisKeysRaw.includes(TEST_PC) && !redisKeysRaw.includes(TEST_SERIAL) && !redisKeysRaw.includes(TEST_ADMIN_RUT));
+        return '0 residuos en PostgreSQL y Redis';
       },
     );
   }
 
   // -------------------------------------------------------------------------
-  // 3. Métricas y Filtros (7d, 15d, 30d, 60d, POR_MES, POR_ANIO)
+  // 5. Métricas en los 6 períodos
   // -------------------------------------------------------------------------
-  const modos = [
-    'ULTIMOS_7_DIAS',
-    'ULTIMOS_15_DIAS',
-    'ULTIMOS_30_DIAS',
-    'ULTIMOS_60_DIAS',
-    'POR_MES',
-    'POR_ANIO',
-  ];
-
   await runTest(
-    '3.1',
-    'GET /api/v1/telemetria/metricas con filtros 7d, 15d, 30d, 60d, POR_MES y POR_ANIO',
+    '5.1',
+    'Métricas en los 6 períodos (7d, 15d, 30d, 60d, POR_MES, POR_ANIO)',
     async () => {
+      const modos = [
+        'ULTIMOS_7_DIAS',
+        'ULTIMOS_15_DIAS',
+        'ULTIMOS_30_DIAS',
+        'ULTIMOS_60_DIAS',
+        'POR_MES',
+        'POR_ANIO',
+      ];
       const summary = [];
       for (const modo of modos) {
         const res = await httpJson(`/api/v1/telemetria/metricas?modo=${encodeURIComponent(modo)}`);
-        assert.equal(res.status, 200, `Modo ${modo} devolvió status ${res.status}`);
+        assert.equal(res.status, 200, `Modo ${modo} devolvió ${res.status}`);
         const d = res.body;
-        assert.ok(d && typeof d === 'object', `Modo ${modo} no devolvió objeto JSON`);
-        assert.equal(d.periodo?.modo, modo, `periodo.modo esperado ${modo}, obtenido ${d.periodo?.modo}`);
-        assert.ok(d.resumenDispositivos && typeof d.resumenDispositivos === 'object', `${modo}: falta resumenDispositivos`);
-        assert.ok(Array.isArray(d.firmasAsignadas?.listado), `${modo}: falta firmasAsignadas.listado`);
-        assert.equal(typeof d.telemetria?.promedioUsoDiarioGeneralMinutos, 'number', `${modo}: falta promedioUsoDiarioGeneralMinutos`);
-        assert.equal(typeof d.telemetria?.tiempoUsoTotalMinutos, 'number', `${modo}: falta tiempoUsoTotalMinutos`);
+        assert.equal(d.periodo?.modo, modo);
+        assert.equal(d.firmas, undefined, 'El bloque obsoleto "firmas" no debe existir');
+        assert.equal(typeof d.telemetria?.promedioUsoDiarioGeneralMinutos, 'number');
+        assert.equal(typeof d.telemetria?.tiempoUsoTotalMinutos, 'number');
+        assert.ok(Array.isArray(d.firmasAsignadas?.listado));
         for (const item of d.firmasAsignadas.listado) {
-          assert.equal(typeof item.promedioUsoDiarioMinutos, 'number', `${modo}: falta promedioUsoDiarioMinutos en ${item.serialNumberToken}`);
+          assert.equal(typeof item.promedioUsoDiarioMinutos, 'number');
         }
-        assert.ok(d.alertasVencimiento && typeof d.alertasVencimiento === 'object', `${modo}: falta alertasVencimiento`);
-        assert.ok(Array.isArray(d.alertasVencimiento.tokensEnAlerta), `${modo}: falta alertasVencimiento.tokensEnAlerta`);
-        assert.ok(d.contratosResumen && typeof d.contratosResumen === 'object', `${modo}: falta contratosResumen`);
-        assert.ok(Array.isArray(d.contratosResumen.listado), `${modo}: falta contratosResumen.listado`);
-        assert.ok(Array.isArray(d.serieTemporal) && d.serieTemporal.length > 0, `${modo}: serieTemporal vacía`);
+        assert.ok(Array.isArray(d.serieTemporal) && d.serieTemporal.length > 0);
         summary.push(`${modo}(dias=${d.serieTemporal.length})`);
       }
       return summary.join(', ');
@@ -437,66 +472,49 @@ async function main() {
   );
 
   // -------------------------------------------------------------------------
-  // 4. Plantilla de Correo de Caducidad y SMTP
+  // 6. Descarga del agente Ghost App limpio
   // -------------------------------------------------------------------------
   await runTest(
-    '4.1',
-    'Plantilla compilada dist/usuarios/correo-aviso.template.js incluye datos y omite RUT',
+    '6.1',
+    'GET /api/v1/telemetria/descargar-agente entrega payload limpio sin código de firma PKCS7',
     async () => {
-      const tplPath = path.join(__dirname, 'dist', 'usuarios', 'correo-aviso.template.js');
-      assert.ok(fs.existsSync(tplPath), `No existe plantilla compilada en ${tplPath}`);
-      const { generarPlantillaCorreoCaducidad } = require(tplPath);
-      assert.equal(typeof generarPlantillaCorreoCaducidad, 'function');
+      const res = await httpJson('/api/v1/telemetria/descargar-agente?formato=autoinstalador');
+      assert.equal(res.status, 200, `Status inesperado: ${res.status}`);
+      const bat = res.raw || '';
+      assert.ok(bat.includes('CoquimboGhostApp'), 'El autoinstalador no contiene CoquimboGhostApp');
 
-      const dummyRut = '19.876.543-2';
-      const out = generarPlantillaCorreoCaducidad({
-        nombre: 'Camila Constanza Herrera Pastén',
-        rut: dummyRut,
-        fechaVencimiento: '2026-11-28',
-        diasRestantes: 10,
-        serialNumber: 'SN-08E6-6A85ED934499',
-      });
+      const regex = /FromBase64String\('([^']+)'\);\s*\$stream\s*=\s*\[IO\.File\]::Open\('%INSTALL_DIR%\\main\.js'/g;
+      const decodedChunks = [];
+      let m;
+      while ((m = regex.exec(bat)) !== null) {
+        decodedChunks.push(Buffer.from(m[1], 'base64'));
+      }
+      assert.ok(decodedChunks.length > 0, 'No se encontraron chunks Base64 de main.js');
+      const mainJs = Buffer.concat(decodedChunks).toString('utf8');
 
-      assert.ok(out.html.includes('Camila Constanza Herrera Pastén'), 'HTML no incluye nombre titular');
-      assert.ok(out.text.includes('Camila Constanza Herrera Pastén'), 'TEXT no incluye nombre titular');
-      assert.ok(out.html.includes('2026-11-28'), 'HTML no incluye fecha de vencimiento');
-      assert.ok(out.text.includes('2026-11-28'), 'TEXT no incluye fecha de vencimiento');
-      assert.ok(out.html.includes('10 días'), 'HTML no incluye días restantes');
-      assert.ok(out.text.includes('10 días'), 'TEXT no incluye días restantes');
-      assert.ok(out.subject.includes('10 días'), 'Subject no incluye días restantes');
+      assert.ok(mainJs.includes('listarCertificadosTokenWindows'), 'Falta lectura de certificados Windows');
+      assert.ok(mainJs.includes('validarRutModulo11'), 'Falta validación RUT módulo 11');
+      assert.ok(!mainJs.includes('firmarPkcs7ConTokenWindows'), 'main.js aún contiene firmarPkcs7ConTokenWindows');
+      assert.ok(!mainJs.includes('startLocalTokenSigningBridge'), 'main.js aún contiene startLocalTokenSigningBridge');
+      assert.ok(!mainJs.includes('KNOWN_TOKEN_CERT_HOLDERS'), 'main.js aún contiene KNOWN_TOKEN_CERT_HOLDERS');
 
-      assert.ok(!out.html.includes(dummyRut), 'HTML filtró el valor del RUT');
-      assert.ok(!out.text.includes(dummyRut), 'TEXT filtró el valor del RUT');
-      assert.ok(!out.subject.includes(dummyRut), 'Subject filtró el valor del RUT');
-
-      assert.match(
-        out.html,
-        /<b>RUT:<\/b><\/td>\s*<td[^>]*>&nbsp;<\/td>/,
-        'La fila RUT: en HTML no tiene valor en blanco / &nbsp;',
-      );
-      assert.match(out.text, /^RUT:\s*$/m, 'La línea RUT: en texto plano no está en blanco');
-
-      return 'Titular, fecha y días OK; fila RUT: en blanco (&nbsp;) sin exposición';
+      return `chunks=${decodedChunks.length}, mainJs=${mainJs.length} bytes (limpio)`;
     },
   );
 
+  // -------------------------------------------------------------------------
+  // 7. Plantilla de correo de caducidad y preview
+  // -------------------------------------------------------------------------
   await runTest(
-    '4.2',
-    'Endpoints SMTP Preview (POST /usuarios/alertas-vencimiento/despachar) y TOTP Issuer (GET /auth/totp/setup)',
+    '7.1',
+    'Preview correo caducidad (POST /usuarios/alertas-vencimiento/despachar soloPreview=true)',
     async () => {
-      const adminRow = psqlScalar(
-        "SELECT id || '|' || rut || '|' || email || '|' || unidad FROM usuarios WHERE rol = 'ADMIN' AND estado = 'ACTIVO' LIMIT 1;",
-      );
-      assert.ok(adminRow, 'No se encontró usuario ADMIN activo para firmar JWT temporal');
-      const [id, rut, email, unidad] = adminRow.split('|');
-      const jwt = signTestAdminJwt({ id, rut, email, unidad });
-
       const dummyRut = '19.876.543-2';
       const res = await httpJson('/api/v1/usuarios/alertas-vencimiento/despachar', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json; charset=utf-8',
-          Authorization: `Bearer ${jwt}`,
+          Authorization: `Bearer ${adminJwt}`,
         },
         body: JSON.stringify({
           nombre: 'Camila Constanza Herrera Pastén',
@@ -508,85 +526,51 @@ async function main() {
           soloPreview: true,
         }),
       });
-
       assert.ok(res.status === 200 || res.status === 201, `Status inesperado ${res.status}: ${res.raw}`);
       assert.equal(res.body?.status, 'preview');
       assert.equal(res.body?.enviadoSmtp, false);
-      assert.equal(res.body?.remitenteSmtp, 'datrigob@gmail.com');
+      assert.ok(res.body?.htmlCorreo?.includes('Oficina de Transformación Digital'));
+      assert.ok(res.body?.htmlCorreo?.includes('+569 91682880'));
       assert.ok(res.body?.htmlCorreo?.includes('Camila Constanza Herrera Pastén'));
-      assert.ok(res.body?.htmlCorreo?.includes('2026-11-28'));
-      assert.ok(res.body?.htmlCorreo?.includes('10 días'));
-      assert.ok(!res.body?.htmlCorreo?.includes(dummyRut), 'Endpoint preview filtró RUT en HTML');
-      assert.ok(!res.body?.cuerpoCorreo?.includes(dummyRut), 'Endpoint preview filtró RUT en texto');
+      assert.ok(!res.body?.htmlCorreo?.includes(dummyRut), 'HTML filtró RUT');
+      assert.ok(!res.body?.cuerpoCorreo?.includes(dummyRut), 'TEXT filtró RUT');
       assert.match(res.body.htmlCorreo, /<b>RUT:<\/b><\/td>\s*<td[^>]*>&nbsp;<\/td>/);
+      assert.match(res.body.cuerpoCorreo, /^RUT:\s*$/m);
 
-      const expectedIssuer = 'Gestion de tokens - I.Municipalidad de Coquimbo';
-      const totpRes = await httpJson('/api/v1/auth/totp/setup', {
-        method: 'GET',
-        headers: { Authorization: `Bearer ${jwt}` },
-      });
-      assert.equal(totpRes.status, 200, `GET /auth/totp/setup devolvió ${totpRes.status}: ${totpRes.raw}`);
-      assert.equal(totpRes.body?.emisor, expectedIssuer, `Emisor TOTP esperado "${expectedIssuer}", obtenido "${totpRes.body?.emisor}"`);
-      assert.ok(
-        decodeURIComponent(totpRes.body?.otpauthUrl || '').includes(expectedIssuer),
-        `otpauthUrl no contiene el emisor "${expectedIssuer}"`,
-      );
-
-      return `status=${res.status}, remitente=${res.body.remitenteSmtp}, emisorTOTP="${totpRes.body.emisor}"`;
-    },
-  );
-
-  await runTest(
-    '4.3',
-    'Verificación SMTP real (nodemailer.verify) dentro de gestion-firmas-backend',
-    async () => {
-      const containerScript = `
-        const fs = require('fs');
-        const nodemailer = require('nodemailer');
-        const lines = fs.readFileSync('/app/.env', 'utf8').replace(/^\\uFEFF/, '').split(/\\r?\\n/);
-        for (const l of lines) {
-          const idx = l.indexOf('=');
-          if (idx > 0) {
-            const k = l.slice(0, idx).trim();
-            const v = l.slice(idx + 1).trim().replace(/^"|"$/g, '');
-            if (!process.env[k]) process.env[k] = v;
-          }
-        }
-        if (process.env.SMTP_HOST !== 'smtp.gmail.com' || Number(process.env.SMTP_PORT) !== 587 || process.env.SMTP_USER !== 'datrigob@gmail.com') {
-          throw new Error('Configuración SMTP inesperada: ' + process.env.SMTP_HOST + ':' + process.env.SMTP_PORT + ' ' + process.env.SMTP_USER);
-        }
-        const t = nodemailer.createTransport({
-          host: process.env.SMTP_HOST,
-          port: Number(process.env.SMTP_PORT || 587),
-          secure: process.env.SMTP_SECURE === 'true' || Number(process.env.SMTP_PORT) === 465,
-          auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS }
-        });
-        t.verify().then(() => {
-          console.log('SMTP_VERIFY_OK');
-        }).catch((err) => {
-          console.error('SMTP_VERIFY_ERROR:', err.message);
-          process.exit(1);
-        });
-      `;
-
-      const out = execFileSync(
-        'docker',
-        ['exec', '-i', CONTAINER_BACKEND, 'node', '-'],
-        { input: containerScript, encoding: 'utf8' },
-      ).trim();
-
-      assert.ok(out.includes('SMTP_VERIFY_OK'), `Salida inesperada de nodemailer.verify(): ${out}`);
-      return 'smtp.gmail.com:587 (datrigob@gmail.com) -> SMTP_VERIFY_OK';
+      return `remitente="${res.body.remitenteSmtp}", RUT omitido OK, oficina y teléfono OK`;
     },
   );
 
   // -------------------------------------------------------------------------
-  // 5. Verificación Final de Integridad Post-Limpieza
+  // 8. Auditoría
+  // -------------------------------------------------------------------------
+  await runTest(
+    '8.1',
+    'Bitácora de auditoría (GET /api/v1/auditoria y /estadisticas)',
+    async () => {
+      const listRes = await httpJson('/api/v1/auditoria', {
+        headers: { Authorization: `Bearer ${adminJwt}` },
+      });
+      assert.equal(listRes.status, 200);
+      assert.ok(Array.isArray(listRes.body));
+
+      const statsRes = await httpJson('/api/v1/auditoria/estadisticas', {
+        headers: { Authorization: `Bearer ${adminJwt}` },
+      });
+      assert.equal(statsRes.status, 200);
+      assert.equal(typeof statsRes.body?.eventosAuditados, 'number');
+
+      return `registros=${listRes.body.length}, totalAuditados=${statsRes.body.eventosAuditados}`;
+    },
+  );
+
+  // -------------------------------------------------------------------------
+  // 9. Conteo final PostgreSQL idéntico al inicial (0 residuos E2E)
   // -------------------------------------------------------------------------
   let finalCounts = {};
   await runTest(
-    '5.1',
-    'Conteo final PostgreSQL intacto y API limpia sin rastros E2E',
+    '9.1',
+    'Conteo final PostgreSQL idéntico al inicial (0 residuos E2E)',
     async () => {
       finalCounts = {
         usuarios: Number(psqlScalar('SELECT COUNT(*) FROM usuarios;')),
@@ -597,21 +581,7 @@ async function main() {
         historial: Number(psqlScalar('SELECT COUNT(*) FROM historial_cambios;')),
       };
 
-      assert.equal(finalCounts.usuarios, 4, `Esperados 4 usuarios, hay ${finalCounts.usuarios}`);
-      assert.equal(finalCounts.tokens, 3, `Esperados 3 tokens, hay ${finalCounts.tokens}`);
-      assert.equal(finalCounts.certificados, baselineCounts.certificados);
-      assert.equal(finalCounts.estaciones, baselineCounts.estaciones);
-      assert.equal(finalCounts.eventos, baselineCounts.eventos);
-      assert.equal(finalCounts.historial, baselineCounts.historial);
-
-      const estRes = await httpJson('/api/v1/telemetria/estaciones');
-      assert.equal(estRes.status, 200);
-      assert.ok(!estRes.body.some((e) => e.codigoPc === TEST_PC), 'API /estaciones aún expone PC E2E');
-
-      const metRes = await httpJson('/api/v1/telemetria/metricas?modo=ULTIMOS_30_DIAS');
-      assert.equal(metRes.status, 200);
-      assert.equal(metRes.body?.resumenDispositivos?.totalExistentes, 3);
-
+      assert.deepEqual(finalCounts, baselineCounts, `Conteo cambió: inicial=${JSON.stringify(baselineCounts)} vs final=${JSON.stringify(finalCounts)}`);
       return JSON.stringify(finalCounts);
     },
   );

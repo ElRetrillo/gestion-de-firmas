@@ -18,11 +18,9 @@ async function bootstrap() {
 
   const app = await NestFactory.create(AppModule);
 
-  // Soporte de payloads JSON/Base64 hasta 15MB para permitir archivos de hasta 5MB según protocolo FirmaGob v2
-  app.use(json({ limit: '15mb' }));
-  app.use(urlencoded({ extended: true, limit: '15mb' }));
+  app.use(json({ limit: '2mb' }));
+  app.use(urlencoded({ extended: true, limit: '2mb' }));
 
-  // Cabeceras de seguridad HTTP estándar (Equivalente Helmet sin dependencias externas)
   app.use((req: Request, res: Response, next: NextFunction) => {
     res.setHeader('X-Content-Type-Options', 'nosniff');
     res.setHeader('X-Frame-Options', 'SAMEORIGIN');
@@ -32,7 +30,6 @@ async function bootstrap() {
     next();
   });
 
-  // Validación estricta de DTOs según lineamiento de ciberseguridad
   app.useGlobalPipes(
     new ValidationPipe({
       whitelist: true,
@@ -41,17 +38,12 @@ async function bootstrap() {
     }),
   );
 
-  // Configuración de CORS institucional
   const corsOriginsEnv = process.env.CORS_ORIGINS;
   let allowedOrigins: string | string[] | boolean = true;
   if (corsOriginsEnv) {
-    if (corsOriginsEnv === '*') {
-      allowedOrigins = '*';
-    } else {
-      allowedOrigins = corsOriginsEnv.split(',').map((o) => o.trim());
-    }
+    allowedOrigins =
+      corsOriginsEnv === '*' ? '*' : corsOriginsEnv.split(',').map((o) => o.trim());
   } else {
-    // Orígenes predeterminados de desarrollo y pasarela
     allowedOrigins = [
       'http://localhost:3000',
       'http://localhost:5173',
@@ -67,20 +59,16 @@ async function bootstrap() {
     credentials: true,
   });
 
-  // Documentación OpenAPI / Swagger
   const config = new DocumentBuilder()
-    .setTitle('Sistema de Gestión de Firmas y Telemetría de Tokens - I. Municipalidad de Coquimbo')
+    .setTitle('Sistema de Monitoreo y Telemetría de Tokens USB - I. Municipalidad de Coquimbo')
     .setDescription(
-      'API Core Institucional conforme a Ley N° 19.799 (FEA), Ley N° 21.180 (Transformación Digital), Ley N° 21.663 (ANCI) e ISO/IEC 27001.',
+      'API de Monitoreo en Tiempo Real, Telemetría USB, Alertas de Vencimiento y Auditoría de Tokens Criptográficos.',
     )
     .setVersion('2.0.0')
-    .addTag('Autenticación y RBAC')
+    .addTag('Autenticación')
     .addTag('Telemetría USB')
-    .addTag('Orquestación de Firmas y Checksign')
-    .addTag('Usuarios e Identidades Digitales')
-    .addTag('Equipamiento USB y Actas de Custodia')
-    .addTag('Auditoría Forense ANCI y Trazabilidad JSONB')
-    .addTag('Integraciones Externas y Webhooks HMAC')
+    .addTag('Usuarios y Alertas')
+    .addTag('Auditoría')
     .addBearerAuth()
     .build();
 
@@ -89,7 +77,7 @@ async function bootstrap() {
 
   const port = process.env.PORT || 3001;
   await app.listen(port);
-  logger.log(`Servidor Backend Core ejecutándose en el puerto ${port}`);
+  logger.log(`Servidor Backend ejecutándose en el puerto ${port}`);
   logger.log(`Documentación Swagger disponible en http://localhost:${port}/api/docs`);
 }
 

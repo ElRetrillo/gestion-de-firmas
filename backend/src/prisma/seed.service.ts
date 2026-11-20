@@ -2,6 +2,16 @@ import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { PrismaService } from './prisma.service';
 import { RedisService } from '../redis/redis.service';
 import { hashSecret, generarPasswordTemporal, generarPin } from '../common/crypto.util';
+import { formatRut } from '../common/rut.util';
+
+interface ExtraSuperadminConfig {
+  rut: string;
+  nombre: string;
+  email: string;
+  cargo?: string;
+  unidad?: string;
+  pinInicial?: string;
+}
 
 @Injectable()
 export class SeedService implements OnModuleInit {
@@ -14,84 +24,9 @@ export class SeedService implements OnModuleInit {
 
   async onModuleInit() {
     await this.asegurarIndicesGin();
-    await this.asegurarCatalogoClasificacionEIntegraciones();
     await this.asegurarAdminInicial();
-    await this.asegurarSegundoSuperadmin();
+    await this.asegurarSuperadminsFijos();
     await this.sincronizarRedisInicial();
-  }
-
-  async asegurarCatalogoClasificacionEIntegraciones() {
-    try {
-      await this.prisma.$executeRawUnsafe(`
-        CREATE TABLE IF NOT EXISTS "clasificacion_informacion" (
-          "id" TEXT NOT NULL,
-          "nivel" "ClasificacionDocumental" NOT NULL,
-          "nombre" TEXT NOT NULL,
-          "descripcion_politica" TEXT NOT NULL,
-          "requiere_fe_publica" BOOLEAN NOT NULL DEFAULT false,
-          "retencion_anios" INTEGER NOT NULL DEFAULT 5,
-          "normativa_base" TEXT NOT NULL DEFAULT 'ISO/IEC 27001 - Ley 21.663 ANCI',
-          "created_at" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
-          "updated_at" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
-          CONSTRAINT "clasificacion_informacion_pkey" PRIMARY KEY ("id")
-        );
-      `);
-      await this.prisma.$executeRawUnsafe(`
-        CREATE UNIQUE INDEX IF NOT EXISTS "clasificacion_informacion_nivel_key" ON "clasificacion_informacion"("nivel");
-      `);
-
-      const niveles: Array<{
-        nivel: 'PUBLICA' | 'INTERNA' | 'CONFIDENCIAL' | 'CRITICA';
-        nombre: string;
-        descripcionPolitica: string;
-        requiereFePublica: boolean;
-        retencionAnios: number;
-      }> = [
-        {
-          nivel: 'PUBLICA',
-          nombre: 'Información Pública Municipal',
-          descripcionPolitica: 'Actos administrativos, ordenanzas y decretos de libre acceso ciudadano bajo Ley N° 20.285.',
-          requiereFePublica: false,
-          retencionAnios: 5,
-        },
-        {
-          nivel: 'INTERNA',
-          nombre: 'Uso Interno Institucional',
-          descripcionPolitica: 'Memorándums, circulares y oficios de tramitación interna entre direcciones municipales.',
-          requiereFePublica: false,
-          retencionAnios: 5,
-        },
-        {
-          nivel: 'CONFIDENCIAL',
-          nombre: 'Información Confidencial Reservada',
-          descripcionPolitica: 'Sumarios administrativos, datos personales sensibles (Ley N° 19.628) y antecedentes contractuales.',
-          requiereFePublica: true,
-          retencionAnios: 10,
-        },
-        {
-          nivel: 'CRITICA',
-          nombre: 'Infraestructura y Seguridad Crítica ANCI',
-          descripcionPolitica: 'Decretos alcaldicios críticos, auditorías de seguridad ANCI (Ley N° 21.663) y custodia criptográfica.',
-          requiereFePublica: true,
-          retencionAnios: 15,
-        },
-      ];
-
-      for (const item of niveles) {
-        await (this.prisma as any).clasificacionInformacion?.upsert({
-          where: { nivel: item.nivel },
-          update: {
-            nombre: item.nombre,
-            descripcionPolitica: item.descripcionPolitica,
-            requiereFePublica: item.requiereFePublica,
-            retencionAnios: item.retencionAnios,
-          },
-          create: item,
-        }).catch(() => {});
-      }
-    } catch (err) {
-      this.logger.warn(`Aviso al inicializar catálogo clasificacion_informacion: ${(err as Error).message}`);
-    }
   }
 
   async asegurarAdminInicial() {
@@ -104,22 +39,18 @@ export class SeedService implements OnModuleInit {
       const emailAdmin = process.env.ADMIN_INICIAL_EMAIL;
       if (!rutAdminRaw || !nombreAdmin || !emailAdmin) {
         this.logger.error(
-          'No existe ningún ADMIN y faltan ADMIN_INICIAL_RUT / ADMIN_INICIAL_NOMBRE / ADMIN_INICIAL_EMAIL en el entorno. No se puede crear el administrador inicial.',
+          'No existe ningún ADMIN y faltan ADMIN_INICIAL_RUT / ADMIN_INICIAL_NOMBRE / ADMIN_INICIAL_EMAIL en el entorno.',
         );
         return;
       }
 
-      // Normaliza el RUT automáticamente (ej: 213748084 -> 21.374.808-4)
-      const { formatRut } = await import('../common/rut.util');
       const rutAdmin = formatRut(rutAdminRaw.trim()) || rutAdminRaw.trim();
-
       const cargoAdmin = process.env.ADMIN_INICIAL_CARGO || 'Administrador de Sistemas';
       const unidadAdmin = process.env.ADMIN_INICIAL_UNIDAD || 'Departamento de Gestión de Sistemas y TICS';
 
       const passwordProvista = process.env.ADMIN_INICIAL_PASSWORD;
       const passwordTemporal = passwordProvista || generarPasswordTemporal();
       const pinTemporal = process.env.ADMIN_INICIAL_PIN || generarPin();
-      // Si se definió explícitamente en el .env, no forzar cambio obligatorio en el primer login
       const debeCambiar = !passwordProvista;
 
       await this.prisma.usuario.upsert({
@@ -145,46 +76,58 @@ export class SeedService implements OnModuleInit {
         },
       });
 
-      this.logger.warn('========================================================================');
-      this.logger.warn('[ADMIN INICIAL] Administrador creado. ANOTE ESTOS DATOS: SE MUESTRAN UNA SOLA VEZ.');
-      this.logger.warn(`  RUT:                 ${rutAdmin}`);
-      this.logger.warn(`  Contraseña temporal: ${passwordTemporal}`);
-      this.logger.warn(`  PIN token temporal:  ${pinTemporal}`);
-      this.logger.warn('  Se exigirá cambiar la contraseña en el primer ingreso.');
-      this.logger.warn('========================================================================');
+      this.logger.warn(`[ADMIN INICIAL] Creado ${rutAdmin} (${emailAdmin}).`);
     } catch (err) {
       this.logger.warn(`No se pudo verificar o crear administrador inicial: ${(err as Error).message}`);
     }
   }
 
-  async asegurarSegundoSuperadmin() {
-    try {
-      const rutCamila = '20.406.484-9';
-      const existe = await this.prisma.usuario.findFirst({
-        where: { OR: [{ rut: rutCamila }, { email: 'camila.herrera@municoquimbo.cl' }] },
-      });
-      if (existe) return;
+  async asegurarSuperadminsFijos() {
+    const raw = process.env.EXTRA_SUPERADMINS_JSON?.trim();
+    if (!raw) return;
 
-      await this.prisma.usuario.create({
-        data: {
-          rut: rutCamila,
-          nombre: 'Camila Constanza Herrera Pastén',
-          email: 'camila.herrera@municoquimbo.cl',
-          passwordHash: hashSecret('123456'),
-          pinHash: hashSecret('123456'),
-          cargo: 'Oficial de Registro',
-          unidad: 'Ilustre Municipalidad de Coquimbo',
-          rol: 'ADMIN',
-          estado: 'ACTIVO',
-          debeCambiarPassword: true,
-        },
-      });
-      this.logger.log('[SUPERADMIN] Segundo superadmin (20.406.484-9) creado con PIN inicial 123456.');
+    let fijos: ExtraSuperadminConfig[] = [];
+    try {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) fijos = parsed;
     } catch (err) {
-      this.logger.warn(`No se pudo verificar segundo superadmin: ${(err as Error).message}`);
+      this.logger.warn(`EXTRA_SUPERADMINS_JSON inválido: ${(err as Error).message}`);
+      return;
+    }
+
+    const defaultOrg = process.env.DEFAULT_ORG_NAME || 'Ilustre Municipalidad de Coquimbo';
+
+    for (const item of fijos) {
+      if (!item?.rut || !item?.nombre || !item?.email) continue;
+      const rut = formatRut(item.rut.trim()) || item.rut.trim();
+      const email = item.email.trim().toLowerCase();
+      try {
+        const existe = await this.prisma.usuario.findFirst({
+          where: { OR: [{ rut }, { email }] },
+        });
+        if (existe) continue;
+
+        const pin = item.pinInicial?.trim() || generarPin();
+        await this.prisma.usuario.create({
+          data: {
+            rut,
+            nombre: item.nombre.trim(),
+            email,
+            passwordHash: hashSecret(pin),
+            pinHash: hashSecret(pin),
+            cargo: (item.cargo || 'Administrador de Tokens').trim(),
+            unidad: (item.unidad || defaultOrg).trim(),
+            rol: 'ADMIN',
+            estado: 'ACTIVO',
+            debeCambiarPassword: true,
+          },
+        });
+        this.logger.log(`[SUPERADMIN] Cuenta inicial creada (${rut}).`);
+      } catch (err) {
+        this.logger.warn(`No se pudo verificar superadmin (${rut}): ${(err as Error).message}`);
+      }
     }
   }
-
 
   async asegurarIndicesGin() {
     try {
@@ -194,12 +137,9 @@ export class SeedService implements OnModuleInit {
       await this.prisma.$executeRawUnsafe(`
         CREATE INDEX IF NOT EXISTS idx_historial_diff_gin ON historial_cambios USING GIN (diff_jsonb);
       `);
-      await this.prisma.$executeRawUnsafe(`
-        CREATE INDEX IF NOT EXISTS idx_solicitudes_flujo_gin ON solicitudes_firma USING GIN (flujo_visacion_jsonb);
-      `);
       this.logger.log('Índices GIN JSONB verificados en PostgreSQL');
     } catch (err) {
-      this.logger.warn(`No se pudieron crear índices GIN aún: ${(err as Error).message}`);
+      this.logger.warn(`No se pudieron crear índices GIN: ${(err as Error).message}`);
     }
   }
 
@@ -209,8 +149,6 @@ export class SeedService implements OnModuleInit {
       for (const est of estaciones) {
         await this.redis.setPresence(est.codigoPc, est.estadoHardware, 3600);
       }
-    } catch {
-      // Ignorar si Redis no está disponible
-    }
+    } catch {}
   }
 }

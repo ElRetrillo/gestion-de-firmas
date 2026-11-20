@@ -31,7 +31,6 @@ export class TelemetriaGateway implements OnGatewayConnection, OnGatewayDisconne
   @SubscribeMessage('unirse_dashboard')
   handleJoinDashboard(client: Socket) {
     client.join('dashboard-supervisores');
-    this.logger.log(`Cliente ${client.id} se unió a la sala dashboard-supervisores`);
     return { status: 'ok', room: 'dashboard-supervisores' };
   }
 
@@ -40,7 +39,6 @@ export class TelemetriaGateway implements OnGatewayConnection, OnGatewayDisconne
     if (payload?.unidadId) {
       const room = `unidad-${payload.unidadId}`;
       client.join(room);
-      this.logger.log(`Cliente ${client.id} se unió a la sala ${room}`);
       return { status: 'ok', room };
     }
     return { status: 'error', message: 'unidadId requerido' };
@@ -65,7 +63,6 @@ export class TelemetriaGateway implements OnGatewayConnection, OnGatewayDisconne
     metadatos?: Record<string, unknown>;
   }) {
     if (this.server) {
-      // Emitir una sola vez globalmente (incluye a la sala dashboard-supervisores sin duplicar el evento)
       this.server.emit('estado_pc_actualizado', payload);
     }
   }
@@ -75,11 +72,4 @@ export class TelemetriaGateway implements OnGatewayConnection, OnGatewayDisconne
       this.server.emit('telemetria_malla_limpiada', { timestamp: new Date().toISOString() });
     }
   }
-
-  emitirActualizacionPresencia(payload: Record<string, unknown>) {
-    if (this.server) {
-      this.server.emit('evento_sistema_firma', payload);
-    }
-  }
 }
-

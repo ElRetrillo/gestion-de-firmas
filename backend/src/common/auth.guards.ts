@@ -13,11 +13,8 @@ import * as crypto from 'crypto';
 export const IS_PUBLIC_KEY = 'isPublic';
 export const ROLES_KEY = 'roles';
 
-/** Marca una ruta como pública (sin JWT). */
 export const Public = () => SetMetadata(IS_PUBLIC_KEY, true);
-/** Restringe una ruta a ciertos roles. */
 export const Roles = (...roles: string[]) => SetMetadata(ROLES_KEY, roles);
-/** Permite acceder aunque el usuario deba cambiar su contraseña (cambiar-password, me). */
 export const AllowPasswordChange = () => SetMetadata('allowPasswordChange', true);
 
 export const JWT_ISSUER = 'municoquimbo-tics-anci';
@@ -66,15 +63,8 @@ export class JwtAuthGuard implements CanActivate {
     if (isPublic) return true;
 
     const req = context.switchToHttp().getRequest();
-    let token: string | undefined;
     const authHeader: string | undefined = req.headers['authorization'];
-    if (authHeader?.startsWith('Bearer ')) token = authHeader.slice(7).trim();
-
-    // Enlaces <a href> de descarga de PDF no pueden enviar cabeceras.
-    const path: string = (req.path || req.url || '').split('?')[0];
-    if (!token && req.method === 'GET' && /\/(pdf|certificado-pdf)$/.test(path)) {
-      token = req.query?.access_token as string | undefined;
-    }
+    const token = authHeader?.startsWith('Bearer ') ? authHeader.slice(7).trim() : undefined;
 
     if (!token) throw new UnauthorizedException('Autenticación requerida.');
     const payload = this.verify(token);

@@ -59,72 +59,42 @@ enum EventoTelemetria {
   FIRMANDO
 }
 
-enum EstadoAprobacion {
-  PENDIENTE
-  EN_VISACION
-  APROBADA
-  RECHAZADA
-  FIRMADA
-}
-
-enum ClasificacionDocumental {
-  PUBLICA
-  INTERNA
-  CONFIDENCIAL
-  CRITICA
-}
-
-enum TipoActa {
-  ENTREGA
-  DEVOLUCION
-  TRASPASO
-  BAJA
-}
-
-enum TipoIntegracion {
-  FIRMAGOB
-  ESIGN_CHILE
-  CLAVE_UNICA
-}
-
 model Usuario {
-  id                  String            @id @default(uuid())
-  rut                 String            @unique
-  nombre              String
-  email               String            @unique
-  cargo               String
-  unidad              String
-  rol                 RolUsuario        @default(FUNCIONARIO)
-  estado              EstadoUsuario     @default(ACTIVO)
-  passwordHash        String            @map("password_hash")
-  pinHash             String            @map("pin_hash")
-  intentosPinFallidos Int               @default(0) @map("intentos_pin_fallidos")
-  pinBloqueado        Boolean           @default(false) @map("pin_bloqueado")
-  debeCambiarPassword Boolean           @default(false) @map("debe_cambiar_password")
-  condicionContractual String           @default("CONTRATA") @map("condicion_contractual")
-  certificados        Certificado[]
-  solicitudesFirma    SolicitudFirma[]
-  actasCustodia       ActaCustodia[]
-  historialCambios    HistorialCambio[]
-  createdAt           DateTime          @default(now()) @map("created_at")
-  updatedAt           DateTime          @updatedAt @map("updated_at")
+  id                   String            @id @default(uuid())
+  rut                  String            @unique
+  nombre               String
+  email                String            @unique
+  cargo                String
+  unidad               String
+  rol                  RolUsuario        @default(FUNCIONARIO)
+  estado               EstadoUsuario     @default(ACTIVO)
+  passwordHash         String            @map("password_hash")
+  pinHash              String            @map("pin_hash")
+  intentosPinFallidos  Int               @default(0) @map("intentos_pin_fallidos")
+  pinBloqueado         Boolean           @default(false) @map("pin_bloqueado")
+  debeCambiarPassword  Boolean           @default(false) @map("debe_cambiar_password")
+  condicionContractual String            @default("CONTRATA") @map("condicion_contractual")
+  certificados         Certificado[]
+  historialCambios     HistorialCambio[]
+  createdAt            DateTime          @default(now()) @map("created_at")
+  updatedAt            DateTime          @updatedAt @map("updated_at")
 
   @@map("usuarios")
 }
 
 model Certificado {
-  id               String              @id @default(uuid())
-  numeroSerie      String              @map("numero_serie")
-  usuarioId        String              @map("usuario_id")
-  usuario          Usuario             @relation(fields: [usuarioId], references: [id], onDelete: Cascade)
-  tipo             TipoCertificado     @default(FIRMAGOB)
-  custodia         CustodiaCertificado @default(TOKEN_FISICO)
-  validoHasta      DateTime            @map("valido_hasta")
-  estado           EstadoCertificado   @default(VIGENTE)
-  tokenHardwareId  String?             @map("token_hardware_id")
-  tokenHardware    TokenHardware?      @relation(fields: [tokenHardwareId], references: [id])
-  createdAt        DateTime            @default(now()) @map("created_at")
-  updatedAt        DateTime            @updatedAt @map("updated_at")
+  id              String              @id @default(uuid())
+  numeroSerie     String              @map("numero_serie")
+  usuarioId       String              @map("usuario_id")
+  usuario         Usuario             @relation(fields: [usuarioId], references: [id], onDelete: Cascade)
+  tipo            TipoCertificado     @default(FIRMAGOB)
+  custodia        CustodiaCertificado @default(TOKEN_FISICO)
+  validoHasta     DateTime            @map("valido_hasta")
+  estado          EstadoCertificado   @default(VIGENTE)
+  tokenHardwareId String?             @map("token_hardware_id")
+  tokenHardware   TokenHardware?      @relation(fields: [tokenHardwareId], references: [id])
+  createdAt       DateTime            @default(now()) @map("created_at")
+  updatedAt       DateTime            @updatedAt @map("updated_at")
 
   @@index([usuarioId])
   @@index([validoHasta])
@@ -132,137 +102,61 @@ model Certificado {
 }
 
 model TokenHardware {
-  id                String            @id @default(uuid())
-  serialNumber      String            @unique @map("serial_number")
-  vendorId          String            @map("vendor_id")
+  id                String             @id @default(uuid())
+  serialNumber      String             @unique @map("serial_number")
+  vendorId          String             @map("vendor_id")
   marca             String
   modelo            String
-  estadoPatrimonial EstadoPatrimonial @default(OPERATIVO) @map("estado_patrimonial")
+  estadoPatrimonial EstadoPatrimonial  @default(OPERATIVO) @map("estado_patrimonial")
   certificados      Certificado[]
   telemetrias       TelemetriaEvento[]
-  actasCustodia     ActaCustodia[]
-  createdAt         DateTime          @default(now()) @map("created_at")
-  updatedAt         DateTime          @updatedAt @map("updated_at")
+  createdAt         DateTime           @default(now()) @map("created_at")
+  updatedAt         DateTime           @updatedAt @map("updated_at")
 
   @@map("tokens_hardware")
 }
 
 model EstacionTrabajo {
-  id                String            @id @default(uuid())
-  codigoPc          String            @unique @map("codigo_pc")
-  ipAsignada        String            @map("ip_asignada")
-  dependenciaFisica String            @map("dependencia_fisica")
-  ultimoPing        DateTime          @default(now()) @map("ultimo_ping")
-  estadoHardware    EstadoHardware    @default(DESCONECTADO) @map("estado_hardware")
-  serialTokenActivo String?           @map("serial_token_activo")
-  createdAt         DateTime          @default(now()) @map("created_at")
-  updatedAt         DateTime          @updatedAt @map("updated_at")
+  id                String         @id @default(uuid())
+  codigoPc          String         @unique @map("codigo_pc")
+  ipAsignada        String         @map("ip_asignada")
+  dependenciaFisica String         @map("dependencia_fisica")
+  ultimoPing        DateTime       @default(now()) @map("ultimo_ping")
+  estadoHardware    EstadoHardware @default(DESCONECTADO) @map("estado_hardware")
+  serialTokenActivo String?        @map("serial_token_activo")
+  createdAt         DateTime       @default(now()) @map("created_at")
+  updatedAt         DateTime       @updatedAt @map("updated_at")
 
   @@index([codigoPc])
   @@map("estaciones_trabajo")
 }
 
 model TelemetriaEvento {
-  id              String            @id @default(uuid())
-  codigoPc        String            @map("codigo_pc")
-  tokenId         String?           @map("token_id")
-  token           TokenHardware?    @relation(fields: [tokenId], references: [id], onDelete: SetNull)
-  evento          EventoTelemetria
-  timestamp       DateTime          @default(now())
-  metadatosJsonb  Json              @default("{}") @map("metadatos_jsonb")
+  id             String           @id @default(uuid())
+  codigoPc       String           @map("codigo_pc")
+  tokenId        String?          @map("token_id")
+  token          TokenHardware?   @relation(fields: [tokenId], references: [id], onDelete: SetNull)
+  evento         EventoTelemetria
+  timestamp      DateTime         @default(now())
+  metadatosJsonb Json             @default("{}") @map("metadatos_jsonb")
 
   @@index([codigoPc, timestamp])
   @@map("telemetria_eventos")
 }
 
-model SolicitudFirma {
-  id                    String                  @id @default(uuid())
-  codigoDocumento       String                  @unique @default(cuid()) @map("codigo_documento")
-  titulo                String
-  usuarioSolicitanteId  String                  @map("usuario_solicitante_id")
-  usuarioSolicitante    Usuario                 @relation(fields: [usuarioSolicitanteId], references: [id])
-  tipoTramite           String                  @map("tipo_tramite")
-  clasificacion         ClasificacionDocumental @default(INTERNA)
-  prioridad             String                  @default("NORMAL")
-  estacionAsignada      String?                 @map("estacion_asignada")
-  tamanioKb             Int                     @default(0) @map("tamanio_kb")
-  estadoAprobacion      EstadoAprobacion        @default(PENDIENTE) @map("estado_aprobacion")
-  documentoUrl          String                  @map("documento_url")
-  documentoFirmadoUrl   String?                 @map("documento_firmado_url")
-  hashSha256            String                  @map("hash_sha256")
-  codigoVerificacion    String?                 @map("codigo_verificacion")
-  codigoRegistroNotarial String?                @map("codigo_registro_notarial")
-  estadoFePublica       String                  @default("NO_APLICA") @map("estado_fe_publica")
-  tsaTimestamp          DateTime?               @map("tsa_timestamp")
-  flujoVisacionJsonb    Json                    @default("[]") @map("flujo_visacion_jsonb")
-  createdAt             DateTime                @default(now()) @map("created_at")
-  updatedAt             DateTime                @updatedAt @map("updated_at")
-
-  @@index([usuarioSolicitanteId])
-  @@index([estadoAprobacion])
-  @@index([codigoDocumento])
-  @@map("solicitudes_firma")
-}
-
-model ActaCustodia {
-  id                  String        @id @default(uuid())
-  codigoActa          String        @unique @default(cuid()) @map("codigo_acta")
-  tokenId             String        @map("token_id")
-  token               TokenHardware @relation(fields: [tokenId], references: [id])
-  usuarioId           String        @map("usuario_id")
-  usuario             Usuario       @relation(fields: [usuarioId], references: [id])
-  tipoActa            TipoActa      @map("tipo_acta")
-  observaciones       String?
-  hashSha256          String        @default("") @map("hash_sha256")
-  documentoFirmadoUrl String        @map("documento_firmado_url")
-  createdAt           DateTime      @default(now()) @map("created_at")
-
-  @@index([tokenId])
-  @@index([usuarioId])
-  @@map("actas_custodia")
-}
-
 model HistorialCambio {
-  id            String    @id @default(uuid())
-  tablaAfectada String    @map("tabla_afectada")
-  registroId    String    @map("registro_id")
+  id            String   @id @default(uuid())
+  tablaAfectada String   @map("tabla_afectada")
+  registroId    String   @map("registro_id")
   accion        String
-  usuarioId     String?   @map("usuario_id")
-  usuario       Usuario?  @relation(fields: [usuarioId], references: [id], onDelete: SetNull)
-  usuarioEmail  String    @map("usuario_email")
-  ipOrigen      String?   @map("ip_origen")
-  diffJsonb     Json      @default("{}") @map("diff_jsonb")
-  createdAt     DateTime  @default(now()) @map("created_at")
+  usuarioId     String?  @map("usuario_id")
+  usuario       Usuario? @relation(fields: [usuarioId], references: [id], onDelete: SetNull)
+  usuarioEmail  String   @map("usuario_email")
+  ipOrigen      String?  @map("ip_origen")
+  diffJsonb     Json     @default("{}") @map("diff_jsonb")
+  createdAt     DateTime @default(now()) @map("created_at")
 
   @@index([tablaAfectada, registroId])
   @@index([createdAt])
   @@map("historial_cambios")
-}
-
-model IntegracionApi {
-  id                   String          @id @default(uuid())
-  servicio             TipoIntegracion @unique
-  credencialesCifradas String          @map("credenciales_cifradas")
-  webhookSecret        String          @map("webhook_secret")
-  endpointUrl          String          @map("endpoint_url")
-  activo               Boolean         @default(true)
-  ultimoCheck          DateTime        @default(now()) @map("ultimo_check")
-  createdAt            DateTime        @default(now()) @map("created_at")
-  updatedAt            DateTime        @updatedAt @map("updated_at")
-
-  @@map("integraciones_api")
-}
-
-model ClasificacionInformacion {
-  id                  String                  @id @default(uuid())
-  nivel               ClasificacionDocumental @unique
-  nombre              String
-  descripcionPolitica String                  @map("descripcion_politica")
-  requiereFePublica   Boolean                 @default(false) @map("requiere_fe_publica")
-  retencionAnios      Int                     @default(5) @map("retencion_anios")
-  normativaBase       String                  @default("ISO/IEC 27001 - Ley 21.663 ANCI") @map("normativa_base")
-  createdAt           DateTime                @default(now()) @map("created_at")
-  updatedAt           DateTime                @updatedAt @map("updated_at")
-
-  @@map("clasificacion_informacion")
 }

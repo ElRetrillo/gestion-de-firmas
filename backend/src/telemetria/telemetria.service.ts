@@ -18,11 +18,18 @@ export class TelemetriaService {
     private readonly gateway: TelemetriaGateway,
   ) {}
 
+  private get defaultOrgName(): string {
+    return process.env.DEFAULT_ORG_NAME || 'Ilustre Municipalidad de Coquimbo';
+  }
+
+  private get defaultDependencia(): string {
+    return process.env.DEFAULT_DEPENDENCIA_FISICA || 'Red Interna Municipal - Coquimbo';
+  }
+
   async registrarEventoUsb(dto: TelemetriaUsbDto) {
     const timestamp = dto.timestamp ? new Date(dto.timestamp) : new Date();
     const isDesconectado = dto.estadoHardware === EstadoHardwareEnum.DESCONECTADO;
 
-    // 0. Consultar estado previo para distinguir transición real de hardware vs heartbeat periódico
     let previousState: string | null = await this.redis.getPresence(dto.codigoPc);
     let previousStation: any = null;
     try {
@@ -32,25 +39,15 @@ export class TelemetriaService {
       if (!previousState && previousStation) {
         previousState = previousStation.estadoHardware;
       }
-    } catch {
-      // Ignorar si BD no responde
-    }
+    } catch {}
 
-    const isHeartbeat = Boolean(dto.metadatos && dto.metadatos.isHeartbeat === true);
-
-    // Solo se considera cambio de estado real si:
-    // 1. Hay un cambio efectivo en el estado físico (ej: DESCONECTADO -> CONECTADO o CONECTADO -> DESCONECTADO)
-    // 2. O si estando conectado, cambia el número de serie del token físico insertado
-    // 3. O si es el primer registro de la estación en la base de datos
     const stateChanged =
       previousState === null ||
       previousState !== dto.estadoHardware ||
       (!isDesconectado && dto.serialNumber && previousStation?.serialTokenActivo !== dto.serialNumber);
 
-    // 1. Persistencia en caché efímera de Redis (TTL 3600s)
     await this.redis.setPresence(dto.codigoPc, dto.estadoHardware);
 
-    // Control de tiempo para alertas de inactividad (>5 minutos conectado sin firmar)
     const timeKeyConnected = `token:connected_at:${dto.codigoPc}`;
     let connectedAtMs: number = Date.now();
     if (!isDesconectado) {
@@ -64,7 +61,6 @@ export class TelemetriaService {
       await this.redis.delKey(timeKeyConnected);
     }
 
-    // 2. Registro o vinculación de hardware token si está presente
     let tokenId: string | null = null;
     let tokenInfo: {
       serialNumber?: string;
@@ -85,6 +81,7 @@ export class TelemetriaService {
       !titularRaw ||
       /^\{?[0-9a-f]{4,8}(-[0-9a-f]{4,12}){2,4}\}?$/i.test(titularRaw) ||
       /^(MS-Organization-Access|MS-Organization-P2P-Access|localhost|DESKTOP-|WIN-)/i.test(titularRaw);
+
     let certMetaFromDto: Record<string, any> = !esTitularGuid
       ? {
           titularNombre: titularRaw,
@@ -100,9 +97,7 @@ export class TelemetriaService {
     if (!isDesconectado && dto.serialNumber && !certMetaFromDto.titularNombre) {
       try {
         const cached = await this.redis.getKey(`token:cert_meta:${dto.serialNumber}`);
-        if (cached) {
-          certMetaFromDto = JSON.parse(cached);
-        }
+        if (cached) certMetaFromDto = JSON.parse(cached);
       } catch {}
     }
 
@@ -130,14 +125,11 @@ export class TelemetriaService {
             estadoPatrimonial: certMetaFromDto.titularNombre ? 'ASIGNADO' : 'OPERATIVO',
           },
           include: {
-            certificados: {
-              include: { usuario: true },
-            },
+            certificados: { include: { usuario: true } },
           },
         });
         tokenId = token.id;
 
-        // Si el certificado X.509 del token trae titularNombre, vincular o crear automáticamente el Usuario y Certificado en BD
         if (certMetaFromDto.titularNombre) {
           try {
             const emailNorm = certMetaFromDto.titularEmail
@@ -164,7 +156,7 @@ export class TelemetriaService {
                   nombre: String(certMetaFromDto.titularNombre),
                   email: emailNorm,
                   cargo: String(certMetaFromDto.titularCargo || 'Profesional'),
-                  unidad: String(certMetaFromDto.titularUnidad || 'Ilustre Municipalidad de Coquimbo'),
+                  unidad: String(certMetaFromDto.titularUnidad || this.defaultOrgName),
                   rol: 'FUNCIONARIO',
                   estado: 'ACTIVO',
                   passwordHash: '$2b$10$autoRegisteredTokenHolderHashPlaceholder000000000000',
@@ -172,7 +164,6 @@ export class TelemetriaService {
                 },
               });
             } else {
-              // Si ya existe -> actualizar y activar (estado = ACTIVO)
               usuarioAsignado = await this.prisma.usuario.update({
                 where: { id: usuarioAsignado.id },
                 data: {
@@ -228,7 +219,6 @@ export class TelemetriaService {
                 certMetaFromDto.certNotAfter &&
                 fechaValidoHasta.getTime() !== certExistente.validoHasta.getTime()
               ) {
-                // Sincronizar automáticamente la fecha y estado reales del certificado detectado en el token USB físico
                 await this.prisma.certificado.update({
                   where: { id: certExistente.id },
                   data: {
@@ -240,10 +230,9 @@ export class TelemetriaService {
               }
             }
           } catch (linkErr) {
-            this.logger.warn(`Aviso al vincular titular de token en BD: ${(linkErr as Error).message}`);
+            this.logger.warn(`Aviso al vincular titular de token: ${(linkErr as Error).message}`);
           }
         } else if (token.certificados?.[0]?.usuario) {
-          // Si el token ya estaba vinculado a una persona en BD, recuperar su identidad de inmediato
           const u = token.certificados[0].usuario;
           certMetaFromDto = {
             titularNombre: u.nombre,
@@ -273,7 +262,6 @@ export class TelemetriaService {
         };
       }
     } else if (isDesconectado) {
-      // Si se desconectó, buscar el token anterior solo para trazabilidad forense del evento de desconexión
       const prevSerial =
         (dto.metadatos?.previousSerialNumber as string | undefined) ||
         previousStation?.serialTokenActivo ||
@@ -283,17 +271,12 @@ export class TelemetriaService {
           const prevToken = await this.prisma.tokenHardware.findUnique({
             where: { serialNumber: prevSerial },
           });
-          if (prevToken) {
-            tokenId = prevToken.id;
-          }
-        } catch {
-          // Ignorar
-        }
+          if (prevToken) tokenId = prevToken.id;
+        } catch {}
       }
       tokenInfo = null;
     }
 
-    // 3. Upsert de la estación de trabajo (limpiando serialTokenActivo cuando pasa a DESCONECTADO)
     let estacionActualizada: any = null;
     try {
       estacionActualizada = await this.prisma.estacionTrabajo.upsert({
@@ -308,7 +291,7 @@ export class TelemetriaService {
         create: {
           codigoPc: dto.codigoPc,
           ipAsignada: dto.ipAsignada || '0.0.0.0',
-          dependenciaFisica: dto.dependenciaFisica || 'Municipalidad de Coquimbo',
+          dependenciaFisica: dto.dependenciaFisica || this.defaultOrgName,
           ultimoPing: timestamp,
           estadoHardware: dto.estadoHardware as any,
           serialTokenActivo: isDesconectado ? null : (dto.serialNumber || null),
@@ -318,16 +301,15 @@ export class TelemetriaService {
       this.logger.warn(`No se pudo actualizar estación de trabajo: ${(err as Error).message}`);
     }
 
-    // 4. Inserción en telemetria_eventos para auditoría forense ÚNICAMENTE ante cambios reales de estado
-    // (Evita que eventos repetidos o heartbeats periódicos se stackeen en los logs de la base de datos)
+    // Registrar en BD solo ante cambios reales de estado (evita inflar logs con heartbeats)
     if (stateChanged) {
       try {
         await this.prisma.telemetriaEvento.create({
           data: {
             codigoPc: dto.codigoPc,
-            tokenId: tokenId,
+            tokenId,
             evento: dto.estadoHardware as any,
-            timestamp: timestamp,
+            timestamp,
             metadatosJsonb: {
               ...((dto.metadatos as Record<string, unknown>) || {}),
               stateChanged: true,
@@ -338,20 +320,16 @@ export class TelemetriaService {
           },
         });
         this.logger.log(
-          `[LOG FORENSE REGISTRADO] Transición de Hardware PC=${dto.codigoPc} -> ${dto.estadoHardware}${
-            dto.serialNumber ? ` (Token S/N=${dto.serialNumber})` : ''
-          }`,
+          `[TELEMETRIA] PC=${dto.codigoPc} -> ${dto.estadoHardware}${dto.serialNumber ? ` (S/N=${dto.serialNumber})` : ''}`,
         );
       } catch (err) {
-        this.logger.warn(`No se pudo guardar telemetría forense en BD: ${(err as Error).message}`);
+        this.logger.warn(`No se pudo guardar evento de telemetría: ${(err as Error).message}`);
       }
     }
 
-    // Cálculo de tiempo transcurrido y alerta (>5 minutos conectado sin firmar)
     const minutosConectado = !isDesconectado ? Math.floor((Date.now() - connectedAtMs) / 60000) : 0;
     const alertaInactividad = !isDesconectado && minutosConectado >= 5;
 
-    // 5. Difusión en tiempo real vía WebSocket hacia Dashboard de Supervisores
     this.gateway.broadcastEstadoPc({
       codigoPc: dto.codigoPc,
       estadoHardware: dto.estadoHardware,
@@ -361,7 +339,7 @@ export class TelemetriaService {
         estacionActualizada?.dependenciaFisica ||
         dto.dependenciaFisica ||
         previousStation?.dependenciaFisica ||
-        'Municipalidad de Coquimbo',
+        this.defaultOrgName,
       serialNumber: isDesconectado ? undefined : tokenInfo?.serialNumber,
       vendorId: isDesconectado ? undefined : tokenInfo?.vendorId,
       marca: isDesconectado ? undefined : tokenInfo?.marca,
@@ -374,7 +352,7 @@ export class TelemetriaService {
         minutosConectado,
         alertaInactividad,
         alertaMensaje: alertaInactividad
-          ? `Alerta de Seguridad: Token conectado por ${minutosConectado} mins sin actividad de firma.`
+          ? `Alerta de Seguridad: Token conectado por ${minutosConectado} mins sin actividad.`
           : undefined,
         previousSerialNumber:
           (dto.metadatos?.previousSerialNumber as string | undefined) ||
@@ -396,19 +374,13 @@ export class TelemetriaService {
 
   async obtenerEstadosEstaciones() {
     let estaciones: any[] = [];
-    let tokensMap: Record<string, any> = {};
+    const tokensMap: Record<string, any> = {};
 
     try {
       const [estRows, tokRows, ultimosEventos] = await Promise.all([
-        this.prisma.estacionTrabajo.findMany({
-          orderBy: { codigoPc: 'asc' },
-        }),
+        this.prisma.estacionTrabajo.findMany({ orderBy: { codigoPc: 'asc' } }),
         this.prisma.tokenHardware.findMany({
-          include: {
-            certificados: {
-              include: { usuario: true },
-            },
-          },
+          include: { certificados: { include: { usuario: true } } },
         }),
         this.prisma.telemetriaEvento.findMany({
           take: 50,
@@ -436,7 +408,6 @@ export class TelemetriaService {
             : {}),
         };
       }
-      // Respaldo por si una estación conectada no tenía serialTokenActivo poblado aún y enriquecer titular desde eventos
       for (const ev of ultimosEventos) {
         const metaEv = (ev.metadatosJsonb || {}) as Record<string, any>;
         const sn = ev.token?.serialNumber;
@@ -482,9 +453,7 @@ export class TelemetriaService {
           if (tokenInfo?.serialNumber && !tokenInfo.titularNombre) {
             try {
               const cachedMeta = await this.redis.getKey(`token:cert_meta:${tokenInfo.serialNumber}`);
-              if (cachedMeta) {
-                Object.assign(tokenInfo, JSON.parse(cachedMeta));
-              }
+              if (cachedMeta) Object.assign(tokenInfo, JSON.parse(cachedMeta));
             } catch {}
           }
         }
@@ -567,7 +536,7 @@ export class TelemetriaService {
       instrucciones: [
         '1. Descargue el instalador en 1 clic desde este portal.',
         '2. Ejecútelo una sola vez en su estación de trabajo Windows.',
-        '3. El agente quedará registrado automáticamente en el inicio de sesión de su usuario (openAtLogin) y operará de forma invisible en segundo plano.',
+        '3. El agente quedará registrado en el inicio de sesión de su usuario y operará en segundo plano.',
       ],
     };
   }
@@ -575,7 +544,7 @@ export class TelemetriaService {
   generarPaqueteInstaladorAgente(
     baseUrl = 'http://localhost:3001',
     formato?: string,
-    dependenciaFisica = 'Red Interna Municipal - Coquimbo',
+    dependenciaFisica?: string,
   ): {
     tipo: 'exe' | 'autoinstalador';
     filename: string;
@@ -583,6 +552,7 @@ export class TelemetriaService {
     buffer?: Buffer;
     filePath?: string;
   } {
+    const depFinal = dependenciaFisica || this.defaultDependencia;
     const exeInfo = this.buscarBinarioExeCompilado();
     if (exeInfo && formato !== 'autoinstalador') {
       return {
@@ -593,18 +563,17 @@ export class TelemetriaService {
       };
     }
 
-    // Generar comandos por fragmentos para evitar el límite de longitud de línea de CMD (8192 bytes)
     const chunkCommands = GHOST_APP_CHUNKS.map((chunk, idx) => {
       const mode = idx === 0 ? 'Create' : 'Append';
       return `powershell -NoProfile -ExecutionPolicy Bypass -Command "$bytes = [Convert]::FromBase64String('${chunk}'); $stream = [IO.File]::Open('%INSTALL_DIR%\\main.js', [IO.FileMode]::${mode}); $stream.Write($bytes, 0, $bytes.Length); $stream.Close()"`;
     });
 
-    const apiKey = process.env.TELEMETRIA_API_KEY || 'muni-coquimbo-ghost-app-sec-key-2026';
+    const apiKey = process.env.TELEMETRIA_API_KEY || 'CHANGE_ME_TELEMETRIA_API_KEY';
     const configJson = JSON.stringify(
       {
         apiUrl: `${baseUrl}/api/v1/telemetria/usb`,
         apiKey,
-        dependenciaFisica,
+        dependenciaFisica: depFinal,
         pollIntervalMs: 2000,
         heartbeatIntervalMs: 45000,
       },
@@ -625,29 +594,27 @@ export class TelemetriaService {
     const batContent = [
       '@echo off',
       'chcp 65001 >nul',
-      'title Instalador Automatico En 1 Clic - Agente Telemetria USB (I. Municipalidad de Coquimbo)',
+      'title Instalador Automatico - Agente Telemetria USB',
       'echo ============================================================================',
-      'echo   ILUSTRE MUNICIPALIDAD DE COQUIMBO - DEPTO. DE GESTION DE SISTEMAS Y TICS',
-      'echo   Instalador Asistido en 1 Clic - Agente Silencioso de Telemetria USB v2.1',
-      'echo   (No requiere Active Directory ni permisos de Administrador local)',
+      'echo   AGENTE SILENCIOSO DE TELEMETRIA USB v2.1',
       'echo ============================================================================',
       'echo.',
       'set "INSTALL_DIR=%LOCALAPPDATA%\\CoquimboGhostApp"',
       'if not exist "%INSTALL_DIR%" mkdir "%INSTALL_DIR%"',
-      'echo [1/4] Desplegando binarios y configuracion en %INSTALL_DIR%...',
+      'echo [1/4] Desplegando archivos y configuracion en %INSTALL_DIR%...',
       'if exist "%INSTALL_DIR%\\main.js" del /f /q "%INSTALL_DIR%\\main.js"',
       ...chunkCommands,
       `powershell -NoProfile -ExecutionPolicy Bypass -Command "[IO.File]::WriteAllBytes('%INSTALL_DIR%\\config.json', [Convert]::FromBase64String('${configBase64}'))"`,
       `powershell -NoProfile -ExecutionPolicy Bypass -Command "[IO.File]::WriteAllBytes('%INSTALL_DIR%\\iniciar-silencioso.vbs', [Convert]::FromBase64String('${vbsBase64}'))"`,
-      'echo [2/4] Registrando inicio automatico en Windows (HKCU Run - openAtLogin)...',
+      'echo [2/4] Registrando inicio automatico en Windows (HKCU Run)...',
       'reg add "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run" /v "CoquimboUsbGhostAgent" /t REG_SZ /d "wscript.exe \\"%INSTALL_DIR%\\iniciar-silencioso.vbs\\"" /f >nul',
       'echo [3/4] Reiniciando instancias previas del agente...',
       'powershell -NoProfile -Command "Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -match \'main\\.js\' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }" >nul 2>&1',
-      'echo [4/4] Iniciando Agente Silencioso en segundo plano (Headless)...',
+      'echo [4/4] Iniciando Agente Silencioso en segundo plano...',
       'start "" wscript.exe "%INSTALL_DIR%\\iniciar-silencioso.vbs"',
       'echo.',
       'echo [OK] Agente instalado y ejecutandose en segundo plano.',
-      'echo      Su estacion (%COMPUTERNAME%) ya esta reportando telemetria en vivo al Dashboard.',
+      'echo      Estacion %COMPUTERNAME% reportando telemetria al Dashboard.',
       'timeout /t 4 >nul',
       'exit /b 0',
     ].join('\r\n');
@@ -660,26 +627,10 @@ export class TelemetriaService {
     };
   }
 
-  /**
-   * Calcula métricas de trazabilidad, estadísticas operacionales y porcentajes
-   * reportables en dos modalidades:
-   * 1) POR_MES (mes calendario específico YYYY-MM)
-   * 2) ULTIMOS_30_DIAS (ventana móvil de los últimos 30 días)
-   */
   async obtenerMetricasTrazabilidad(modoInput?: string, mesInput?: string) {
     const nombresMeses = [
-      'Enero',
-      'Febrero',
-      'Marzo',
-      'Abril',
-      'Mayo',
-      'Junio',
-      'Julio',
-      'Agosto',
-      'Septiembre',
-      'Octubre',
-      'Noviembre',
-      'Diciembre',
+      'Enero', 'Febrero', 'Marzo', 'Abril', 'Mayo', 'Junio',
+      'Julio', 'Agosto', 'Septiembre', 'Octubre', 'Noviembre', 'Diciembre',
     ];
 
     const modosValidos = [
@@ -693,8 +644,7 @@ export class TelemetriaService {
     const modo = modosValidos.includes(String(modoInput)) ? String(modoInput) : 'ULTIMOS_30_DIAS';
     const ahora = new Date();
     const defaultMes = `${ahora.getFullYear()}-${String(ahora.getMonth() + 1).padStart(2, '0')}`;
-    const mesSeleccionado =
-      mesInput && /^\d{4}-\d{2}$/.test(mesInput) ? mesInput : defaultMes;
+    const mesSeleccionado = mesInput && /^\d{4}-\d{2}$/.test(mesInput) ? mesInput : defaultMes;
 
     let fechaInicio: Date;
     let fechaFin: Date;
@@ -703,11 +653,10 @@ export class TelemetriaService {
     if (modo === 'POR_MES') {
       const [yStr, mStr] = mesSeleccionado.split('-');
       const year = Number(yStr);
-      const month = Number(mStr); // 1..12
+      const month = Number(mStr);
       fechaInicio = new Date(year, month - 1, 1, 0, 0, 0, 0);
       fechaFin = new Date(year, month, 0, 23, 59, 59, 999);
-      const nombreMes = nombresMeses[(month - 1 + 12) % 12] || mStr;
-      etiquetaPeriodo = `${nombreMes} ${year}`;
+      etiquetaPeriodo = `${nombresMeses[(month - 1 + 12) % 12] || mStr} ${year}`;
     } else if (modo === 'POR_ANIO') {
       const year = ahora.getFullYear();
       fechaInicio = new Date(year, 0, 1, 0, 0, 0, 0);
@@ -735,7 +684,6 @@ export class TelemetriaService {
       etiquetaPeriodo = 'Últimos 30 días';
     }
 
-    // Construir lista de meses disponibles (últimos 12 meses + mes seleccionado)
     const mesesMap = new Map<string, string>();
     for (let i = 0; i < 12; i++) {
       const d = new Date(ahora.getFullYear(), ahora.getMonth() - i, 1);
@@ -756,10 +704,8 @@ export class TelemetriaService {
         estacionesVivo,
         tokensHardware,
         eventosTelemetria,
-        solicitudesPeriodo,
         usuarios,
         certificados,
-        actasPeriodo,
         historialPeriodo,
       ] = await Promise.all([
         this.obtenerEstadosEstaciones(),
@@ -768,66 +714,25 @@ export class TelemetriaService {
             certificados: {
               include: {
                 usuario: {
-                  select: { id: true, nombre: true, rut: true, unidad: true, cargo: true },
-                },
-              },
-            },
-            actasCustodia: {
-              orderBy: { createdAt: 'desc' },
-              take: 1,
-              include: {
-                usuario: {
-                  select: { id: true, nombre: true, rut: true, unidad: true, cargo: true },
+                  select: { id: true, nombre: true, rut: true, email: true, unidad: true, cargo: true },
                 },
               },
             },
           },
         }),
         this.prisma.telemetriaEvento.findMany({
-          where: {
-            timestamp: {
-              gte: fechaInicio,
-              lte: fechaFin,
-            },
-          },
+          where: { timestamp: { gte: fechaInicio, lte: fechaFin } },
           include: { token: true },
           orderBy: { timestamp: 'desc' },
         }),
-        this.prisma.solicitudFirma.findMany({
-          where: {
-            createdAt: {
-              gte: fechaInicio,
-              lte: fechaFin,
-            },
-          },
-          include: {
-            usuarioSolicitante: {
-              select: { id: true, nombre: true, unidad: true, rut: true },
-            },
-          },
-        }),
         this.prisma.usuario.findMany(),
         this.prisma.certificado.findMany(),
-        this.prisma.actaCustodia.findMany({
-          where: {
-            createdAt: {
-              gte: fechaInicio,
-              lte: fechaFin,
-            },
-          },
-        }),
         this.prisma.historialCambio.findMany({
-          where: {
-            createdAt: {
-              gte: fechaInicio,
-              lte: fechaFin,
-            },
-          },
+          where: { createdAt: { gte: fechaInicio, lte: fechaFin } },
           orderBy: { createdAt: 'desc' },
         }),
       ]);
 
-      // 1. Métricas de Estaciones y Telemetría USB
       const totalEstaciones = estacionesVivo.length;
       const estacionesConectadas = estacionesVivo.filter(
         (e: any) => e.estadoEnVivo === 'CONECTADO' || e.estadoEnVivo === 'FIRMANDO',
@@ -843,21 +748,12 @@ export class TelemetriaService {
       const totalEventosPeriodo = eventosTelemetria.length;
       const eventosConectado = eventosTelemetria.filter((e) => e.evento === 'CONECTADO').length;
       const eventosFirmando = eventosTelemetria.filter((e) => e.evento === 'FIRMANDO').length;
-      const eventosDesconectado = eventosTelemetria.filter(
-        (e) => e.evento === 'DESCONECTADO',
-      ).length;
+      const eventosDesconectado = eventosTelemetria.filter((e) => e.evento === 'DESCONECTADO').length;
 
       const porcentajeEventosConectado = pct(eventosConectado, totalEventosPeriodo);
       const porcentajeEventosFirmando = pct(eventosFirmando, totalEventosPeriodo);
       const porcentajeEventosDesconectado = pct(eventosDesconectado, totalEventosPeriodo);
 
-      const tokensRegistrados = tokensHardware.length;
-      const tokensOperativos = tokensHardware.filter(
-        (t) => t.estadoPatrimonial === 'OPERATIVO' || t.estadoPatrimonial === 'ASIGNADO',
-      ).length;
-      const porcentajeTokensOperativos = pct(tokensOperativos, tokensRegistrados);
-
-      // Trazabilidad por Estación de Trabajo en el período
       const mapaEstaciones = new Map<
         string,
         {
@@ -877,7 +773,7 @@ export class TelemetriaService {
       for (const est of estacionesVivo as any[]) {
         mapaEstaciones.set(est.codigoPc, {
           codigoPc: est.codigoPc,
-          dependenciaFisica: est.dependenciaFisica || 'Red Interna Municipal',
+          dependenciaFisica: est.dependenciaFisica || this.defaultDependencia,
           ipAsignada: est.ipAsignada || '-',
           estadoActual: est.estadoEnVivo || 'DESCONECTADO',
           serialTokenActivo: est.tokenInfo?.serialNumber || est.serialTokenActivo || null,
@@ -897,7 +793,7 @@ export class TelemetriaService {
         if (!mapaEstaciones.has(ev.codigoPc)) {
           mapaEstaciones.set(ev.codigoPc, {
             codigoPc: ev.codigoPc,
-            dependenciaFisica: meta.dependenciaFisica || 'Red Interna Municipal',
+            dependenciaFisica: meta.dependenciaFisica || this.defaultDependencia,
             ipAsignada: meta.ipAsignada || '-',
             estadoActual: 'DESCONECTADO',
             serialTokenActivo: ev.token?.serialNumber || meta.serialNumber || null,
@@ -926,7 +822,6 @@ export class TelemetriaService {
         }))
         .sort((a, b) => b.totalEventos - a.totalEventos);
 
-      // Trazabilidad detallada por Dispositivo / Token Físico en el período
       let diasHabilesPeriodo = 0;
       const dCursor = new Date(fechaInicio);
       dCursor.setHours(0, 0, 0, 0);
@@ -944,9 +839,7 @@ export class TelemetriaService {
         tokensHardware.map(async (t: any) => {
           try {
             const raw = await this.redis.getClient()?.get(`token:cert_meta:${t.serialNumber}`);
-            if (raw) {
-              certMetaPorSerial.set(t.serialNumber, JSON.parse(raw));
-            }
+            if (raw) certMetaPorSerial.set(t.serialNumber, JSON.parse(raw));
           } catch {}
         }),
       );
@@ -970,7 +863,6 @@ export class TelemetriaService {
               est.serialTokenActivo === t.serialNumber,
           );
 
-          // Calcular tiempo total de uso en minutos emparejando eventos CONECTADO/FIRMANDO -> DESCONECTADO
           const eventosOrdenados = [...eventosDelToken].sort(
             (a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime(),
           );
@@ -1009,8 +901,7 @@ export class TelemetriaService {
           );
 
           const certAsignado = t.certificados?.[0];
-          const actaReciente = t.actasCustodia?.[0];
-          const usuarioTitular = certAsignado?.usuario || actaReciente?.usuario || null;
+          const usuarioTitular = certAsignado?.usuario || null;
           const evConTitular = eventosDelToken.find((ev) => (ev.metadatosJsonb as any)?.titularNombre);
           const metaRedis = certMetaPorSerial.get(t.serialNumber) || {};
           const metaTitular =
@@ -1045,10 +936,10 @@ export class TelemetriaService {
               ? {
                   nombre: usuarioTitular.nombre,
                   rut: usuarioTitular.rut,
-                  email: (usuarioTitular as any).email,
+                  email: usuarioTitular.email,
                   cargo: usuarioTitular.cargo,
                   unidad: usuarioTitular.unidad,
-                  origenCertificado: Boolean(metaTitular?.titularNombre || t.serialNumber === 'SN-08E6-D453B70C2CF7'),
+                  origenCertificado: Boolean(metaTitular?.titularNombre || certAsignado),
                 }
               : metaTitular?.titularNombre
                 ? {
@@ -1056,7 +947,7 @@ export class TelemetriaService {
                     rut: String(metaTitular.titularEmail || 'Detectado por Token'),
                     email: metaTitular.titularEmail ? String(metaTitular.titularEmail) : undefined,
                     cargo: metaTitular.titularCargo ? String(metaTitular.titularCargo) : 'Profesional',
-                    unidad: String(metaTitular.titularUnidad || 'Ilustre Municipalidad de Coquimbo'),
+                    unidad: String(metaTitular.titularUnidad || this.defaultOrgName),
                     origenCertificado: true,
                   }
                 : null,
@@ -1088,76 +979,6 @@ export class TelemetriaService {
         })
         .sort((a, b) => b.totalEventosPeriodo - a.totalEventosPeriodo);
 
-      // 2. Métricas Documentales y de Firmas en el período
-      const totalSolicitudesPeriodo = solicitudesPeriodo.length;
-      const firmadas = solicitudesPeriodo.filter((s) => s.estadoAprobacion === 'FIRMADA').length;
-      const rechazadas = solicitudesPeriodo.filter(
-        (s) => s.estadoAprobacion === 'RECHAZADA',
-      ).length;
-      const pendientes = solicitudesPeriodo.filter(
-        (s) =>
-          s.estadoAprobacion === 'PENDIENTE' ||
-          s.estadoAprobacion === 'EN_VISACION' ||
-          s.estadoAprobacion === 'APROBADA',
-      ).length;
-
-      const tasaExitoFirmaPct = pct(firmadas, totalSolicitudesPeriodo);
-      const tasaRechazoPct = pct(rechazadas, totalSolicitudesPeriodo);
-      const tasaPendientesPct = pct(pendientes, totalSolicitudesPeriodo);
-
-      const fePublicaRequerida = solicitudesPeriodo.filter(
-        (s) => s.estadoFePublica && s.estadoFePublica !== 'NO_APLICA',
-      );
-      const fePublicaOtorgada = fePublicaRequerida.filter(
-        (s) =>
-          s.estadoFePublica === 'VALIDADO_FE_PUBLICA' ||
-          s.estadoFePublica === 'OTORGADA' ||
-          Boolean(s.codigoRegistroNotarial),
-      ).length;
-      const fePublicaPendiente = fePublicaRequerida.length - fePublicaOtorgada;
-      const porcentajeFePublica = pct(fePublicaOtorgada, fePublicaRequerida.length);
-
-      const nivelesClasificacion = ['PUBLICA', 'INTERNA', 'CONFIDENCIAL', 'CRITICA'];
-      const porClasificacion = nivelesClasificacion.map((nivel) => {
-        const cantidad = solicitudesPeriodo.filter((s) => s.clasificacion === nivel).length;
-        return {
-          clasificacion: nivel,
-          cantidad,
-          porcentaje: pct(cantidad, totalSolicitudesPeriodo),
-        };
-      });
-
-      const mapaUnidades = new Map<
-        string,
-        { unidad: string; total: number; firmadas: number; pendientes: number; rechazadas: number }
-      >();
-      for (const sol of solicitudesPeriodo) {
-        const nombreUnidad = sol.usuarioSolicitante?.unidad || 'Unidad General Municipal';
-        if (!mapaUnidades.has(nombreUnidad)) {
-          mapaUnidades.set(nombreUnidad, {
-            unidad: nombreUnidad,
-            total: 0,
-            firmadas: 0,
-            pendientes: 0,
-            rechazadas: 0,
-          });
-        }
-        const u = mapaUnidades.get(nombreUnidad)!;
-        u.total += 1;
-        if (sol.estadoAprobacion === 'FIRMADA') u.firmadas += 1;
-        else if (sol.estadoAprobacion === 'RECHAZADA') u.rechazadas += 1;
-        else u.pendientes += 1;
-      }
-
-      const porUnidad = Array.from(mapaUnidades.values())
-        .map((u) => ({
-          ...u,
-          porcentajeExito: pct(u.firmadas, u.total),
-          porcentajeParticipacion: pct(u.total, totalSolicitudesPeriodo),
-        }))
-        .sort((a, b) => b.total - a.total);
-
-      // 3. Métricas de Administración, Custodia, Certificados y Auditoría
       const totalUsuarios = usuarios.length;
       const usuariosActivos = usuarios.filter(
         (u) => u.estado === 'ACTIVO' && u.rol !== 'PENDIENTE',
@@ -1181,17 +1002,9 @@ export class TelemetriaService {
       const porcentajeTokenFisico = pct(custodiaTokenFisico, totalCertificados);
       const porcentajeCloud = pct(custodiaCloud, totalCertificados);
 
-      const actasPorTipo = {
-        ENTREGA: actasPeriodo.filter((a) => a.tipoActa === 'ENTREGA').length,
-        DEVOLUCION: actasPeriodo.filter((a) => a.tipoActa === 'DEVOLUCION').length,
-        TRASPASO: actasPeriodo.filter((a) => a.tipoActa === 'TRASPASO').length,
-        BAJA: actasPeriodo.filter((a) => a.tipoActa === 'BAJA').length,
-      };
-
       const totalEventosAuditoriaPeriodo = historialPeriodo.length;
       const conteoAcciones = new Map<string, number>();
       const conteoModulos = new Map<string, number>();
-
       for (const h of historialPeriodo) {
         conteoAcciones.set(h.accion, (conteoAcciones.get(h.accion) || 0) + 1);
         conteoModulos.set(h.tablaAfectada, (conteoModulos.get(h.tablaAfectada) || 0) + 1);
@@ -1213,7 +1026,6 @@ export class TelemetriaService {
         }))
         .sort((a, b) => b.cantidad - a.cantidad);
 
-      // 4. Serie Temporal Diaria del Período
       const diasMap = new Map<
         string,
         {
@@ -1268,18 +1080,6 @@ export class TelemetriaService {
         }
       }
 
-      for (const sol of solicitudesPeriodo) {
-        if (sol.estadoAprobacion === 'FIRMADA') {
-          const fechaRef = sol.tsaTimestamp ? new Date(sol.tsaTimestamp) : new Date(sol.updatedAt);
-          const key = toDateKey(fechaRef);
-          const slot = diasMap.get(key);
-          if (slot) {
-            slot.firmasRealizadas += 1;
-            slot.totalActividad += 1;
-          }
-        }
-      }
-
       for (const aud of historialPeriodo) {
         const key = toDateKey(new Date(aud.createdAt));
         const slot = diasMap.get(key);
@@ -1290,8 +1090,8 @@ export class TelemetriaService {
       }
 
       const serieTemporal = Array.from(diasMap.values());
-
       const totalEventosHistorico = await this.prisma.telemetriaEvento.count().catch(() => totalEventosPeriodo);
+
       const trazabilidadReales = trazabilidadDispositivos.filter(
         (d: any) => !(String(d.serialNumber).startsWith('SN-WIN-') && String(d.serialNumber).endsWith('-UNKNOWN')),
       );
@@ -1327,7 +1127,7 @@ export class TelemetriaService {
             nombre: d.funcionarioAsignado?.nombre || 'Sin Titular',
             email: d.funcionarioAsignado?.email || d.funcionarioAsignado?.rut || '-',
             cargo: d.funcionarioAsignado?.cargo || 'Profesional',
-            unidad: d.funcionarioAsignado?.unidad || 'Ilustre Municipalidad de Coquimbo',
+            unidad: d.funcionarioAsignado?.unidad || this.defaultOrgName,
           },
           fechaAsignacion: fechaAsig,
           fechaExpiracion: fechaExp,
@@ -1540,20 +1340,6 @@ export class TelemetriaService {
                 )
               : 0,
         },
-        firmas: {
-          totalSolicitudesPeriodo,
-          firmadas,
-          pendientes,
-          rechazadas,
-          tasaExitoFirmaPct,
-          tasaPendientesPct,
-          tasaRechazoPct,
-          fePublicaOtorgada,
-          fePublicaPendiente,
-          porcentajeFePublica,
-          porClasificacion,
-          porUnidad,
-        },
         administracion: {
           totalUsuarios,
           usuariosActivos,
@@ -1569,8 +1355,6 @@ export class TelemetriaService {
           custodiaCloud,
           porcentajeTokenFisico,
           porcentajeCloud,
-          actasPeriodo: actasPeriodo.length,
-          actasPorTipo,
           totalEventosAuditoriaPeriodo,
           auditoriaPorAccion,
           auditoriaPorModulo,
@@ -1578,9 +1362,7 @@ export class TelemetriaService {
         serieTemporal,
       };
     } catch (error) {
-      this.logger.error(
-        `Error al calcular métricas de trazabilidad: ${(error as Error).message}`,
-      );
+      this.logger.error(`Error al calcular métricas de trazabilidad: ${(error as Error).message}`);
       throw error;
     }
   }

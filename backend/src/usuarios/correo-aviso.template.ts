@@ -19,13 +19,20 @@ export function generarPlantillaCorreoCaducidad(datos: DatosPlantillaCaducidad):
   html: string;
 } {
   const nombre = (datos.nombre || 'Funcionario(a)').trim();
-  const rut = (datos.rut || '-').trim();
   const fechaVencimiento = (datos.fechaVencimiento || '-').trim();
   const diasNum = Number(datos.diasRestantes ?? 0);
   const diasTexto =
     diasNum <= 0
       ? `Expirado hace ${Math.abs(diasNum)} ${Math.abs(diasNum) === 1 ? 'día' : 'días'}`
       : `${diasNum} ${diasNum === 1 ? 'día' : 'días'}`;
+
+  const officeName = process.env.MAIL_OFFICE_NAME || 'Oficina de Transformación Digital';
+  const deptName = process.env.MAIL_DEPT_NAME || 'Departamento de Gestión de Sistemas y TICS';
+  const contactPhone = process.env.MAIL_CONTACT_PHONE || '+569 91682880';
+  const contactPhoneHref = contactPhone.replace(/\s+/g, '');
+  const contactEmail = process.env.MAIL_CONTACT_EMAIL || 'transformaciondigital@municoquimbo.cl';
+  const webUrl = process.env.MAIL_WEB_URL || 'municoquimbo.cl';
+  const webHref = /^https?:\/\//i.test(webUrl) ? webUrl : `http://${webUrl}/`;
 
   const subject =
     diasNum <= 0
@@ -51,22 +58,22 @@ export function generarPlantillaCorreoCaducidad(datos: DatosPlantillaCaducidad):
     '01 Responder este correo confirmando su intención de renovar el certificado.',
     '02 Adjuntar fotocopia del carnet de identidad por ambos lados, actualizada.',
     '03 Indicar teléfono de contacto institucional o personal.',
-    '04 Si usted ya posee un token físico debe dirigirse al Departamento de Gestión de Sistemas y TICs para actualizar su certificado.',
+    `04 Si usted ya posee un token físico debe dirigirse al ${deptName} para actualizar su certificado.`,
     '05 Recibir notificación vía correo cuando el nuevo certificado esté disponible.',
     '',
     'Importante',
     'Una vez vencido el certificado, no podrá firmar digitalmente ningún documento hasta completar la renovación. Le recomendamos iniciar el proceso a la brevedad para evitar interrupciones en su gestión.',
     '',
     'Dónde realizar el trámite',
-    'Oficina de Transformación Digital - piso 6, en horario laboral.',
-    'Consultas: transformaciondigital@municoquimbo.cl',
+    `${officeName} - piso 6, en horario laboral.`,
+    `Consultas: ${contactEmail}`,
     '',
     'Quedamos atentos a sus comentarios.',
     '',
     'Atte.',
-    'Oficina de Transformación Digital',
-    'Departamento de Gestión de Sistemas y TICS',
-    'TEL +569 91682880 | MAIL transformaciondigital@municoquimbo.cl | WEB municoquimbo.cl',
+    officeName,
+    deptName,
+    `TEL ${contactPhone} | MAIL ${contactEmail} | WEB ${webUrl}`,
     '',
     'Municipalidad - Comunicación Institucional',
     'Mensaje confidencial. Si no es el destinatario, elimínelo y notifique al remitente. No imprima si no es necesario.',
@@ -187,7 +194,7 @@ export function generarPlantillaCorreoCaducidad(datos: DatosPlantillaCaducidad):
                   <span style="display:inline-block;background:#EEF4FC;color:#003080;font-family:'Courier New',monospace;font-weight:bold;font-size:12px;padding:3px 8px;border-radius:3px;">04</span>
                 </td>
                 <td valign="top" style="padding:12px 0px;border-bottom:1px solid #f0f0f2;">
-                  <b style="color:#00163F;">Si usted ya posee un token físico debe dirigirse</b> al Departamento de Gestión de Sistemas y TICs para actualizar su certificado.
+                  <b style="color:#00163F;">Si usted ya posee un token físico debe dirigirse</b> al ${escapeHtml(deptName)} para actualizar su certificado.
                 </td>
               </tr>
               <tr>
@@ -223,8 +230,8 @@ export function generarPlantillaCorreoCaducidad(datos: DatosPlantillaCaducidad):
               <tr>
                 <td style="padding:14px 18px;font-size:13px;line-height:1.55;color:#00163F;">
                   <div style="font-weight:bold;font-size:14px;margin-bottom:4px;">Dónde realizar el trámite</div>
-                  <b>Oficina de Transformación Digital</b> - piso 6, en horario laboral.<br>
-                  Consultas: <b>transformaciondigital@municoquimbo.cl</b>
+                  <b>${escapeHtml(officeName)}</b> - piso 6, en horario laboral.<br>
+                  Consultas: <b>${escapeHtml(contactEmail)}</b>
                 </td>
               </tr>
             </tbody>
@@ -245,12 +252,12 @@ export function generarPlantillaCorreoCaducidad(datos: DatosPlantillaCaducidad):
                 <td width="6" bgcolor="#00163F" style="width:6px;background:#00163F;line-height:0;font-size:0px;">&nbsp;</td>
                 <td width="14" style="width:14px;">&nbsp;</td>
                 <td valign="top">
-                  <div style="font-weight:bold;font-size:15px;color:#00163F;line-height:1.2;">Oficina de Transformación Digital</div>
-                  <div style="font-size:12px;color:#5b5b5f;margin-top:2px;">Departamento de Gestión de Sistemas y TICS</div>
+                  <div style="font-weight:bold;font-size:15px;color:#00163F;line-height:1.2;">${escapeHtml(officeName)}</div>
+                  <div style="font-size:12px;color:#5b5b5f;margin-top:2px;">${escapeHtml(deptName)}</div>
                   <div style="font-size:11px;color:#5b5b5f;margin-top:8px;">
-                    <b style="color:#00163F;text-transform:uppercase;letter-spacing:0.5px;">TEL</b> <a href="tel:+56991682880" target="_blank">+569 91682880</a>&nbsp;&nbsp;&nbsp;
-                    <b style="color:#00163F;text-transform:uppercase;letter-spacing:0.5px;">MAIL</b> <a href="mailto:transformaciondigital@municoquimbo.cl" target="_blank">transformaciondigital@municoquimbo.cl</a>&nbsp;&nbsp;&nbsp;
-                    <b style="color:#00163F;text-transform:uppercase;letter-spacing:0.5px;">WEB</b> <a href="http://municoquimbo.cl/" target="_blank">municoquimbo.cl</a>
+                    <b style="color:#00163F;text-transform:uppercase;letter-spacing:0.5px;">TEL</b> <a href="tel:${escapeHtml(contactPhoneHref)}" target="_blank">${escapeHtml(contactPhone)}</a>&nbsp;&nbsp;&nbsp;
+                    <b style="color:#00163F;text-transform:uppercase;letter-spacing:0.5px;">MAIL</b> <a href="mailto:${escapeHtml(contactEmail)}" target="_blank">${escapeHtml(contactEmail)}</a>&nbsp;&nbsp;&nbsp;
+                    <b style="color:#00163F;text-transform:uppercase;letter-spacing:0.5px;">WEB</b> <a href="${escapeHtml(webHref)}" target="_blank">${escapeHtml(webUrl)}</a>
                   </div>
                 </td>
               </tr>
@@ -268,7 +275,7 @@ export function generarPlantillaCorreoCaducidad(datos: DatosPlantillaCaducidad):
   </table>
   <br>
   <div style="text-align:left;max-width:600px;margin:0 auto;">
-    <img src="https://www.municoquimbo.cl//images/estructura/2023/Marzo/firma-correo.jpg" alt="Firma Institucional Municipalidad de Coquimbo" style="max-width:100%;height:auto;">
+    <img src="https://www.municoquimbo.cl//images/estructura/2023/Marzo/firma-correo.jpg" alt="Firma Institucional" style="max-width:100%;height:auto;">
   </div>
 </div>`;
 

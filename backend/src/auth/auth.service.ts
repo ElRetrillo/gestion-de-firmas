@@ -3,10 +3,8 @@ import {
   UnauthorizedException,
   ForbiddenException,
   BadRequestException,
-  NotFoundException,
   HttpException,
   HttpStatus,
-  Logger,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { PrismaService } from '../prisma/prisma.service';
@@ -18,7 +16,6 @@ import {
 } from '../common/crypto.util';
 import { formatRut } from '../common/rut.util';
 import { JWT_ISSUER } from '../common/auth.guards';
-import { evaluarPoliticaRbacFirma } from './rbac-firmas.policy';
 import { RedisService } from '../redis/redis.service';
 import {
   derivarSecretoUsuario,
@@ -26,8 +23,8 @@ import {
   verificarTotp,
   generarOtpauthUrl,
   generarSecretoBase32,
+  getTotpIssuer,
 } from '../common/totp.util';
-
 import { IsNotEmpty, IsOptional, IsString } from 'class-validator';
 
 export class VerificarTotpDto {
@@ -47,31 +44,7 @@ export class LoginDto {
 
   @IsString()
   @IsOptional()
-  rolSimulado?: string;
-
-  @IsString()
-  @IsOptional()
   codigoTotp?: string;
-}
-
-export class VerificarPinDto {
-  @IsString()
-  @IsNotEmpty()
-  rut!: string;
-
-  @IsString()
-  @IsNotEmpty()
-  pin!: string;
-}
-
-export class DesbloquearPinDto {
-  @IsString()
-  @IsNotEmpty()
-  rut!: string;
-
-  @IsString()
-  @IsNotEmpty()
-  nuevoPin!: string;
 }
 
 export class CambiarPasswordDto {
@@ -88,60 +61,12 @@ export class CambiarPasswordDto {
   codigoTotp?: string;
 }
 
-export class RegistroFuncionarioDto {
-  @IsString()
-  @IsNotEmpty()
-  rut!: string;
-
-  @IsString()
-  @IsNotEmpty()
-  nombre!: string;
-
-  @IsString()
-  @IsNotEmpty()
-  apellido!: string;
-
-  @IsString()
-  @IsOptional()
-  email?: string;
-
-  @IsString()
-  @IsNotEmpty()
-  password!: string;
-
-  @IsString()
-  @IsOptional()
-  cargo?: string;
-
-  @IsString()
-  @IsOptional()
-  unidad?: string;
-
-  @IsString()
-  @IsOptional()
-  condicionContractual?: string;
-}
-
-export class ClaveUnicaAuthDto {
-  @IsString()
-  @IsOptional()
-  code?: string;
-
-  @IsString()
-  @IsOptional()
-  state?: string;
-
-  @IsString()
-  @IsOptional()
-  rut?: string;
-}
-
 const MAX_INTENTOS_LOGIN = 5;
 const VENTANA_BLOQUEO_MS = 15 * 60 * 1000;
+const SESSION_TTL_SECONDS = 3 * 3600;
 
 @Injectable()
 export class AuthService {
-  private readonly logger = new Logger(AuthService.name);
   private readonly jwtSecret: string;
   private readonly intentos = new Map<string, { count: number; desde: number }>();
 
@@ -155,11 +80,12 @@ export class AuthService {
 
   private signJwt(payload: Record<string, unknown>): string {
     const header = Buffer.from(JSON.stringify({ alg: 'HS256', typ: 'JWT' })).toString('base64url');
+    const now = Math.floor(Date.now() / 1000);
     const body = Buffer.from(
       JSON.stringify({
         ...payload,
-        iat: Math.floor(Date.now() / 1000),
-        exp: Math.floor(Date.now() / 1000) + 3 * 3600, // 3 horas
+        iat: now,
+        exp: now + SESSION_TTL_SECONDS,
         iss: JWT_ISSUER,
       }),
     ).toString('base64url');
@@ -182,7 +108,7 @@ export class AuthService {
     return {
       accessToken: token,
       tokenType: 'Bearer',
-      expiresIn: 3 * 3600,
+      expiresIn: SESSION_TTL_SECONDS,
       debeCambiarPassword: !!u.debeCambiarPassword,
       usuario: this.perfilPublico(u),
     };
@@ -199,7 +125,6 @@ export class AuthService {
       rol: u.rol,
       estado: u.estado,
       condicionContractual: u.condicionContractual || 'CONTRATA',
-      rbac: evaluarPoliticaRbacFirma(u),
       pinBloqueado: u.pinBloqueado,
       debeCambiarPassword: !!u.debeCambiarPassword,
       ...(u.certificados ? { certificados: u.certificados } : {}),
@@ -246,57 +171,6 @@ export class AuthService {
       .catch(() => {});
   }
 
-  async registrar(dto: RegistroFuncionarioDto, ipOrigen = 'desconocida') {
-    const rutLimpio = (dto.rut || '').trim();
-    if (!rutLimpio || !dto.nombre?.trim() || !dto.apellido?.trim() || !dto.password) {
-      throw new BadRequestException('RUT, Nombre, Apellido y Contraseña son obligatorios.');
-    }
-
-    const rut = formatRut(rutLimpio) || rutLimpio;
-    const nombreCompleto = `${dto.nombre.trim()} ${dto.apellido.trim()}`;
-    const emailFinal = (dto.email || '').trim().toLowerCase();
-    if (!emailFinal || !emailFinal.endsWith('@municoquimbo.cl')) {
-      throw new BadRequestException('Debe ingresar un correo institucional válido con dominio @municoquimbo.cl.');
-    }
-
-    const existente = await this.prisma.usuario.findFirst({
-      where: { OR: [{ rut }, { rut: rutLimpio }, { email: emailFinal }] },
-    });
-    if (existente) {
-      throw new BadRequestException('Ya existe un funcionario registrado con ese RUT o correo.');
-    }
-
-    const errPass = validarFortalezaPassword(dto.password);
-    if (errPass) throw new BadRequestException(errPass);
-
-    const nuevo = await this.prisma.usuario.create({
-      data: {
-        rut,
-        nombre: nombreCompleto,
-        email: emailFinal,
-        cargo: (dto.cargo || 'Profesionales').trim(),
-        unidad: (dto.unidad || 'I. Municipalidad de Coquimbo').trim(),
-        condicionContractual: (dto.condicionContractual || 'CONTRATA').trim().toUpperCase(),
-        rol: 'FUNCIONARIO',
-        estado: 'ACTIVO',
-        passwordHash: hashSecret(dto.password),
-        pinHash: hashSecret('1234'), // PIN estándar inicial
-        debeCambiarPassword: false,
-      },
-    });
-
-    await this.auditar('REGISTRO_AUTONOMO', rut, nuevo.id, nuevo.email, ipOrigen, {
-      nombreCompleto,
-      rolInicial: 'FUNCIONARIO',
-    });
-
-    return {
-      status: 'success',
-      mensaje: 'Registro completado con éxito. Sesión iniciada.',
-      ...this.emitirSesion(nuevo),
-    };
-  }
-
   async login(dto: LoginDto, ipOrigen = 'desconocida') {
     const rut = (dto.rut || '').trim();
     if (!rut || !dto.password) {
@@ -310,7 +184,6 @@ export class AuthService {
       include: { certificados: true },
     });
 
-    // Mensaje genérico para no revelar si el RUT existe.
     if (!u || !verifySecret(dto.password, u.passwordHash)) {
       this.registrarFallo(rut);
       await this.auditar('LOGIN_FALLIDO', rut, u?.id, u?.email || 'desconocido', ipOrigen, {});
@@ -323,7 +196,7 @@ export class AuthService {
 
     if (u.rol === 'PENDIENTE') {
       throw new ForbiddenException(
-        'Tu registro fue recibido exitosamente pero tu cuenta está a la espera de que el Administrador te asigne un rol institucional antes de poder ingresar.',
+        'Cuenta pendiente de asignación de rol institucional por un Administrador.',
       );
     }
 
@@ -367,6 +240,9 @@ export class AuthService {
       include: { certificados: true },
     });
     if (!u) throw new UnauthorizedException('Usuario no encontrado.');
+    if (u.estado === 'SUSPENDIDO' || u.estado === 'DESVINCULADO') {
+      throw new UnauthorizedException('Cuenta revocada o suspendida.');
+    }
     return this.perfilPublico(u);
   }
 
@@ -399,227 +275,15 @@ export class AuthService {
     return this.emitirSesion(actualizado);
   }
 
-  async verificarPinToken(dto: VerificarPinDto, solicitante?: { sub?: string; rol?: string }) {
-    const usuario = await this.prisma.usuario.findUnique({ where: { rut: dto.rut } });
-    if (!usuario) {
-      throw new UnauthorizedException('Funcionario no encontrado para verificación de PIN.');
-    }
-    if (solicitante && solicitante.sub && solicitante.sub !== usuario.id && solicitante.rol !== 'ADMIN') {
-      throw new ForbiddenException('Solo puede verificar su propio PIN.');
-    }
-
-    if (usuario.pinBloqueado) {
-      throw new ForbiddenException(
-        'El PIN del token criptográfico se encuentra BLOQUEADO por intentos fallidos. Solicite desbloqueo a un administrador.',
-      );
-    }
-
-    if (!verifySecret(dto.pin, usuario.pinHash)) {
-      const nuevosIntentos = usuario.intentosPinFallidos + 1;
-      const bloquear = nuevosIntentos >= 3;
-      await this.prisma.usuario.update({
-        where: { id: usuario.id },
-        data: { intentosPinFallidos: nuevosIntentos, pinBloqueado: bloquear },
-      });
-      throw new UnauthorizedException(
-        bloquear
-          ? 'PIN incorrecto. Token BLOQUEADO tras 3 intentos fallidos.'
-          : `PIN incorrecto. Intentos restantes: ${3 - nuevosIntentos}`,
-      );
-    }
-
-    if (usuario.intentosPinFallidos > 0) {
-      await this.prisma.usuario.update({
-        where: { id: usuario.id },
-        data: { intentosPinFallidos: 0 },
-      });
-    }
-
-    return { valido: true, mensaje: 'PIN criptográfico validado correctamente.' };
-  }
-
-  async desbloquearPin(dto: DesbloquearPinDto, admin: { sub: string; email: string; rut: string }) {
-    if (!dto.rut) throw new BadRequestException('RUT obligatorio.');
-    if (!dto.nuevoPin || !/^\d{4,8}$/.test(dto.nuevoPin)) {
-      throw new BadRequestException('El nuevo PIN debe ser numérico de 4 a 8 dígitos.');
-    }
-    const objetivo = await this.prisma.usuario.findUnique({ where: { rut: dto.rut } });
-    if (!objetivo) throw new NotFoundException(`Funcionario ${dto.rut} no encontrado.`);
-
-    const usuario = await this.prisma.usuario.update({
-      where: { rut: dto.rut },
-      data: {
-        pinBloqueado: false,
-        intentosPinFallidos: 0,
-        pinHash: hashSecret(dto.nuevoPin),
-      },
-    });
-
-    await this.prisma.historialCambio.create({
-      data: {
-        tablaAfectada: 'usuarios',
-        registroId: dto.rut,
-        accion: 'DESBLOQUEO_PIN_TOKEN',
-        usuarioId: admin.sub,
-        usuarioEmail: admin.email,
-        diffJsonb: {
-          rutAfectado: dto.rut,
-          pinBloqueadoAnterior: objetivo.pinBloqueado,
-          autorizadoPor: admin.rut,
-        },
-      },
-    });
-
-    return {
-      status: 'success',
-      rut: usuario.rut,
-      pinBloqueado: false,
-      mensaje: `Token criptográfico de ${usuario.nombre} desbloqueado y PIN restablecido.`,
-    };
-  }
-
   async logout(user: any, ipOrigen = 'desconocida') {
     const rut = user?.rut || 'desconocido';
     const email = user?.email || 'desconocido';
-    const sub = user?.sub;
-    await this.auditar('SIGN_OUT', rut, sub, email, ipOrigen, {
+    await this.auditar('SIGN_OUT', rut, user?.sub, email, ipOrigen, {
       evento: 'Cierre de sesión del usuario',
     });
     return { status: 'ok', mensaje: 'Sesión cerrada y registrada en bitácora.' };
   }
 
-  /**
-   * Módulo 6: Adaptador de Autenticación Unificada (ClaveÚnica OAuth2 + Active Directory).
-   * Opera en modo SANDBOX_LOCAL cuando aún no se han aprovisionado las credenciales oficiales en .env,
-   * y conmuta automáticamente a PRODUCCION_OFICIAL cuando están presentes.
-   */
-  obtenerConfigProveedoresAuth() {
-    const cuClientId = this.configService.get<string>('CLAVEUNICA_CLIENT_ID', '');
-    const cuRedirectUri = this.configService.get<string>(
-      'CLAVEUNICA_REDIRECT_URI',
-      'http://localhost:5173/auth/claveunica/callback',
-    );
-    const adLdapUrl = this.configService.get<string>('AD_LDAP_URL', '');
-
-    return {
-      claveUnica: {
-        habilitado: true,
-        modo: cuClientId ? 'PRODUCCION_OFICIAL' : 'SANDBOX_LOCAL',
-        authorizeUrl: cuClientId
-          ? `https://accounts.claveunica.gob.cl/openid/authorize?client_id=${encodeURIComponent(cuClientId)}&response_type=code&scope=openid%20run%20name&redirect_uri=${encodeURIComponent(cuRedirectUri)}&state=cqm-oauth-2026`
-          : '/api/v1/auth/claveunica/sandbox',
-      },
-      activeDirectory: {
-        habilitado: true,
-        modo: adLdapUrl ? 'PRODUCCION_OFICIAL' : 'SANDBOX_LOCAL',
-        dominio: this.configService.get<string>('AD_DOMAIN', 'MUNICOQUIMBO.LOCAL'),
-      },
-    };
-  }
-
-  async loginClaveUnica(dto: ClaveUnicaAuthDto, ipOrigen = 'desconocida') {
-    const cuClientId = this.configService.get<string>('CLAVEUNICA_CLIENT_ID', '');
-    const cuClientSecret = this.configService.get<string>('CLAVEUNICA_CLIENT_SECRET', '');
-    const cuRedirectUri = this.configService.get<string>('CLAVEUNICA_REDIRECT_URI', '');
-
-    let rutResuelto = dto.rut ? formatRut(dto.rut.trim()) || dto.rut.trim() : '';
-    const modo = cuClientId && cuClientSecret ? 'PRODUCCION_OFICIAL' : 'SANDBOX_LOCAL';
-
-    if (modo === 'PRODUCCION_OFICIAL' && dto.code) {
-      // Intercambio estándar OpenID Connect con ClaveÚnica del Estado de Chile
-      const tokenRes = await fetch('https://accounts.claveunica.gob.cl/openid/token/', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body: new URLSearchParams({
-          client_id: cuClientId,
-          client_secret: cuClientSecret,
-          redirect_uri: cuRedirectUri,
-          grant_type: 'authorization_code',
-          code: dto.code,
-        }).toString(),
-      });
-
-      if (!tokenRes.ok) {
-        throw new UnauthorizedException('Error al validar código OAuth2 con ClaveÚnica.');
-      }
-      const tokenData = (await tokenRes.json()) as { access_token: string };
-      const infoRes = await fetch('https://accounts.claveunica.gob.cl/openid/userinfo/', {
-        method: 'POST',
-        headers: { Authorization: `Bearer ${tokenData.access_token}` },
-      });
-      if (!infoRes.ok) {
-        throw new UnauthorizedException('No se pudo obtener el RUN desde ClaveÚnica.');
-      }
-      const infoData = (await infoRes.json()) as { RolUnico?: { numero: number; DV: string } };
-      if (infoData.RolUnico) {
-        rutResuelto = formatRut(`${infoData.RolUnico.numero}-${infoData.RolUnico.DV}`);
-      }
-    }
-
-    const u = rutResuelto
-      ? await this.prisma.usuario.findFirst({
-          where: { OR: [{ rut: rutResuelto }, { rut: dto.rut || '' }] },
-          include: { certificados: true },
-        })
-      : await this.prisma.usuario.findFirst({
-          where: { estado: 'ACTIVO' },
-          orderBy: { createdAt: 'asc' },
-          include: { certificados: true },
-        });
-
-    if (!u) {
-      throw new UnauthorizedException(
-        `El RUN ${rutResuelto || 'indicado'} no se encuentra registrado como funcionario activo en el padrón municipal.`,
-      );
-    }
-
-    if (u.estado === 'DESVINCULADO' || u.estado === 'SUSPENDIDO') {
-      throw new ForbiddenException(`Cuenta bloqueada. Estado actual: ${u.estado}.`);
-    }
-
-    await this.auditar('LOGIN_CLAVEUNICA_OAUTH2', u.rut, u.id, u.email, ipOrigen, {
-      modoIntegracion: modo,
-      rol: u.rol,
-      unidad: u.unidad,
-    });
-
-    return {
-      ...this.emitirSesion(u),
-      proveedorAuth: 'CLAVE_UNICA',
-      modoIntegracion: modo,
-    };
-  }
-
-  async loginActiveDirectory(dto: LoginDto, ipOrigen = 'desconocida') {
-    const adLdapUrl = this.configService.get<string>('AD_LDAP_URL', '');
-    const modo = adLdapUrl ? 'PRODUCCION_OFICIAL' : 'SANDBOX_LOCAL';
-
-    const sesion: any = await this.login(dto, ipOrigen);
-    const rutAud = sesion.usuario?.rut || sesion.rut || dto.rut;
-    const idAud = sesion.usuario?.id;
-    const emailAud = sesion.usuario?.email || sesion.email || 'desconocido';
-    await this.auditar(
-      'LOGIN_ACTIVE_DIRECTORY',
-      rutAud,
-      idAud,
-      emailAud,
-      ipOrigen,
-      {
-        modoIntegracion: modo,
-        dominio: this.configService.get<string>('AD_DOMAIN', 'MUNICOQUIMBO.LOCAL'),
-      },
-    );
-
-    return {
-      ...sesion,
-      proveedorAuth: 'ACTIVE_DIRECTORY',
-      modoIntegracion: modo,
-    };
-  }
-
-  /**
-   * Genera o recupera el secreto TOTP RFC 6238 del funcionario para configurar Google / Microsoft Authenticator
-   */
   async obtenerSetupTotp(userIdOrRut: string) {
     const usuario = await this.prisma.usuario.findFirst({
       where: { OR: [{ id: userIdOrRut }, { rut: userIdOrRut }] },
@@ -632,10 +296,11 @@ export class AuthService {
       secret = derivarSecretoUsuario(usuario.rut, this.jwtSecret);
     }
 
+    const emisor = getTotpIssuer();
     const otpauthUrl = generarOtpauthUrl({
       cuenta: `${usuario.rut} (${usuario.email})`,
       secretBase32: secret,
-      emisor: 'Gestion de tokens - I.Municipalidad de Coquimbo',
+      emisor,
     });
 
     const codigoActual = calcularTotp(secret);
@@ -647,13 +312,13 @@ export class AuthService {
       secretBase32: secret,
       otpauthUrl,
       codigoActual,
-      emisor: 'Gestion de tokens - I.Municipalidad de Coquimbo',
+      emisor,
       instrucciones: [
         '1. Descargue Google Authenticator, Microsoft Authenticator o 2FAS en su teléfono.',
-        '2. En la app móvil, seleccione "Agregar cuenta" o "+" y luego "Ingresar clave de configuración".',
-        `3. En nombre de cuenta escriba "${usuario.email}" y en la clave ingrese: ${secret}`,
-        '4. Asegúrese de que el tipo de clave sea "Basada en tiempo" (TOTP 30s).',
-        '5. El código de 6 dígitos que aparezca en su aplicación será su OTP dinámico para autorizar firmas.',
+        '2. Seleccione "Agregar cuenta" o "+" y escanee el código QR o ingrese la clave manualmente.',
+        `3. Nombre de cuenta: "${usuario.email}" | Clave: ${secret}`,
+        '4. Verifique que el tipo de clave sea "Basada en tiempo" (TOTP 30s).',
+        '5. Ingrese el código dinámico de 6 dígitos generado por su aplicación.',
       ],
       aplicacionesRecomendadas: [
         {
@@ -678,9 +343,6 @@ export class AuthService {
     };
   }
 
-  /**
-   * Valida si un código de 6 dígitos ingresado coincide con el OTP TOTP en tiempo real del usuario
-   */
   async verificarCodigoTotpUsuario(rutOrUserId: string, codigo: string): Promise<boolean> {
     const cleanQuery = (rutOrUserId || '').replace(/[^0-9kK]/g, '').toUpperCase();
     const usuario = await this.prisma.usuario.findFirst({
@@ -688,11 +350,13 @@ export class AuthService {
         OR: [
           { id: rutOrUserId },
           { rut: rutOrUserId },
-          ...(cleanQuery.length >= 7 ? [
-            { rut: { contains: cleanQuery.slice(0, 8) } },
-            { rut: { contains: cleanQuery } }
-          ] : [])
-        ]
+          ...(cleanQuery.length >= 7
+            ? [
+                { rut: { contains: cleanQuery.slice(0, 8) } },
+                { rut: { contains: cleanQuery } },
+              ]
+            : []),
+        ],
       },
     });
     if (!usuario) return false;
@@ -705,9 +369,6 @@ export class AuthService {
     return verificarTotp(secret, codigo, 1, 30);
   }
 
-  /**
-   * Regenera un nuevo secreto aleatorio para el usuario y lo almacena en Redis
-   */
   async regenerarSecretoTotp(userIdOrRut: string) {
     const usuario = await this.prisma.usuario.findFirst({
       where: { OR: [{ id: userIdOrRut }, { rut: userIdOrRut }] },
@@ -715,9 +376,7 @@ export class AuthService {
     if (!usuario) throw new UnauthorizedException('Usuario no encontrado.');
 
     const nuevoSecreto = generarSecretoBase32(20);
-    const redisKey = `user:totp-secret:${usuario.rut}`;
-    await this.redis.setKey(redisKey, nuevoSecreto, 365 * 86400);
-
+    await this.redis.setKey(`user:totp-secret:${usuario.rut}`, nuevoSecreto, 365 * 86400);
     return this.obtenerSetupTotp(usuario.id);
   }
 }

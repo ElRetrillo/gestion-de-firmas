@@ -1,4 +1,12 @@
-import { Injectable, Logger, NotFoundException, BadRequestException, ConflictException, OnModuleInit, OnModuleDestroy } from '@nestjs/common';
+import {
+  Injectable,
+  Logger,
+  NotFoundException,
+  BadRequestException,
+  ConflictException,
+  OnModuleInit,
+  OnModuleDestroy,
+} from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { hashSecret, generarPasswordTemporal, generarPin, validarFortalezaPassword } from '../common/crypto.util';
 import { formatRut, getRutVariants } from '../common/rut.util';
@@ -6,15 +14,44 @@ import { generarPlantillaCorreoCaducidad } from './correo-aviso.template';
 import * as nodemailer from 'nodemailer';
 import * as fs from 'fs';
 import * as path from 'path';
+import { IsEmail, IsNotEmpty, IsOptional, IsString } from 'class-validator';
 
 const ROLES_VALIDOS = ['ADMIN', 'SUPERVISOR', 'FUNCIONARIO', 'MINISTRO_DE_FE', 'PENDIENTE'];
+
+function getAdminPrincipalRut(): string | null {
+  const raw = process.env.ADMIN_INICIAL_RUT?.trim();
+  if (!raw) return null;
+  return formatRut(raw) || raw;
+}
+
+function getSuperadminsProtegidos(): string[] {
+  const ruts = new Set<string>();
+  const principal = getAdminPrincipalRut();
+  if (principal) ruts.add(principal);
+
+  for (const envVar of [process.env.SUPERADMINS_FIJOS_JSON, process.env.EXTRA_SUPERADMINS_JSON]) {
+    if (!envVar) continue;
+    try {
+      const parsed = JSON.parse(envVar);
+      if (Array.isArray(parsed)) {
+        for (const item of parsed) {
+          const raw = typeof item === 'string' ? item : item?.rut;
+          if (raw && typeof raw === 'string') {
+            const norm = formatRut(raw.trim()) || raw.trim();
+            if (norm) ruts.add(norm);
+          }
+        }
+      }
+    } catch {}
+  }
+
+  return Array.from(ruts);
+}
 
 function sanitizar<T extends Record<string, any>>(u: T): Omit<T, 'passwordHash' | 'pinHash'> {
   const { passwordHash, pinHash, ...resto } = u as any;
   return resto;
 }
-
-import { IsEmail, IsNotEmpty, IsOptional, IsString } from 'class-validator';
 
 export class CrearUsuarioDto {
   @IsString()
@@ -67,40 +104,22 @@ export class CambiarEstadoUsuarioDto {
   ejecutadoPor?: string;
 }
 
-export class SolicitarModificacionDatosDto {
+export class GenerarCredencialesAdminDto {
   @IsString()
-  @IsOptional()
-  rut?: string;
-
-  @IsString()
-  @IsOptional()
-  nuevoCargo?: string;
-
-  @IsString()
-  @IsOptional()
-  nuevaUnidad?: string;
-
-  @IsString()
-  @IsOptional()
-  nuevaCondicionContractual?: string;
-
-  @IsEmail()
-  @IsOptional()
-  nuevoEmail?: string;
+  @IsNotEmpty()
+  rut!: string;
 
   @IsString()
   @IsNotEmpty()
-  justificacion!: string;
-}
-
-export class ResolverModificacionDatosDto {
-  @IsString()
-  @IsNotEmpty()
-  decision!: 'APROBADA' | 'RECHAZADA';
+  nombre!: string;
 
   @IsString()
   @IsOptional()
-  observacion?: string;
+  email?: string;
+
+  @IsString()
+  @IsOptional()
+  pinInicial?: string;
 }
 
 @Injectable()
@@ -111,7 +130,6 @@ export class UsuariosService implements OnModuleInit, OnModuleDestroy {
   constructor(private readonly prisma: PrismaService) {}
 
   async onModuleInit() {
-    // Ejecución inicial diferida (10s tras arranque) y programación automática cada 24 horas (Módulo 2: Alertas 60, 30 y 15 días)
     setTimeout(() => {
       this.ejecutarBarridoAutomaticoVencimientos().catch(() => {});
     }, 10000);
@@ -177,14 +195,13 @@ export class UsuariosService implements OnModuleInit, OnModuleDestroy {
               tokenHardware: true,
             },
           },
-          actasCustodia: true,
         },
         orderBy: { nombre: 'asc' },
         ...(filtros?.limit ? { take: Number(filtros.limit) } : {}),
       });
       return usuarios.map((u) => sanitizar(u));
     } catch (err) {
-      this.logger.error(`Error al listar usuarios en base de datos: ${(err as Error).message}`);
+      this.logger.error(`Error al listar usuarios: ${(err as Error).message}`);
       return [];
     }
   }
@@ -219,13 +236,14 @@ export class UsuariosService implements OnModuleInit, OnModuleDestroy {
     if (!dto.pin) pinTemporal = generarPin();
     const pinFinal = dto.pin || pinTemporal!;
 
+    const orgDefault = process.env.DEFAULT_ORG_NAME || 'Ilustre Municipalidad de Coquimbo';
     const nuevo = await this.prisma.usuario.create({
       data: {
         rut,
         nombre: dto.nombre.trim(),
         email: dto.email.trim().toLowerCase(),
         cargo: (dto.cargo || 'Funcionario').trim(),
-        unidad: (dto.unidad || 'Municipalidad de Coquimbo').trim(),
+        unidad: (dto.unidad || orgDefault).trim(),
         rol,
         condicionContractual: dto.condicionContractual || 'CONTRATA',
         passwordHash: hashSecret(passwordFinal),
@@ -235,25 +253,26 @@ export class UsuariosService implements OnModuleInit, OnModuleDestroy {
       },
     });
 
-    await this.prisma.historialCambio.create({
-      data: {
-        tablaAfectada: 'usuarios',
-        registroId: nuevo.rut,
-        accion: rol === 'ADMIN' ? 'ALTA_ADMINISTRADOR' : 'ALTA_FUNCIONARIO',
-        usuarioId: ejecutor?.sub || nuevo.id,
-        usuarioEmail: ejecutor?.email || nuevo.email,
-        diffJsonb: {
-          nombre: nuevo.nombre,
-          rol: nuevo.rol,
-          unidad: nuevo.unidad,
-          condicionContractual: nuevo.condicionContractual,
+    await this.prisma.historialCambio
+      .create({
+        data: {
+          tablaAfectada: 'usuarios',
+          registroId: nuevo.rut,
+          accion: rol === 'ADMIN' ? 'ALTA_ADMINISTRADOR' : 'ALTA_FUNCIONARIO',
+          usuarioId: ejecutor?.sub || nuevo.id,
+          usuarioEmail: ejecutor?.email || nuevo.email,
+          diffJsonb: {
+            nombre: nuevo.nombre,
+            rol: nuevo.rol,
+            unidad: nuevo.unidad,
+            condicionContractual: nuevo.condicionContractual,
+          },
         },
-      },
-    }).catch(() => {});
+      })
+      .catch(() => {});
 
     return {
       ...sanitizar(nuevo),
-      // Credenciales temporales: se muestran UNA sola vez.
       ...(passwordTemporal ? { passwordTemporal } : {}),
       ...(pinTemporal ? { pinTemporal } : {}),
     };
@@ -277,16 +296,18 @@ export class UsuariosService implements OnModuleInit, OnModuleDestroy {
     }
 
     const actualizado = await this.prisma.usuario.update({ where: { id: u.id }, data: { rol: rolNuevo as any } });
-    await this.prisma.historialCambio.create({
-      data: {
-        tablaAfectada: 'usuarios',
-        registroId: u.rut,
-        accion: 'CAMBIO_ROL',
-        usuarioId: ejecutor.sub,
-        usuarioEmail: ejecutor.email,
-        diffJsonb: { rolAnterior: u.rol, rolNuevo },
-      },
-    }).catch(() => {});
+    await this.prisma.historialCambio
+      .create({
+        data: {
+          tablaAfectada: 'usuarios',
+          registroId: u.rut,
+          accion: 'CAMBIO_ROL',
+          usuarioId: ejecutor.sub,
+          usuarioEmail: ejecutor.email,
+          diffJsonb: { rolAnterior: u.rol, rolNuevo },
+        },
+      })
+      .catch(() => {});
     return sanitizar(actualizado);
   }
 
@@ -298,105 +319,103 @@ export class UsuariosService implements OnModuleInit, OnModuleDestroy {
       where: { id: u.id },
       data: { passwordHash: hashSecret(passwordTemporal), debeCambiarPassword: true },
     });
+    await this.prisma.historialCambio
+      .create({
+        data: {
+          tablaAfectada: 'usuarios',
+          registroId: u.rut,
+          accion: 'RESET_PASSWORD_ADMIN',
+          usuarioId: ejecutor.sub,
+          usuarioEmail: ejecutor.email,
+          diffJsonb: { rut: u.rut },
+        },
+      })
+      .catch(() => {});
+    return {
+      rut: u.rut,
+      passwordTemporal,
+      mensaje: 'Entregue esta contraseña al funcionario; deberá cambiarla al ingresar. Se muestra una sola vez.',
+    };
+  }
+
+  async cambiarEstadoUsuario(idOrRut: string, dto: CambiarEstadoUsuarioDto, ejecutor?: { sub: string; email: string }) {
+    const usuario = await this.prisma.usuario.findFirst({
+      where: { OR: [{ id: idOrRut }, { rut: idOrRut }] },
+      include: { certificados: true },
+    });
+    if (!usuario) {
+      throw new NotFoundException(`Funcionario ${idOrRut} no encontrado`);
+    }
+
+    if (usuario.rol === 'ADMIN' && dto.estado !== 'ACTIVO') {
+      if (ejecutor && usuario.id === ejecutor.sub) {
+        throw new BadRequestException('No puede cambiar su propio estado de administrador.');
+      }
+      const admins = await this.prisma.usuario.count({ where: { rol: 'ADMIN', estado: 'ACTIVO' } });
+      if (admins <= 1) {
+        throw new BadRequestException('Debe existir al menos un administrador activo.');
+      }
+    }
+
+    const estadoAnterior = usuario.estado;
+    const esDesvinculacion = dto.estado === 'DESVINCULADO' || dto.estado === 'SUSPENDIDO';
+
+    const actualizado = await this.prisma.usuario.update({
+      where: { id: usuario.id },
+      data: {
+        estado: dto.estado,
+        pinBloqueado: esDesvinculacion ? true : usuario.pinBloqueado,
+      },
+    });
+
+    const certificadosRevocados: string[] = [];
+    if (esDesvinculacion) {
+      for (const cert of usuario.certificados) {
+        if (cert.estado !== 'REVOCADO') {
+          await this.prisma.certificado.update({
+            where: { id: cert.id },
+            data: { estado: 'REVOCADO' },
+          });
+          certificadosRevocados.push(cert.id);
+        }
+        if (cert.tokenHardwareId && dto.estado === 'DESVINCULADO') {
+          await this.prisma.tokenHardware
+            .update({
+              where: { id: cert.tokenHardwareId },
+              data: { estadoPatrimonial: 'EN_REVISION' },
+            })
+            .catch(() => {});
+        }
+      }
+    }
+
     await this.prisma.historialCambio.create({
       data: {
         tablaAfectada: 'usuarios',
-        registroId: u.rut,
-        accion: 'RESET_PASSWORD_ADMIN',
-        usuarioId: ejecutor.sub,
-        usuarioEmail: ejecutor.email,
-        diffJsonb: { rut: u.rut },
+        registroId: usuario.rut,
+        accion: dto.estado === 'DESVINCULADO' ? 'DESVINCULACION_RRHH' : 'CAMBIO_ESTADO_USUARIO',
+        usuarioId: ejecutor?.sub || usuario.id,
+        usuarioEmail: ejecutor?.email || dto.ejecutadoPor || 'sistema',
+        diffJsonb: {
+          funcionario: usuario.nombre,
+          rut: usuario.rut,
+          estadoAnterior,
+          estadoNuevo: dto.estado,
+          motivo: dto.motivo || 'Actualización administrativa de ciclo de vida',
+          certificadosRevocados,
+          protocoloAnci48h: esDesvinculacion,
+        },
       },
-    }).catch(() => {});
-    return { rut: u.rut, passwordTemporal, mensaje: 'Entregue esta contraseña al funcionario; deberá cambiarla al ingresar. Se muestra una sola vez.' };
-  }
+    });
 
-  /**
-   * Módulo 1 (Sección 3.1): Ciclo de vida del funcionario y protocolo de bloqueo <48h RRHH
-   */
-  async cambiarEstadoUsuario(idOrRut: string, dto: CambiarEstadoUsuarioDto, ejecutor?: { sub: string; email: string }) {
-    {
-      const usuario = await this.prisma.usuario.findFirst({
-        where: {
-          OR: [{ id: idOrRut }, { rut: idOrRut }],
-        },
-        include: { certificados: true },
-      });
-
-      if (!usuario) {
-        throw new NotFoundException(`Funcionario ${idOrRut} no encontrado`);
-      }
-
-      if (usuario.rol === 'ADMIN' && dto.estado !== 'ACTIVO') {
-        if (ejecutor && usuario.id === ejecutor.sub) {
-          throw new BadRequestException('No puede cambiar su propio estado de administrador.');
-        }
-        const admins = await this.prisma.usuario.count({ where: { rol: 'ADMIN', estado: 'ACTIVO' } });
-        if (admins <= 1) {
-          throw new BadRequestException('Debe existir al menos un administrador activo.');
-        }
-      }
-
-      const estadoAnterior = usuario.estado;
-      const esDesvinculacion = dto.estado === 'DESVINCULADO' || dto.estado === 'SUSPENDIDO';
-
-      const actualizado = await this.prisma.usuario.update({
-        where: { id: usuario.id },
-        data: {
-          estado: dto.estado,
-          pinBloqueado: esDesvinculacion ? true : usuario.pinBloqueado,
-        },
-      });
-
-      const certificadosRevocados: string[] = [];
-
-      // Si es desvinculación o suspensión, revocar inmediatamente todos sus certificados (Ley 21.663 <48h)
-      if (esDesvinculacion) {
-        for (const cert of usuario.certificados) {
-          if (cert.estado !== 'REVOCADO') {
-            await this.prisma.certificado.update({
-              where: { id: cert.id },
-              data: { estado: 'REVOCADO' },
-            });
-            certificadosRevocados.push(cert.id);
-          }
-          if (cert.tokenHardwareId && dto.estado === 'DESVINCULADO') {
-            await this.prisma.tokenHardware.update({
-              where: { id: cert.tokenHardwareId },
-              data: { estadoPatrimonial: 'EN_REVISION' },
-            }).catch(() => {});
-          }
-        }
-      }
-
-      await this.prisma.historialCambio.create({
-        data: {
-          tablaAfectada: 'usuarios',
-          registroId: usuario.rut,
-          accion: dto.estado === 'DESVINCULADO' ? 'DESVINCULACION_RRHH' : 'CAMBIO_ESTADO_USUARIO',
-          usuarioId: ejecutor?.sub || usuario.id,
-          usuarioEmail: ejecutor?.email || dto.ejecutadoPor || 'sistema',
-          diffJsonb: {
-            funcionario: usuario.nombre,
-            rut: usuario.rut,
-            estadoAnterior,
-            estadoNuevo: dto.estado,
-            motivo: dto.motivo || 'Actualización administrativa de ciclo de vida',
-            certificadosRevocados,
-            protocoloAnci48h: esDesvinculacion,
-          },
-        },
-      });
-
-      return {
-        status: 'success',
-        usuario: sanitizar(actualizado),
-        certificadosRevocados,
-        mensaje: esDesvinculacion
-          ? `Protocolo ANCI/RRHH (<48h) ejecutado: Cuenta ${dto.estado} y ${certificadosRevocados.length} certificado(s) revocado(s).`
-          : `Estado de ${usuario.nombre} actualizado a ${dto.estado}.`,
-      };
-    }
+    return {
+      status: 'success',
+      usuario: sanitizar(actualizado),
+      certificadosRevocados,
+      mensaje: esDesvinculacion
+        ? `Protocolo ANCI/RRHH (<48h) ejecutado: Cuenta ${dto.estado} y ${certificadosRevocados.length} certificado(s) revocado(s).`
+        : `Estado de ${usuario.nombre} actualizado a ${dto.estado}.`,
+    };
   }
 
   async obtenerAlertasVencimiento() {
@@ -406,13 +425,8 @@ export class UsuariosService implements OnModuleInit, OnModuleDestroy {
     try {
       const certs = await this.prisma.certificado.findMany({
         where: {
-          validoHasta: {
-            lte: en60Dias,
-            gte: ahora,
-          },
-          estado: {
-            in: ['VIGENTE', 'POR_VENCER'],
-          },
+          validoHasta: { lte: en60Dias, gte: ahora },
+          estado: { in: ['VIGENTE', 'POR_VENCER'] },
         },
         include: {
           usuario: true,
@@ -434,7 +448,7 @@ export class UsuariosService implements OnModuleInit, OnModuleDestroy {
           custodia: c.custodia,
           hardwareModelo: c.tokenHardware
             ? `${c.tokenHardware.marca} ${c.tokenHardware.modelo}`
-            : 'Thales Luna HSM Cloud',
+            : 'Token Criptográfico',
           diasRestantes,
           severidad,
           fechaExpiracion: c.validoHasta.toISOString().split('T')[0],
@@ -499,16 +513,20 @@ export class UsuariosService implements OnModuleInit, OnModuleDestroy {
       ? 'Vista previa lista para enviar por SMTP'
       : 'Plantilla generada (SMTP no configurado en .env)';
 
-    const smtpHost = process.env.SMTP_HOST;
-    const smtpUser = process.env.SMTP_USER;
-    const smtpPass = process.env.SMTP_PASS;
+    const smtpHost = process.env.SMTP_HOST || '';
+    const smtpUser = process.env.SMTP_USER || '';
+    const smtpPass = process.env.SMTP_PASS || '';
     const smtpPort = Number(process.env.SMTP_PORT || 587);
     const smtpSecure = process.env.SMTP_SECURE === 'true' || smtpPort === 465;
+    const officeName = process.env.MAIL_OFFICE_NAME || 'Oficina de Transformación Digital';
+    const deptName = process.env.MAIL_DEPT_NAME || 'Departamento de Gestión de Sistemas y TICS';
     const smtpFrom =
-      process.env.SMTP_FROM ||
-      `"Oficina de Transformación Digital - Departamento de Gestión de Sistemas y TICS" <${smtpUser || 'datrigob@gmail.com'}>`;
+      process.env.SMTP_FROM || (smtpUser ? `"${officeName} - ${deptName}" <${smtpUser}>` : '');
 
-    const smtpPassPendiente = !smtpPass || smtpPass.includes('REEMPLAZAR_CON_APP_PASSWORD');
+    const smtpPassPendiente =
+      !smtpPass ||
+      smtpPass.includes('REEMPLAZAR_CON_APP_PASSWORD') ||
+      smtpPass.includes('CHANGE_ME');
 
     if (!payload.soloPreview) {
       if (smtpHost && smtpUser && !smtpPassPendiente && emailDestino) {
@@ -532,7 +550,7 @@ export class UsuariosService implements OnModuleInit, OnModuleDestroy {
             : [];
 
           await transporter.sendMail({
-            from: smtpFrom,
+            from: smtpFrom || smtpUser,
             to: emailDestino,
             subject: plantilla.subject,
             text: plantilla.text,
@@ -549,7 +567,7 @@ export class UsuariosService implements OnModuleInit, OnModuleDestroy {
           this.logger.warn(`[SMTP] Error enviando a ${emailDestino}: ${(smtpErr as Error).message}`);
         }
       } else if (smtpPassPendiente && smtpUser) {
-        motivoSmtp = `Falta configurar la Contraseña de Aplicación de Gmail (SMTP_PASS) para ${smtpUser}`;
+        motivoSmtp = `Falta configurar SMTP_PASS para ${smtpUser}`;
       }
 
       try {
@@ -562,7 +580,7 @@ export class UsuariosService implements OnModuleInit, OnModuleDestroy {
             diffJsonb: {
               certificadoId: payload.certificadoId || 'TODOS_EN_UMBRAL',
               destinatario: emailDestino || 'TODOS_LOS_FUNCIONARIOS_POR_VENCER',
-              remitente: smtpUser || 'datrigob@gmail.com',
+              remitente: smtpUser,
               titular: nombreTitular || undefined,
               enviadoSmtp,
               motivoSmtp,
@@ -570,16 +588,14 @@ export class UsuariosService implements OnModuleInit, OnModuleDestroy {
             },
           },
         });
-      } catch {
-        // Ignorar si BD no disponible
-      }
+      } catch {}
     }
 
     return {
       status: payload.soloPreview ? 'preview' : 'dispatched',
       enviadoSmtp,
       motivoSmtp,
-      remitenteSmtp: smtpUser || 'datrigob@gmail.com',
+      remitenteSmtp: smtpUser,
       certificadoId: payload.certificadoId || 'ALL',
       emailDestino: emailDestino || 'multiple',
       asunto: plantilla.subject,
@@ -589,16 +605,11 @@ export class UsuariosService implements OnModuleInit, OnModuleDestroy {
     };
   }
 
-  /**
-   * Módulo 2: Barrido automático programado de vencimientos a 60, 30 y 15 días.
-   * Actualiza certificados próximos a vencer y registra alertas preventivas en el Audit Trail.
-   */
   async ejecutarBarridoAutomaticoVencimientos() {
     try {
       const ahora = new Date();
       const alertas = await this.obtenerAlertasVencimiento();
 
-      // Marcar como VENCIDO aquellos cuya fecha ya expiró
       await this.prisma.certificado.updateMany({
         where: {
           validoHasta: { lt: ahora },
@@ -645,7 +656,7 @@ export class UsuariosService implements OnModuleInit, OnModuleDestroy {
       });
 
       this.logger.log(
-        `[Scheduler Vencimientos] Barrido automático completado: ${alertas.length} certificado(s) en ventana de 60/30/15 días.`,
+        `[Scheduler Vencimientos] Barrido completado: ${alertas.length} certificado(s) en ventana 60/30/15 días.`,
       );
       return {
         procesados: alertas.length,
@@ -659,156 +670,171 @@ export class UsuariosService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
-  /**
-   * Módulo 5: Flujo formal de solicitudes de actualización de perfiles, cargos y traslados internos.
-   */
-  async solicitarModificacionDatos(
-    dto: SolicitarModificacionDatosDto,
-    solicitanteContext?: { sub?: string; rut?: string; email?: string },
-  ) {
-    const targetRut = dto.rut ? formatRut(dto.rut) : solicitanteContext?.rut;
-    const usuario = await this.prisma.usuario.findFirst({
-      where: targetRut
-        ? { OR: [{ rut: targetRut }, { id: solicitanteContext?.sub || '' }] }
-        : { id: solicitanteContext?.sub || '' },
+  async listarAdministradores() {
+    const protegidos = getSuperadminsProtegidos();
+    const admins = await this.prisma.usuario.findMany({
+      where: { rol: 'ADMIN' },
+      orderBy: { createdAt: 'asc' },
     });
+    return admins.map((u) => ({
+      ...sanitizar(u),
+      esFijo: protegidos.includes(u.rut),
+    }));
+  }
 
-    if (!usuario) {
-      throw new NotFoundException('No se encontró el funcionario para registrar la solicitud de modificación.');
+  async generarCredencialesAdmin(
+    dto: { rut: string; nombre: string; email?: string; pinInicial?: string },
+    ejecutor?: { sub?: string; email?: string },
+  ) {
+    const rutRaw = dto.rut?.trim() || '';
+    const rut = formatRut(rutRaw) || rutRaw;
+    const nombre = dto.nombre?.trim() || '';
+    if (!rut || !nombre) {
+      throw new BadRequestException('RUT y nombre son obligatorios.');
     }
 
-    const folio = `MOD-DATOS-2026-${Math.floor(1000 + Math.random() * 9000)}`;
-    const registro = await this.prisma.historialCambio.create({
-      data: {
-        tablaAfectada: 'usuarios',
-        registroId: folio,
-        accion: 'SOLICITUD_MODIFICACION_DATOS',
-        usuarioId: usuario.id,
-        usuarioEmail: usuario.email,
-        diffJsonb: {
-          folio,
-          estadoSolicitud: 'PENDIENTE',
-          usuarioId: usuario.id,
-          rut: usuario.rut,
-          nombre: usuario.nombre,
-          datosActuales: {
-            cargo: usuario.cargo,
-            unidad: usuario.unidad,
-            condicionContractual: usuario.condicionContractual,
-            email: usuario.email,
-          },
-          cambiosSolicitados: {
-            nuevoCargo: dto.nuevoCargo || usuario.cargo,
-            nuevaUnidad: dto.nuevaUnidad || usuario.unidad,
-            nuevaCondicionContractual: dto.nuevaCondicionContractual || usuario.condicionContractual,
-            nuevoEmail: dto.nuevoEmail || usuario.email,
-          },
-          justificacion: dto.justificacion,
-          fechaSolicitud: new Date().toISOString(),
-        },
-      },
+    const pinRaw = dto.pinInicial?.trim() || '';
+    if (pinRaw && pinRaw.length !== 6) {
+      throw new BadRequestException('El PIN inicial debe tener exactamente 6 caracteres.');
+    }
+    const pinFinal = pinRaw || String(Math.floor(100000 + Math.random() * 900000));
+
+    const emailInput = dto.email?.trim().toLowerCase() || '';
+    const email = emailInput || `admin.${rut.replace(/[^0-9kK]/g, '').toLowerCase()}@municoquimbo.cl`;
+
+    const existente = await this.prisma.usuario.findFirst({
+      where: { OR: [{ rut }, { email }] },
     });
 
+    if (existente && existente.rol === 'ADMIN' && existente.estado === 'ACTIVO') {
+      throw new ConflictException(`Ya existe un administrador activo con ese RUT o correo (${existente.rut}).`);
+    }
+
+    const orgDefault = process.env.DEFAULT_ORG_NAME || 'Ilustre Municipalidad de Coquimbo';
+    const u = existente
+      ? await this.prisma.usuario.update({
+          where: { id: existente.id },
+          data: {
+            rol: 'ADMIN',
+            estado: 'ACTIVO',
+            nombre,
+            passwordHash: hashSecret(pinFinal),
+            pinHash: hashSecret(pinFinal),
+            pinBloqueado: false,
+            debeCambiarPassword: true,
+          },
+        })
+      : await this.prisma.usuario.create({
+          data: {
+            rut,
+            nombre,
+            email,
+            cargo: 'Administrador Delegado',
+            unidad: orgDefault,
+            rol: 'ADMIN',
+            estado: 'ACTIVO',
+            passwordHash: hashSecret(pinFinal),
+            pinHash: hashSecret(pinFinal),
+            debeCambiarPassword: true,
+          },
+        });
+
+    await this.prisma.historialCambio
+      .create({
+        data: {
+          tablaAfectada: 'usuarios',
+          registroId: u.rut,
+          accion: 'GENERAR_CREDENCIALES_ADMIN',
+          usuarioId: ejecutor?.sub || u.id,
+          usuarioEmail: ejecutor?.email || u.email,
+          diffJsonb: {
+            rut: u.rut,
+            nombre: u.nombre,
+            email: u.email,
+            promovidoDesdeExistente: !!existente,
+            rolAnterior: existente?.rol || null,
+            estadoAnterior: existente?.estado || null,
+          },
+        },
+      })
+      .catch(() => {});
+
+    const protegidos = getSuperadminsProtegidos();
     return {
-      status: 'registered',
-      folio,
-      id: registro.id,
-      estado: 'PENDIENTE',
-      mensaje: `Solicitud formal de modificación ${folio} registrada y enviada a visación de TICs/RRHH.`,
+      usuario: {
+        ...sanitizar(u),
+        esFijo: protegidos.includes(u.rut),
+      },
+      credenciales: {
+        rut: u.rut,
+        pinInicial: pinFinal,
+      },
     };
   }
 
-  async listarSolicitudesModificacion() {
-    const registros = await this.prisma.historialCambio.findMany({
+  async revocarAdministrador(idOrRut: string, ejecutor: { sub: string; email: string }) {
+    const rutFormateado = formatRut(idOrRut);
+    const u = await this.prisma.usuario.findFirst({
       where: {
-        accion: {
-          in: [
-            'SOLICITUD_MODIFICACION_DATOS',
-            'SOLICITUD_MODIFICACION_APROBADA',
-            'SOLICITUD_MODIFICACION_RECHAZADA',
-          ],
-        },
-      },
-      orderBy: { createdAt: 'desc' },
-      take: 50,
-    });
-
-    return registros.map((r) => {
-      const meta = (r.diffJsonb as Record<string, any>) || {};
-      return {
-        id: r.id,
-        folio: meta.folio || r.registroId,
-        estadoSolicitud: meta.estadoSolicitud || 'PENDIENTE',
-        rut: meta.rut || '',
-        nombre: meta.nombre || r.usuarioEmail,
-        datosActuales: meta.datosActuales || {},
-        cambiosSolicitados: meta.cambiosSolicitados || {},
-        justificacion: meta.justificacion || '',
-        observacionResolucion: meta.observacionResolucion || null,
-        resueltoPor: meta.resueltoPor || null,
-        createdAt: r.createdAt,
-      };
-    });
-  }
-
-  async resolverSolicitudModificacion(
-    solicitudIdOrFolio: string,
-    dto: ResolverModificacionDatosDto,
-    ejecutor: { sub: string; email: string },
-  ) {
-    const registro = await this.prisma.historialCambio.findFirst({
-      where: {
-        OR: [{ id: solicitudIdOrFolio }, { registroId: solicitudIdOrFolio }],
+        OR: [
+          { id: idOrRut },
+          { rut: idOrRut },
+          ...(rutFormateado ? [{ rut: rutFormateado }] : []),
+        ],
       },
     });
-
-    if (!registro) {
-      throw new NotFoundException(`Solicitud de modificación ${solicitudIdOrFolio} no encontrada.`);
+    if (!u) {
+      throw new NotFoundException(`Administrador ${idOrRut} no encontrado.`);
     }
 
-    const meta = (registro.diffJsonb as Record<string, any>) || {};
-    const cambios = meta.cambiosSolicitados || {};
-    const usuarioId = meta.usuarioId || registro.usuarioId;
-
-    if (dto.decision === 'APROBADA' && usuarioId) {
-      await this.prisma.usuario.update({
-        where: { id: usuarioId },
-        data: {
-          ...(cambios.nuevoCargo ? { cargo: cambios.nuevoCargo } : {}),
-          ...(cambios.nuevaUnidad ? { unidad: cambios.nuevaUnidad } : {}),
-          ...(cambios.nuevaCondicionContractual
-            ? { condicionContractual: cambios.nuevaCondicionContractual }
-            : {}),
-          ...(cambios.nuevoEmail ? { email: cambios.nuevoEmail.toLowerCase() } : {}),
-        },
-      });
+    if (u.id === ejecutor.sub) {
+      throw new BadRequestException('No puede revocar sus propias facultades de administrador.');
+    }
+    const adminPrincipal = getAdminPrincipalRut();
+    if (adminPrincipal && u.rut === adminPrincipal) {
+      throw new BadRequestException(`No es posible revocar al administrador titular principal (${adminPrincipal}).`);
+    }
+    const adminsActivos = await this.prisma.usuario.count({ where: { rol: 'ADMIN', estado: 'ACTIVO' } });
+    if (adminsActivos <= 1) {
+      throw new BadRequestException('Debe existir al menos un administrador activo.');
     }
 
-    const nuevaAccion =
-      dto.decision === 'APROBADA'
-        ? 'SOLICITUD_MODIFICACION_APROBADA'
-        : 'SOLICITUD_MODIFICACION_RECHAZADA';
-
-    const actualizado = await this.prisma.historialCambio.update({
-      where: { id: registro.id },
+    await this.prisma.usuario.update({
+      where: { id: u.id },
       data: {
-        accion: nuevaAccion,
-        diffJsonb: {
-          ...meta,
-          estadoSolicitud: dto.decision,
-          observacionResolucion: dto.observacion || null,
-          resueltoPor: ejecutor.email,
-          fechaResolucion: new Date().toISOString(),
-        },
+        rol: 'FUNCIONARIO',
+        estado: 'SUSPENDIDO',
+        pinBloqueado: true,
+        debeCambiarPassword: true,
+        passwordHash: hashSecret(generarPasswordTemporal()),
       },
     });
+
+    await this.prisma.historialCambio
+      .create({
+        data: {
+          tablaAfectada: 'usuarios',
+          registroId: u.rut,
+          accion: 'REVOCAR_ADMIN',
+          usuarioId: ejecutor.sub,
+          usuarioEmail: ejecutor.email,
+          diffJsonb: {
+            rut: u.rut,
+            nombre: u.nombre,
+            rolAnterior: u.rol,
+            estadoAnterior: u.estado,
+            rolNuevo: 'FUNCIONARIO',
+            estadoNuevo: 'SUSPENDIDO',
+          },
+        },
+      })
+      .catch(() => {});
 
     return {
-      status: 'resolved',
-      id: actualizado.id,
-      folio: meta.folio || actualizado.registroId,
-      decision: dto.decision,
-      resueltoPor: ejecutor.email,
+      status: 'success',
+      rut: u.rut,
+      nombre: u.nombre,
+      mensaje: 'Facultades de administrador revocadas inmediatamente.',
     };
   }
 }

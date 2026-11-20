@@ -27,12 +27,13 @@ export class RedisService implements OnModuleInit, OnModuleDestroy {
       enableOfflineQueue: false,
     });
 
-    this.client.connect()
+    this.client
+      .connect()
       .then(() => {
-        this.logger.log(`Conexión con Redis establecida en ${host}:${port} (TTL Presencia: ${this.ttlSeconds}s)`);
+        this.logger.log(`Conexión con Redis establecida en ${host}:${port} (TTL: ${this.ttlSeconds}s)`);
       })
       .catch((err) => {
-        this.logger.warn(`Redis no disponible de inmediato (${err.message}). Funcionamiento en modo resiliente.`);
+        this.logger.warn(`Redis no disponible de inmediato (${err.message}). Operando con respaldo en memoria.`);
       });
   }
 
@@ -55,9 +56,7 @@ export class RedisService implements OnModuleInit, OnModuleDestroy {
       try {
         const val = await this.client.get(key);
         if (val) return val;
-      } catch {
-        // Fallback a memoria
-      }
+      } catch {}
     }
     const mem = this.memoryFallback.get(key);
     if (mem && mem.expiresAt > Date.now()) {
@@ -71,9 +70,7 @@ export class RedisService implements OnModuleInit, OnModuleDestroy {
     if (!this.client) return;
     try {
       await this.client.set(key, value, 'EX', ttlSeconds);
-    } catch {
-      // Ignorar fallback
-    }
+    } catch {}
   }
 
   async getKey(key: string): Promise<string | null> {
@@ -81,9 +78,7 @@ export class RedisService implements OnModuleInit, OnModuleDestroy {
       try {
         const val = await this.client.get(key);
         if (val) return val;
-      } catch {
-        // Fallback a memoria
-      }
+      } catch {}
     }
     const mem = this.memoryFallback.get(key);
     if (mem && mem.expiresAt > Date.now()) {
@@ -97,15 +92,11 @@ export class RedisService implements OnModuleInit, OnModuleDestroy {
     if (!this.client) return;
     try {
       await this.client.del(key);
-    } catch {
-      // Ignorar
-    }
+    } catch {}
   }
 
   async getAllPresences(): Promise<Record<string, string>> {
     const result: Record<string, string> = {};
-
-    // Primero cargar de memoria con TTL válido
     const now = Date.now();
     for (const [k, v] of this.memoryFallback.entries()) {
       if (k.startsWith('pc:status:') && v.expiresAt > now) {
@@ -140,55 +131,7 @@ export class RedisService implements OnModuleInit, OnModuleDestroy {
       if (keys.length > 0) {
         await this.client.del(...keys);
       }
-    } catch {
-      // Ignorar error de limpieza en Redis
-    }
-  }
-
-  /**
-   * Bloqueo distribuido (Redlock pattern) para evitar colisiones en firmas simultáneas (Sección 2.2)
-   */
-  async acquireLock(resourceKey: string, ttlMs = 15000): Promise<string | null> {
-    const lockKey = `lock:${resourceKey}`;
-    const token = `${Date.now()}-${Math.random().toString(36).substring(2, 10)}`;
-
-    if (this.client) {
-      try {
-        const ok = await this.client.set(lockKey, token, 'PX', ttlMs, 'NX');
-        return ok === 'OK' ? token : null;
-      } catch {
-        // Fallback en memoria si Redis no responde
-      }
-    }
-
-    const existing = this.memoryFallback.get(lockKey);
-    if (existing && existing.expiresAt > Date.now()) {
-      return null;
-    }
-    this.memoryFallback.set(lockKey, { value: token, expiresAt: Date.now() + ttlMs });
-    return token;
-  }
-
-  async releaseLock(resourceKey: string, token: string): Promise<void> {
-    const lockKey = `lock:${resourceKey}`;
-    const mem = this.memoryFallback.get(lockKey);
-    if (mem && mem.value === token) {
-      this.memoryFallback.delete(lockKey);
-    }
-
-    if (!this.client) return;
-    try {
-      const script = `
-        if redis.call("get", KEYS[1]) == ARGV[1] then
-          return redis.call("del", KEYS[1])
-        else
-          return 0
-        end
-      `;
-      await this.client.eval(script, 1, lockKey, token);
-    } catch {
-      // Ignorar error de liberación
-    }
+    } catch {}
   }
 
   getClient(): Redis | null {
